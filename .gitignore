@@ -1,0 +1,40 @@
+# Python cache/runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Local logs and runtime output
+*.log
+*.log.*
+nohup.out
+logs/
+
+# Large assets excluded from the code repository
+*.zip
+*.tar
+*.rar
+*.7z
+*.pdmodel
+*.pdiparams
+*.jpg
+*.jpeg
+*.png
+*.pdf
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Not included by design
+online/
+mySideCollection/
+image_set2/
