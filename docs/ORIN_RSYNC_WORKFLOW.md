@@ -158,10 +158,15 @@ git push origin master
 https://gitee.com/younglet/baidu_smartcar_2026.git
 ```
 
-如果需要推送 GitHub，需要先添加 GitHub remote，例如：
+当前 GitHub remote 已配置为：
+
+```text
+github  https://github.com/PrusENDI/2026_baidu_car.git
+```
+
+推送 GitHub：
 
 ```powershell
-git remote add github <github-repo-url>
 git push github master
 ```
 

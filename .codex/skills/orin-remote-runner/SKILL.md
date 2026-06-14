@@ -94,7 +94,13 @@ The configured `origin` is currently Gitee, not GitHub:
 https://gitee.com/younglet/baidu_smartcar_2026.git
 ```
 
-Do not push to Gitee unless the user explicitly asks for it. If the user requires GitHub, ask for the GitHub repository URL, add it as a separate remote, and push there only after confirmation.
+Do not push to Gitee unless the user explicitly asks for it. The GitHub remote is configured as:
+
+```text
+github  https://github.com/PrusENDI/2026_baidu_car.git
+```
+
+Push GitHub with `git push github master` after local verification.
 
 ## Hard Stops
 
