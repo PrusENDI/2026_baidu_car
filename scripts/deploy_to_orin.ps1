@@ -45,7 +45,7 @@ if (-not $Apply) {
 } else {
     Write-Host "Mode: apply. Files will be copied to the Orin run copy."
     $quotedWorkspace = ConvertTo-RemoteShellSingleQuoted -Value $Script:RemoteWorkspace
-    & ssh $Script:OrinSshTarget "mkdir -p -- $quotedWorkspace"
+    Invoke-OrinSsh -Command "mkdir -p -- $quotedWorkspace"
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to create remote workspace: $($Script:RemoteWorkspace)"
     }

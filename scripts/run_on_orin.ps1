@@ -19,7 +19,7 @@ $quotedWorkspace = ConvertTo-RemoteShellSingleQuoted -Value $Script:RemoteWorksp
 $remoteCommand = "cd $quotedWorkspace && $Command"
 
 Write-Host "Running on Orin: $remoteCommand"
-& ssh $Script:OrinSshTarget $remoteCommand
+Invoke-OrinSsh -Command $remoteCommand
 if ($LASTEXITCODE -ne 0) {
     throw "Remote command failed with exit code $LASTEXITCODE"
 }

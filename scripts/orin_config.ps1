@@ -9,6 +9,8 @@ $Script:RemoteRunCommand = ""    # Example: python3 car_start_2026.py
 $Script:LocalProjectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $Script:LocalOrinLogRoot = Join-Path $Script:LocalProjectRoot "logs\orin"
 $Script:RsyncWindowsPathStyle = "msys" # msys: /c/path, cygwin: /cygdrive/c/path
+$Script:OrinSshExe = "C:\msys64\usr\bin\ssh.exe"
+$Script:OrinSshArgs = @("-i", "/c/tmp/codex_orin_ed25519", "-o", "StrictHostKeyChecking=accept-new")
 $Script:RsyncSshCommand = "ssh -i /c/tmp/codex_orin_ed25519 -o StrictHostKeyChecking=accept-new"
 
 # Keep source/model/config files syncable by default. Exclude only local tooling,
@@ -93,9 +95,9 @@ function Assert-OrinConfig {
         Assert-OrinSetting -Name "RemoteRunCommand" -Value $Script:RemoteRunCommand
     }
 
-    $sshCommand = Get-Command ssh -ErrorAction SilentlyContinue
+    $sshCommand = Get-Command $Script:OrinSshExe -ErrorAction SilentlyContinue
     if (-not $sshCommand) {
-        throw "ssh was not found in PATH. Install or enable OpenSSH client before using Orin scripts."
+        throw "ssh was not found at $($Script:OrinSshExe). Install MSYS2 OpenSSH or update scripts\orin_config.ps1."
     }
 
     if ($RequireRsync) {
@@ -104,6 +106,15 @@ function Assert-OrinConfig {
             throw "rsync was not found in PATH. Install Git Bash/MSYS2/cwRsync/WSL rsync and make it available to PowerShell."
         }
     }
+}
+
+function Invoke-OrinSsh {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command
+    )
+
+    & $Script:OrinSshExe @Script:OrinSshArgs $Script:OrinSshTarget $Command
 }
 
 function ConvertTo-RsyncLocalPath {

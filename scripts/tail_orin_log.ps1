@@ -15,7 +15,7 @@ $quotedLogPath = ConvertTo-RemoteShellSingleQuoted -Value $remoteFullPath
 $remoteCommand = "tail -n $Lines -F -- $quotedLogPath"
 
 Write-Host "Tailing Orin log: $($Script:OrinSshTarget):$remoteFullPath"
-& ssh $Script:OrinSshTarget $remoteCommand
+Invoke-OrinSsh -Command $remoteCommand
 if ($LASTEXITCODE -ne 0) {
     throw "tail failed with exit code $LASTEXITCODE"
 }
