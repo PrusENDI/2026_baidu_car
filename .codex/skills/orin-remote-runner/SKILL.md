@@ -65,6 +65,9 @@ description: Use when working in this Baidu smartcar project with Jetson Orin, s
 - The current Orin target is `jetson@192.168.0.155`.
 - The current Orin run-copy path is `/home/jetson/workspaces/baidu_car_2026_official_run_copy/`.
 - The project currently uses MSYS2 rsync on Windows.
+- Passwordless SSH uses the Codex-specific key outside the repo: `C:\tmp\codex_orin_ed25519`.
+- Do not commit SSH private keys, public keys, or copied `authorized_keys` files into the project.
+- Use MSYS2 SSH with `-i /c/tmp/codex_orin_ed25519` for rsync compatibility.
 - Use `scripts/deploy_to_orin.ps1` instead of handwritten rsync commands.
 - `scripts/deploy_to_orin.ps1` defaults to dry-run.
 - `-Apply` copies files.
