@@ -8,9 +8,47 @@ import time
 import cv2
 import platform
 import os, sys
+import glob
 
 
 from .log_wrap import logger
+
+
+def _project_camera_sort_key(path):
+    name = os.path.basename(path)
+    try:
+        return int(name.replace("cam", ""))
+    except ValueError:
+        return 9999
+
+
+def list_project_camera_paths():
+    return sorted(
+        [
+            path
+            for path in glob.glob("/dev/cam*")
+            if os.path.basename(path)[3:].isdigit()
+        ],
+        key=_project_camera_sort_key,
+    )
+
+
+def resolve_camera_path(index):
+    requested = "/dev/cam" + str(index)
+    if os.path.exists(requested):
+        return requested
+
+    try:
+        number = int(index)
+    except (TypeError, ValueError):
+        return requested
+
+    cameras = list_project_camera_paths()
+    if number >= 1 and len(cameras) >= number:
+        fallback = cameras[number - 1]
+        logger.info("摄像头%s不存在，自动使用%s" % (requested, fallback))
+        return fallback
+    return requested
 
 class Camera:
     def __init__(self, index=1, width=640, height=480):
@@ -46,7 +84,7 @@ class Camera:
                     self.src = self.index
                     self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
                 else:
-                    self.src = "/dev/cam" + str(self.index)
+                    self.src = resolve_camera_path(self.index)
                     # 如果self.src不存在，则报错
                     if os.path.exists(self.src) == False:
                         logger.error("摄像头{}不存在".format(self.src))
