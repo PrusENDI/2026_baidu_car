@@ -10,6 +10,17 @@ spec.loader.exec_module(safe)
 
 
 class SafetyTests(unittest.TestCase):
+    def test_argument_limits_allow_300_seconds_but_reject_longer(self):
+        self.assertIsNone(safe.validate_limits(0.10, 300.0))
+        self.assertEqual(
+            "speed 0..0.10; duration 0..300",
+            safe.validate_limits(0.10, 300.1),
+        )
+        self.assertEqual(
+            "speed 0..0.10; duration 0..300",
+            safe.validate_limits(0.11, 15.0),
+        )
+
     def test_rejects_non_finite_or_excessive_model_output(self):
         self.assertEqual("invalid_model_output", safe.validate_output([float("nan"), 0.0], 1.0))
         self.assertEqual("model_output_limit", safe.validate_output([1.1, 0.0], 1.0))

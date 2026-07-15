@@ -8,7 +8,7 @@ Run the 2026 lane model on Orin without importing the project-wide `smartcar` pa
 
 Add `tools/lane_only_infer_server.py`, a local ZeroMQ REP service on port 5001.  It loads only Paddle Inference, OpenCV, NumPy, and the lane model paths from `config_car.yml`; it must not import `smartcar` or `infer_wrap.py`.  It answers `ATATA` readiness probes and image requests with the model's two numeric outputs.
 
-Extend `tools/safe_lane_test.py` to start that server as a child process, wait for a bounded readiness interval, make one camera-frame inference preflight, and validate exactly two finite bounded values.  A failed preflight exits before the control loop.  The existing control loop remains capped at speed 0.10 and duration 15 seconds, and its `finally` block retains `car.stop()`.
+Extend `tools/safe_lane_test.py` to start that server as a child process, wait for a bounded readiness interval, make one camera-frame inference preflight, and validate exactly two finite bounded values.  A failed preflight exits before the control loop.  The control loop remains capped at speed 0.10; its default duration remains 15 seconds while the explicit duration limit is 300 seconds. Its `finally` block retains `car.stop()`.
 
 ## Safety and Verification
 

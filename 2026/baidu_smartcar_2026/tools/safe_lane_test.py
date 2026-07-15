@@ -13,6 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER = Path(__file__).with_name("lane_only_infer_server.py")
 
 
+def validate_limits(speed, duration):
+    if not 0 < speed <= 0.10 or not 0 < duration <= 300:
+        return "speed 0..0.10; duration 0..300"
+    return None
+
+
 def validate_output(output, limit):
     if not isinstance(output, (list, tuple)) or len(output) != 2:
         return "invalid_model_output"
@@ -134,8 +140,9 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=30.0)
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
-    if not 0 < args.speed <= 0.10 or not 0 < args.duration <= 15:
-        raise SystemExit("speed 0..0.10; duration 0..15")
+    limit_error = validate_limits(args.speed, args.duration)
+    if limit_error:
+        raise SystemExit(limit_error)
 
     process = subprocess.Popen([sys.executable, "-u", str(SERVER)], stdout=sys.stdout, stderr=sys.stderr)
     lane = LaneClient()
