@@ -146,3 +146,46 @@ Expected: It reports a two-number lane result and `SAFE_STOP`; there is no `set_
 - [ ] **Step 3: Record the actual output and confirmation that no motion command was issued**
 
 Append the command, output, model path, and non-motion confirmation to the daily debug log.
+
+### Task 5: Extend only the explicit duration limit
+
+**Files:**
+- Modify: `tests/test_safe_lane_test.py`
+- Modify: `tools/safe_lane_test.py`
+
+- [ ] **Step 1: Write the failing boundary test**
+
+```python
+def test_argument_limits_allow_300_seconds_but_reject_longer(self):
+    self.assertIsNone(safe.validate_limits(0.10, 300.0))
+    self.assertEqual("speed 0..0.10; duration 0..300", safe.validate_limits(0.10, 300.1))
+```
+
+- [ ] **Step 2: Run the test and verify it fails because `validate_limits` is absent**
+
+Run: `python -m unittest tests/test_safe_lane_test.py -v`
+
+Expected: FAIL with `AttributeError: module 'safe_lane_test' has no attribute 'validate_limits'`.
+
+- [ ] **Step 3: Add the bounded validation helper and use it in `main`**
+
+```python
+def validate_limits(speed, duration):
+    if not 0 < speed <= 0.10 or not 0 < duration <= 300:
+        return "speed 0..0.10; duration 0..300"
+    return None
+```
+
+Keep `--speed` default `0.08` and `--duration` default `15.0` unchanged.
+
+- [ ] **Step 4: Run the complete test suite**
+
+Run: `python -m unittest discover -s tests -p 'test_*.py' -v`
+
+Expected: all tests PASS.
+
+- [ ] **Step 5: Sync and verify only the safety script on Orin**
+
+Run: `powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\sync_to_orin.ps1 -Files tools/safe_lane_test.py -Verify`
+
+Expected: remote verification reports `tools/safe_lane_test.py` under the confirmed run copy.
