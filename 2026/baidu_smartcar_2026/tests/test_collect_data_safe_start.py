@@ -77,9 +77,23 @@ class CollectDataSafeStartTest(unittest.TestCase):
             path_exists=lambda path: path == "/dev/cam1",
             port_checker=lambda port: False,
             ports=[5000],
+            frame_checker=None,
         )
 
         self.assertIn("missing camera device: /dev/cam2", errors)
+
+    def test_preflight_reports_camera_read_failure(self):
+        module = load_module()
+
+        errors = module.preflight(
+            cam_sources=["/dev/cam1", "/dev/cam4"],
+            path_exists=lambda path: True,
+            port_checker=lambda port: False,
+            ports=[5000],
+            frame_checker=lambda path: path == "/dev/cam4",
+        )
+
+        self.assertIn("camera cannot read frame: /dev/cam1", errors)
 
     def test_main_preflight_uses_resolved_camera_paths(self):
         module = load_module()
