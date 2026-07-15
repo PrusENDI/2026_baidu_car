@@ -112,11 +112,39 @@ def is_port_listening(port, host="127.0.0.1", timeout=0.2):
         sock.close()
 
 
-def preflight(cam_sources, path_exists=os.path.exists, port_checker=is_port_listening, ports=None):
+def can_read_camera_frame(source, width=640, height=480, attempts=5, delay=0.05):
+    import cv2
+    import time
+
+    cap = cv2.VideoCapture(source)
+    try:
+        if not cap.isOpened():
+            return False
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        for _ in range(attempts):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return True
+            time.sleep(delay)
+        return False
+    finally:
+        cap.release()
+
+
+def preflight(
+    cam_sources,
+    path_exists=os.path.exists,
+    port_checker=is_port_listening,
+    ports=None,
+    frame_checker=can_read_camera_frame,
+):
     errors = []
     for source in cam_sources:
         if not path_exists(source):
             errors.append("missing camera device: {}".format(source))
+        elif frame_checker is not None and not frame_checker(source):
+            errors.append("camera cannot read frame: {}".format(source))
     for port in ports or []:
         if port_checker(port):
             errors.append("streamer port already in use: {}".format(port))
