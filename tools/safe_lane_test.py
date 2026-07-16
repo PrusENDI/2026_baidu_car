@@ -197,19 +197,37 @@ def preflight_infer(client, frame):
 
 
 def run_lane_loop(duration, speed, output_limit, cap, stream, lane, car, py, pa,
-                  monotonic=time.monotonic):
+                  monotonic=time.monotonic, recorder=None):
     start = monotonic()
-    while monotonic() - start < duration:
+    previous_loop_start = start
+    frame_index = 0
+    loop_start = monotonic()
+    while loop_start - start < duration:
         frame = cap.read()
         if frame is None:
             return "camera_failure"
         stream.update_frame(frame, "cam1")
+        infer_start = monotonic()
         output = lane.infer(frame)
+        infer_ms = (monotonic() - infer_start) * 1000.0
         error = validate_output(output, output_limit)
         if error:
             return error
         error_y, error_angle = output
-        car.set_velocity(speed, py(-error_y), pa(-error_angle))
+        y_cmd = py(-error_y)
+        yaw_cmd = pa(-error_angle)
+        elapsed_s = loop_start - start
+        loop_elapsed = loop_start - previous_loop_start
+        loop_fps = 1.0 / loop_elapsed if loop_elapsed > 0 else 0.0
+        if recorder is not None:
+            recorder.record(
+                frame, elapsed_s, frame_index, infer_ms, loop_fps,
+                error_y, error_angle, y_cmd, yaw_cmd, speed, y_cmd, yaw_cmd,
+            )
+        car.set_velocity(speed, y_cmd, yaw_cmd)
+        frame_index += 1
+        previous_loop_start = loop_start
+        loop_start = monotonic()
     return "duration_elapsed"
 
 

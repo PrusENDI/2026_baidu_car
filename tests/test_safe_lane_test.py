@@ -54,7 +54,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual([0.1, -0.2], safe.preflight_infer(client, object()))
         self.assertEqual(5000, client.timeout_ms)
 
-    def test_normal_lane_loop_keeps_duration_elapsed_reason(self):
+    def test_recorder_none_keeps_normal_duration_elapsed_behavior(self):
         class Cap:
             def read(self):
                 return object()
@@ -73,7 +73,7 @@ class SafetyTests(unittest.TestCase):
             def set_velocity(self, speed, y, angle):
                 self.calls += 1
 
-        ticks = iter([0.0, 0.0, 1.0])
+        ticks = iter([0.0, 0.0, 0.0, 0.0, 1.0])
         car = Car()
         reason = safe.run_lane_loop(
             duration=0.1,
@@ -86,9 +86,72 @@ class SafetyTests(unittest.TestCase):
             py=lambda value: value,
             pa=lambda value: value,
             monotonic=lambda: next(ticks),
+            recorder=None,
         )
         self.assertEqual("duration_elapsed", reason)
         self.assertEqual(1, car.calls)
+
+
+class LaneLoopRecordingTests(unittest.TestCase):
+    def test_records_exact_chassis_commands_before_setting_velocity(self):
+        events = []
+
+        class Cap:
+            def read(self):
+                return "frame"
+
+        class Stream:
+            def update_frame(self, frame, name):
+                events.append(("stream", frame, name))
+
+        class Lane:
+            def infer(self, frame):
+                events.append(("infer", frame))
+                return [0.25, -0.25]
+
+        class Recorder:
+            def __init__(self):
+                self.calls = []
+
+            def record(self, *args):
+                self.calls.append(args)
+                events.append(("record", args))
+
+        class Car:
+            def __init__(self):
+                self.calls = []
+
+            def set_velocity(self, speed, vy, yaw):
+                self.calls.append((speed, vy, yaw))
+                events.append(("command", speed, vy, yaw))
+
+        recorder = Recorder()
+        car = Car()
+        ticks = iter([0.0, 0.0, 0.0, 0.01, 1.0])
+
+        reason = safe.run_lane_loop(
+            duration=0.1,
+            speed=0.05,
+            output_limit=1.0,
+            cap=Cap(),
+            stream=Stream(),
+            lane=Lane(),
+            car=car,
+            py=lambda value: value * 2,
+            pa=lambda value: value * 3,
+            monotonic=lambda: next(ticks),
+            recorder=recorder,
+        )
+
+        self.assertEqual("duration_elapsed", reason)
+        self.assertLess(
+            next(index for index, event in enumerate(events) if event[0] == "record"),
+            next(index for index, event in enumerate(events) if event[0] == "command"),
+        )
+        self.assertEqual((0.05, -0.5, 0.75), car.calls[0])
+        recorded = recorder.calls[0]
+        self.assertEqual(car.calls[0][1], recorded[10])
+        self.assertEqual(car.calls[0][2], recorded[11])
 
 
 class RecorderContractTests(unittest.TestCase):
