@@ -1,5 +1,6 @@
 import importlib.util
 import json
+from contextlib import ExitStack
 from pathlib import Path
 import sys
 import tempfile
@@ -15,6 +16,9 @@ spec.loader.exec_module(safe)
 
 
 class SafetyTests(unittest.TestCase):
+    def test_record_dir_argument_defaults_to_none(self):
+        self.assertIsNone(safe.parse_args([]).record_dir)
+
     def test_argument_limits_allow_300_seconds_but_reject_longer(self):
         self.assertIsNone(safe.validate_limits(0.10, 300.0))
         self.assertEqual(
@@ -155,6 +159,125 @@ class LaneLoopRecordingTests(unittest.TestCase):
              -0.5, 0.75, 0.05, -0.5, 0.75),
             recorded,
         )
+
+
+class CliRecordingLifecycleTests(unittest.TestCase):
+    def _run_main(self, argv, *, recorder_create=None, loop=None):
+        events = []
+
+        class Process:
+            def terminate(self):
+                events.append("process.terminate")
+
+            def wait(self, timeout):
+                events.append("process.wait")
+
+        class Lane:
+            def close(self):
+                events.append("lane.close")
+
+        class Cap:
+            def read(self):
+                return "frame"
+
+            def close(self):
+                events.append("cap.close")
+
+        class Stream:
+            def stop(self):
+                events.append("stream.stop")
+
+        class Driver:
+            def __init__(self):
+                events.append("driver.init")
+
+            def stop(self):
+                events.append("car.stop")
+
+        messages = []
+        patches = [
+            patch.object(safe.subprocess, "Popen", return_value=Process()),
+            patch.object(safe, "LaneClient", return_value=Lane()),
+            patch.object(safe, "wait_ready", return_value=True),
+            patch.object(safe, "hardware_components", return_value=(lambda *_: Cap(), lambda: Stream(), Driver, lambda *_, **__: object())),
+            patch.object(safe, "preflight_infer", return_value=[0.0, 0.0]),
+            patch("builtins.print", side_effect=messages.append),
+        ]
+        if recorder_create is not None:
+            patches.append(patch.object(safe.TestRecorder, "create", side_effect=recorder_create))
+        if loop is not None:
+            patches.append(patch.object(safe, "run_lane_loop", side_effect=loop))
+        with ExitStack() as stack:
+            for active_patch in patches:
+                stack.enter_context(active_patch)
+            safe.main(argv)
+        return events, messages
+
+    def test_preflight_only_record_dir_never_creates_recorder_or_driver(self):
+        events, messages = self._run_main(
+            ["--preflight-only", "--record-dir", "records"],
+            recorder_create=AssertionError("recorder must not be created"),
+        )
+
+        self.assertNotIn("driver.init", events)
+        self.assertIn("SAFE_STOP reason=preflight_complete", messages)
+
+    def test_recording_init_failure_prevents_driver_and_safely_stops(self):
+        events, messages = self._run_main(
+            ["--record-dir", "records"],
+            recorder_create=OSError("disk unavailable"),
+        )
+
+        self.assertNotIn("driver.init", events)
+        self.assertIn("SAFE_STOP reason=recording_init_failure:OSError", messages)
+
+    def test_loop_recorder_failure_stops_car_before_closing_recorder(self):
+        class Recorder:
+            def close(self, reason):
+                events.append(("recorder.close", reason))
+
+        events = []
+        recorder = Recorder()
+
+        class Process:
+            def terminate(self):
+                events.append("process.terminate")
+
+            def wait(self, timeout):
+                events.append("process.wait")
+
+        class Lane:
+            def close(self):
+                events.append("lane.close")
+
+        class Cap:
+            def read(self):
+                return "frame"
+
+            def close(self):
+                events.append("cap.close")
+
+        class Stream:
+            def stop(self):
+                events.append("stream.stop")
+
+        class Driver:
+            def stop(self):
+                events.append("car.stop")
+
+        messages = []
+        with patch.object(safe.subprocess, "Popen", return_value=Process()), \
+             patch.object(safe, "LaneClient", return_value=Lane()), \
+             patch.object(safe, "wait_ready", return_value=True), \
+             patch.object(safe, "hardware_components", return_value=(lambda *_: Cap(), lambda: Stream(), Driver, lambda *_, **__: object())), \
+             patch.object(safe, "preflight_infer", return_value=[0.0, 0.0]), \
+             patch.object(safe.TestRecorder, "create", return_value=recorder), \
+             patch.object(safe, "run_lane_loop", side_effect=safe.RecordingWriteError(RuntimeError("write failed"))), \
+             patch("builtins.print", side_effect=messages.append):
+            safe.main(["--record-dir", "records"])
+
+        self.assertIn("SAFE_STOP reason=recording_write_failure:RuntimeError", messages)
+        self.assertLess(events.index("car.stop"), events.index(("recorder.close", "recording_write_failure:RuntimeError")))
 
 
 class RecorderContractTests(unittest.TestCase):
