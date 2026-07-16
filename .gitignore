@@ -34,6 +34,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Local linked worktrees
+.worktrees/
+
 # Not included by design
 online/
 mySideCollection/
