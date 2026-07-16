@@ -214,8 +214,11 @@ def run_lane_loop(duration, speed, output_limit, cap, stream, lane, car, py, pa,
             return "camera_failure"
         stream.update_frame(frame, "cam1")
         infer_start = monotonic()
-        output = lane.infer(frame)
+        timeout_ms = 5000 if frame_index == 0 else 1000
+        output = lane.infer(frame, timeout_ms=timeout_ms)
         infer_ms = (monotonic() - infer_start) * 1000.0
+        if output is None:
+            return "inference_timeout"
         error = validate_output(output, output_limit)
         if error:
             return error
@@ -345,6 +348,9 @@ def main(argv=None):
             reason = "camera_failure"
             return
         output = preflight_infer(lane, frame)
+        if output is None:
+            reason = "preflight_inference_timeout"
+            return
         reason = validate_output(output, args.output_limit)
         if reason:
             return
