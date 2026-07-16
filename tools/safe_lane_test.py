@@ -196,6 +196,12 @@ def preflight_infer(client, frame):
     return client.infer(frame, timeout_ms=5000)
 
 
+class RecordingWriteError(Exception):
+    def __init__(self, cause):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 def run_lane_loop(duration, speed, output_limit, cap, stream, lane, car, py, pa,
                   monotonic=time.monotonic, recorder=None):
     start = monotonic()
@@ -220,10 +226,13 @@ def run_lane_loop(duration, speed, output_limit, cap, stream, lane, car, py, pa,
         loop_elapsed = loop_start - previous_loop_start
         loop_fps = 1.0 / loop_elapsed if loop_elapsed > 0 else 0.0
         if recorder is not None:
-            recorder.record(
-                frame, elapsed_s, frame_index, infer_ms, loop_fps,
-                error_y, error_angle, y_cmd, yaw_cmd, speed, y_cmd, yaw_cmd,
-            )
+            try:
+                recorder.record(
+                    frame, elapsed_s, frame_index, infer_ms, loop_fps,
+                    error_y, error_angle, y_cmd, yaw_cmd, speed, y_cmd, yaw_cmd,
+                )
+            except Exception as exc:
+                raise RecordingWriteError(exc) from exc
         car.set_velocity(speed, y_cmd, yaw_cmd)
         frame_index += 1
         previous_loop_start = loop_start
@@ -304,21 +313,26 @@ def hardware_components():
     return camera.Camera, streamer.Streamer, mecanum.MecanumDriver, util.PID
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--speed", type=float, default=0.08)
     parser.add_argument("--duration", type=float, default=15.0)
     parser.add_argument("--output-limit", type=float, default=1.2)
     parser.add_argument("--startup-timeout", type=float, default=30.0)
     parser.add_argument("--preflight-only", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--record-dir", type=Path, default=None)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     limit_error = validate_limits(args.speed, args.duration)
     if limit_error:
         raise SystemExit(limit_error)
 
     process = subprocess.Popen([sys.executable, "-u", str(SERVER)], stdout=sys.stdout, stderr=sys.stderr)
     lane = LaneClient()
-    cap = car = stream = None
+    cap = car = stream = recorder = None
     reason = "startup_failure"
     try:
         if not wait_ready(lane, args.startup_timeout):
@@ -338,6 +352,22 @@ def main():
         if args.preflight_only:
             reason = "preflight_complete"
             return
+        if args.record_dir is not None:
+            try:
+                recorder = TestRecorder.create(
+                    args.record_dir,
+                    utc_session_name(),
+                    (320, 240),
+                    {
+                        "speed": args.speed,
+                        "duration": args.duration,
+                        "output_limit": args.output_limit,
+                    },
+                )
+            except Exception as exc:
+                reason = "recording_init_failure:" + type(exc).__name__
+                print(reason)
+                return
         car = Driver()
         car.stop()
         stream = Streamer()
@@ -346,15 +376,24 @@ def main():
         reason = run_lane_loop(
             args.duration, args.speed, args.output_limit,
             cap, stream, lane, car, py, pa,
+            recorder=recorder,
         )
     except KeyboardInterrupt:
         reason = "keyboard_interrupt"
+    except RecordingWriteError as exc:
+        reason = "recording_write_failure:" + type(exc.cause).__name__
+        print(reason)
     except Exception as exc:
         reason = "runtime_error:" + type(exc).__name__
         print(reason)
     finally:
         if car is not None:
             car.stop()
+        if recorder is not None:
+            try:
+                recorder.close(reason)
+            except Exception as exc:
+                print("recording_close_failure:" + type(exc).__name__)
         if cap is not None:
             cap.close()
         if stream is not None:
