@@ -177,6 +177,82 @@ class RecorderContractTests(unittest.TestCase):
             self.assertTrue(metadata["started_at_utc"])
             self.assertTrue(metadata["ended_at_utc"])
 
+    def test_create_removes_empty_session_when_video_writer_initialization_fails(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(safe, "open_video_writer", side_effect=RuntimeError("writer failed")):
+            with self.assertRaisesRegex(RuntimeError, "writer failed"):
+                safe.TestRecorder.create(directory, "session-1", (320, 240), {})
+
+            self.assertFalse((Path(directory) / "session-1").exists())
+
+    def test_create_releases_writer_when_csv_initialization_fails(self):
+        class Writer:
+            released = False
+
+            def release(self):
+                self.released = True
+
+        writer = Writer()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(safe, "open_video_writer", return_value=writer), \
+             patch.object(Path, "open", side_effect=OSError("csv failed")):
+            with self.assertRaisesRegex(OSError, "csv failed"):
+                safe.TestRecorder.create(directory, "session-1", (320, 240), {})
+
+        self.assertTrue(writer.released)
+
+    def test_create_closes_csv_and_releases_writer_when_header_write_fails(self):
+        class Writer:
+            released = False
+
+            def release(self):
+                self.released = True
+
+        class CsvHandle:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        class HeaderWriter:
+            def __init__(self, handle, fieldnames):
+                pass
+
+            def writeheader(self):
+                raise OSError("header failed")
+
+        writer = Writer()
+        csv_handle = CsvHandle()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(safe, "open_video_writer", return_value=writer), \
+             patch.object(Path, "open", return_value=csv_handle), \
+             patch.object(safe.csv, "DictWriter", HeaderWriter):
+            with self.assertRaisesRegex(OSError, "header failed"):
+                safe.TestRecorder.create(directory, "session-1", (320, 240), {})
+
+        self.assertTrue(writer.released)
+        self.assertTrue(csv_handle.closed)
+
+    def test_close_publishes_metadata_when_release_and_csv_close_fail(self):
+        class Writer:
+            def release(self):
+                raise RuntimeError("release failed")
+
+        class CsvHandle:
+            def close(self):
+                raise RuntimeError("csv close failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "session-1"
+            session.mkdir()
+            recorder = safe.TestRecorder(session, Writer(), CsvHandle(), object(), (320, 240), {})
+
+            with self.assertRaises(Exception):
+                recorder.close("safe_stop")
+
+            metadata = json.loads((session / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual("safe_stop", metadata["stop_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

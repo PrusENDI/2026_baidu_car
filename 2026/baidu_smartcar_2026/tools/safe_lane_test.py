@@ -66,12 +66,31 @@ class TestRecorder:
     @classmethod
     def create(cls, base_dir, session_name, frame_size, parameters):
         session_dir = create_record_session(base_dir, session_name)
-        writer = open_video_writer(session_dir / "annotated.mp4", frame_size)
-        csv_handle = (session_dir / "frames.csv").open("w", encoding="utf-8", newline="")
-        csv_writer = csv.DictWriter(csv_handle, fieldnames=CSV_FIELDS)
-        csv_writer.writeheader()
-        csv_handle.flush()
-        return cls(session_dir, writer, csv_handle, csv_writer, frame_size, parameters)
+        writer = None
+        csv_handle = None
+        try:
+            writer = open_video_writer(session_dir / "annotated.mp4", frame_size)
+            csv_handle = (session_dir / "frames.csv").open("w", encoding="utf-8", newline="")
+            csv_writer = csv.DictWriter(csv_handle, fieldnames=CSV_FIELDS)
+            csv_writer.writeheader()
+            csv_handle.flush()
+            return cls(session_dir, writer, csv_handle, csv_writer, frame_size, parameters)
+        except Exception:
+            if csv_handle is not None:
+                try:
+                    csv_handle.close()
+                except Exception:
+                    pass
+            if writer is not None:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+            try:
+                session_dir.rmdir()
+            except OSError:
+                pass
+            raise
 
     def record(self, frame, elapsed_s, frame_index, infer_ms, loop_fps, error_y, error_angle,
                y_pid, yaw_pid, vx, vy, yaw):
@@ -111,9 +130,15 @@ class TestRecorder:
     def close(self, stop_reason):
         if self.closed:
             return
-        self.closed = True
-        self.writer.release()
-        self.csv_handle.close()
+        errors = []
+        try:
+            self.writer.release()
+        except Exception as exc:
+            errors.append(exc)
+        try:
+            self.csv_handle.close()
+        except Exception as exc:
+            errors.append(exc)
         metadata = {
             "format_version": 1,
             "started_at_utc": self.started_at_utc,
@@ -127,8 +152,17 @@ class TestRecorder:
             "stop_reason": stop_reason,
         }
         temporary = self.session_dir / "metadata.json.tmp"
-        temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.session_dir / "metadata.json")
+        try:
+            temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self.session_dir / "metadata.json")
+        except Exception as exc:
+            errors.append(exc)
+        else:
+            self.closed = True
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+            raise ExceptionGroup("recorder_close_failed", errors)
 
 
 def validate_limits(speed, duration):
