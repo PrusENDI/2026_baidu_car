@@ -247,11 +247,15 @@ class RecorderContractTests(unittest.TestCase):
             session.mkdir()
             recorder = safe.TestRecorder(session, Writer(), CsvHandle(), object(), (320, 240), {})
 
-            with self.assertRaises(Exception):
+            with self.assertRaisesRegex(RuntimeError, "^release failed$") as raised:
                 recorder.close("safe_stop")
 
             metadata = json.loads((session / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual("safe_stop", metadata["stop_reason"])
+            self.assertEqual(
+                ("RuntimeError: csv close failed",),
+                raised.exception.recorder_cleanup_errors,
+            )
 
 
 if __name__ == "__main__":

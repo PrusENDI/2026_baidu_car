@@ -160,9 +160,11 @@ class TestRecorder:
         else:
             self.closed = True
         if errors:
-            if len(errors) == 1:
-                raise errors[0]
-            raise ExceptionGroup("recorder_close_failed", errors)
+            first_error = errors[0]
+            first_error.recorder_cleanup_errors = tuple(
+                f"{type(error).__name__}: {error}" for error in errors[1:]
+            )
+            raise first_error
 
 
 def validate_limits(speed, duration):
