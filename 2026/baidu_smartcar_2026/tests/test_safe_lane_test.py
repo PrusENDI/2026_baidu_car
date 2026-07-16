@@ -58,6 +58,75 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual([0.1, -0.2], safe.preflight_infer(client, object()))
         self.assertEqual(5000, client.timeout_ms)
 
+    def test_loop_uses_cold_start_timeout_then_normal_timeout(self):
+        class Cap:
+            def read(self):
+                return object()
+
+        class Stream:
+            def update_frame(self, frame, name):
+                pass
+
+        class Lane:
+            def __init__(self):
+                self.timeouts = []
+
+            def infer(self, frame, timeout_ms):
+                self.timeouts.append(timeout_ms)
+                return [0.1, -0.2]
+
+        class Car:
+            def set_velocity(self, speed, y, angle):
+                pass
+
+        lane = Lane()
+        ticks = iter([0.0, 0.0, 0.0, 0.01, 0.02, 0.02, 0.03, 1.0])
+        reason = safe.run_lane_loop(
+            duration=0.1, speed=0.05, output_limit=1.0,
+            cap=Cap(), stream=Stream(), lane=lane, car=Car(),
+            py=lambda value: value, pa=lambda value: value,
+            monotonic=lambda: next(ticks),
+        )
+
+        self.assertEqual("duration_elapsed", reason)
+        self.assertEqual([5000, 1000], lane.timeouts)
+
+    def test_initial_loop_inference_timeout_stops_before_velocity_command(self):
+        expected_timeout = 5000
+
+        class Cap:
+            def read(self):
+                return object()
+
+        class Stream:
+            def update_frame(self, frame, name):
+                pass
+
+        class Lane:
+            def infer(self, frame, timeout_ms):
+                if timeout_ms != expected_timeout:
+                    raise AssertionError("expected cold-start timeout")
+                return None
+
+        class Car:
+            def __init__(self):
+                self.calls = []
+
+            def set_velocity(self, speed, y, angle):
+                self.calls.append((speed, y, angle))
+
+        car = Car()
+        ticks = iter([0.0, 0.0, 0.0, 0.01])
+        reason = safe.run_lane_loop(
+            duration=0.1, speed=0.05, output_limit=1.0,
+            cap=Cap(), stream=Stream(), lane=Lane(), car=car,
+            py=lambda value: value, pa=lambda value: value,
+            monotonic=lambda: next(ticks),
+        )
+
+        self.assertEqual("inference_timeout", reason)
+        self.assertEqual([], car.calls)
+
     def test_recorder_none_keeps_normal_duration_elapsed_behavior(self):
         class Cap:
             def read(self):
@@ -68,7 +137,7 @@ class SafetyTests(unittest.TestCase):
                 pass
 
         class Lane:
-            def infer(self, frame):
+            def infer(self, frame, timeout_ms):
                 return [0.1, -0.2]
 
         class Car:
@@ -109,7 +178,7 @@ class LaneLoopRecordingTests(unittest.TestCase):
                 events.append(("stream", frame, name))
 
         class Lane:
-            def infer(self, frame):
+            def infer(self, frame, timeout_ms):
                 events.append(("infer", frame))
                 return [0.25, -0.25]
 
@@ -162,7 +231,7 @@ class LaneLoopRecordingTests(unittest.TestCase):
 
 
 class CliRecordingLifecycleTests(unittest.TestCase):
-    def _run_main(self, argv, *, recorder_create=None, loop=None):
+    def _run_main(self, argv, *, recorder_create=None, loop=None, preflight_output=(0.0, 0.0)):
         events = []
 
         class Process:
@@ -200,7 +269,7 @@ class CliRecordingLifecycleTests(unittest.TestCase):
             patch.object(safe, "LaneClient", return_value=Lane()),
             patch.object(safe, "wait_ready", return_value=True),
             patch.object(safe, "hardware_components", return_value=(lambda *_: Cap(), lambda: Stream(), Driver, lambda *_, **__: object())),
-            patch.object(safe, "preflight_infer", return_value=[0.0, 0.0]),
+            patch.object(safe, "preflight_infer", return_value=preflight_output),
             patch("builtins.print", side_effect=messages.append),
         ]
         if recorder_create is not None:
@@ -221,6 +290,14 @@ class CliRecordingLifecycleTests(unittest.TestCase):
 
         self.assertNotIn("driver.init", events)
         self.assertIn("SAFE_STOP reason=preflight_complete", messages)
+
+    def test_preflight_timeout_has_explicit_reason(self):
+        events, messages = self._run_main(
+            [], loop=AssertionError("loop must not run"), preflight_output=None,
+        )
+
+        self.assertNotIn("driver.init", events)
+        self.assertEqual(["SAFE_STOP reason=preflight_inference_timeout"], messages)
 
     def test_recording_init_failure_prevents_driver_and_safely_stops(self):
         events, messages = self._run_main(
