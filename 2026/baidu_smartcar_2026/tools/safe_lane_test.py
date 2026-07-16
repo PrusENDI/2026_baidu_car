@@ -388,7 +388,10 @@ def main(argv=None):
         print(reason)
     finally:
         if car is not None:
-            car.stop()
+            try:
+                car.stop()
+            except Exception as exc:
+                print("car_stop_failure:" + type(exc).__name__)
         if recorder is not None:
             try:
                 recorder.close(reason)

@@ -279,6 +279,71 @@ class CliRecordingLifecycleTests(unittest.TestCase):
         self.assertIn("SAFE_STOP reason=recording_write_failure:RuntimeError", messages)
         self.assertLess(events.index("car.stop"), events.index(("recorder.close", "recording_write_failure:RuntimeError")))
 
+    def test_final_stop_failure_does_not_skip_remaining_cleanup(self):
+        events = []
+
+        class Recorder:
+            def close(self, reason):
+                events.append(("recorder.close", reason))
+
+        class Process:
+            def terminate(self):
+                events.append("process.terminate")
+
+            def wait(self, timeout):
+                events.append("process.wait")
+
+        class Lane:
+            def close(self):
+                events.append("lane.close")
+
+        class Cap:
+            def read(self):
+                return "frame"
+
+            def close(self):
+                events.append("cap.close")
+
+        class Stream:
+            def stop(self):
+                events.append("stream.stop")
+
+        class Driver:
+            def __init__(self):
+                self.stop_calls = 0
+
+            def stop(self):
+                self.stop_calls += 1
+                events.append("car.stop")
+                if self.stop_calls == 2:
+                    raise RuntimeError("stop failed")
+
+        messages = []
+        with patch.object(safe.subprocess, "Popen", return_value=Process()), \
+             patch.object(safe, "LaneClient", return_value=Lane()), \
+             patch.object(safe, "wait_ready", return_value=True), \
+             patch.object(safe, "hardware_components", return_value=(lambda *_: Cap(), lambda: Stream(), Driver, lambda *_, **__: object())), \
+             patch.object(safe, "preflight_infer", return_value=[0.0, 0.0]), \
+             patch.object(safe.TestRecorder, "create", return_value=Recorder()), \
+             patch.object(safe, "run_lane_loop", return_value="duration_elapsed"), \
+             patch("builtins.print", side_effect=messages.append):
+            safe.main(["--record-dir", "records"])
+
+        final_stop = len(events) - 1 - events[::-1].index("car.stop")
+        self.assertEqual(
+            [
+                "car.stop",
+                ("recorder.close", "duration_elapsed"),
+                "cap.close",
+                "stream.stop",
+                "lane.close",
+                "process.terminate",
+                "process.wait",
+            ],
+            events[final_stop:],
+        )
+        self.assertIn("SAFE_STOP reason=duration_elapsed", messages)
+
 
 class RecorderContractTests(unittest.TestCase):
     def test_session_name_is_utc_timestamp_with_random_hex_suffix(self):
