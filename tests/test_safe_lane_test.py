@@ -1,6 +1,11 @@
 import importlib.util
+import json
 from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 
 path = Path(__file__).parents[1] / "tools" / "safe_lane_test.py"
@@ -84,6 +89,93 @@ class SafetyTests(unittest.TestCase):
         )
         self.assertEqual("duration_elapsed", reason)
         self.assertEqual(1, car.calls)
+
+
+class RecorderContractTests(unittest.TestCase):
+    def test_session_name_is_utc_timestamp_with_random_hex_suffix(self):
+        now = safe.datetime.datetime(2026, 7, 16, 9, 8, 7, tzinfo=safe.datetime.timezone.utc)
+
+        name = safe.utc_session_name(now)
+
+        self.assertRegex(name, r"^20260716T090807Z-[0-9a-f]{8}$")
+
+    def test_create_record_session_creates_exclusive_child_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = safe.create_record_session(Path(directory), "session-1")
+
+            self.assertEqual(Path(directory) / "session-1", session)
+            self.assertTrue(session.is_dir())
+            with self.assertRaises(FileExistsError):
+                safe.create_record_session(Path(directory), "session-1")
+
+    def test_open_video_writer_uses_mp4v_20fps_and_rejects_closed_writer(self):
+        calls = []
+
+        class Writer:
+            def isOpened(self):
+                return False
+
+            def release(self):
+                pass
+
+        cv2 = SimpleNamespace(
+            VideoWriter_fourcc=lambda *codec: calls.append(codec) or 123,
+            VideoWriter=lambda path, fourcc, fps, size: calls.append((path, fourcc, fps, size)) or Writer(),
+        )
+        with patch.dict(sys.modules, {"cv2": cv2}):
+            with self.assertRaisesRegex(RuntimeError, "^recording_video_open_failed$"):
+                safe.open_video_writer("out.mp4", (320, 240))
+
+        self.assertEqual(("m", "p", "4", "v"), calls[0])
+        self.assertEqual(("out.mp4", 123, 20.0, (320, 240)), calls[1])
+
+    def test_recorder_writes_annotated_video_csv_and_atomic_metadata(self):
+        class Writer:
+            def __init__(self):
+                self.frames = []
+                self.released = False
+
+            def write(self, frame):
+                self.frames.append(frame)
+
+            def release(self):
+                self.released = True
+
+        writer = Writer()
+        cv2 = SimpleNamespace(FONT_HERSHEY_SIMPLEX=0, putText=lambda *args: args[0])
+        frame = SimpleNamespace(copy=lambda: "annotated-frame")
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(safe, "open_video_writer", return_value=writer), \
+             patch.dict(sys.modules, {"cv2": cv2}):
+            recorder = safe.TestRecorder.create(
+                directory, "session-1", (320, 240), {"speed": 0.08},
+            )
+            recorder.record(frame, 1.25, 3, 12.5, 25.0, 0.1, -0.2, 0.3, -0.4, 0.08, 0.0, -0.1)
+            recorder.close("duration_elapsed")
+            recorder.close("ignored")
+
+            session = Path(directory) / "session-1"
+            self.assertEqual(["annotated-frame"], writer.frames)
+            self.assertTrue(writer.released)
+            self.assertEqual(
+                ",".join(safe.CSV_FIELDS),
+                (session / "frames.csv").read_text(encoding="utf-8").splitlines()[0],
+            )
+            row = (session / "frames.csv").read_text(encoding="utf-8").splitlines()[1].split(",")
+            self.assertEqual("true", row[-1])
+            self.assertEqual("3", row[1])
+            self.assertFalse((session / "metadata.json.tmp").exists())
+            metadata = json.loads((session / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(1, metadata["format_version"])
+            self.assertEqual({"speed": 0.08}, metadata["parameters"])
+            self.assertEqual([320, 240], metadata["frame_size"])
+            self.assertEqual("annotated.mp4", metadata["video_file"])
+            self.assertEqual("frames.csv", metadata["csv_file"])
+            self.assertEqual(1, metadata["frame_count"])
+            self.assertEqual(1, metadata["video_frame_count"])
+            self.assertEqual("duration_elapsed", metadata["stop_reason"])
+            self.assertTrue(metadata["started_at_utc"])
+            self.assertTrue(metadata["ended_at_utc"])
 
 
 if __name__ == "__main__":

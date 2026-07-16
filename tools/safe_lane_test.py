@@ -1,5 +1,7 @@
 """Bounded lane-following test with a standalone, timeout-protected lane service."""
 import argparse
+import csv
+import datetime
 import importlib.util
 import json
 import math
@@ -7,10 +9,126 @@ import subprocess
 import sys
 import time
 import types
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = Path(__file__).with_name("lane_only_infer_server.py")
+
+CSV_FIELDS = [
+    "elapsed_s", "frame_index", "infer_ms", "loop_fps", "error_y", "error_angle",
+    "y_pid", "yaw_pid", "vx", "vy", "yaw", "video_written",
+]
+
+
+def utc_session_name(now=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    else:
+        now = now.astimezone(datetime.timezone.utc)
+    return now.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+
+
+def create_record_session(base_dir, session_name):
+    session_dir = Path(base_dir) / session_name
+    session_dir.mkdir(parents=True, exist_ok=False)
+    return session_dir
+
+
+def open_video_writer(path, size):
+    import cv2
+
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 20.0, size)
+    if not writer.isOpened():
+        writer.release()
+        raise RuntimeError("recording_video_open_failed")
+    return writer
+
+
+def _utc_timestamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class TestRecorder:
+    def __init__(self, session_dir, writer, csv_handle, csv_writer, frame_size, parameters):
+        self.session_dir = session_dir
+        self.writer = writer
+        self.csv_handle = csv_handle
+        self.csv_writer = csv_writer
+        self.frame_size = frame_size
+        self.parameters = parameters
+        self.started_at_utc = _utc_timestamp()
+        self.frame_count = 0
+        self.video_frame_count = 0
+        self.closed = False
+
+    @classmethod
+    def create(cls, base_dir, session_name, frame_size, parameters):
+        session_dir = create_record_session(base_dir, session_name)
+        writer = open_video_writer(session_dir / "annotated.mp4", frame_size)
+        csv_handle = (session_dir / "frames.csv").open("w", encoding="utf-8", newline="")
+        csv_writer = csv.DictWriter(csv_handle, fieldnames=CSV_FIELDS)
+        csv_writer.writeheader()
+        csv_handle.flush()
+        return cls(session_dir, writer, csv_handle, csv_writer, frame_size, parameters)
+
+    def record(self, frame, elapsed_s, frame_index, infer_ms, loop_fps, error_y, error_angle,
+               y_pid, yaw_pid, vx, vy, yaw):
+        if self.closed:
+            raise RuntimeError("recorder_closed")
+        import cv2
+
+        annotated = frame.copy()
+        lines = [
+            f"t={elapsed_s:.3f}s frame={frame_index} infer={infer_ms:.1f}ms fps={loop_fps:.1f}",
+            f"error_y={error_y:.3f} error_angle={error_angle:.3f}",
+            f"y_pid={y_pid:.3f} yaw_pid={yaw_pid:.3f}",
+            f"vx={vx:.3f} vy={vy:.3f} yaw={yaw:.3f}",
+        ]
+        for line_index, line in enumerate(lines):
+            cv2.putText(annotated, line, (8, 24 + line_index * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        self.writer.write(annotated)
+        self.video_frame_count += 1
+        self.csv_writer.writerow({
+            "elapsed_s": elapsed_s,
+            "frame_index": frame_index,
+            "infer_ms": infer_ms,
+            "loop_fps": loop_fps,
+            "error_y": error_y,
+            "error_angle": error_angle,
+            "y_pid": y_pid,
+            "yaw_pid": yaw_pid,
+            "vx": vx,
+            "vy": vy,
+            "yaw": yaw,
+            "video_written": "true",
+        })
+        self.csv_handle.flush()
+        self.frame_count += 1
+
+    def close(self, stop_reason):
+        if self.closed:
+            return
+        self.closed = True
+        self.writer.release()
+        self.csv_handle.close()
+        metadata = {
+            "format_version": 1,
+            "started_at_utc": self.started_at_utc,
+            "ended_at_utc": _utc_timestamp(),
+            "parameters": self.parameters,
+            "frame_size": list(self.frame_size),
+            "video_file": "annotated.mp4",
+            "csv_file": "frames.csv",
+            "frame_count": self.frame_count,
+            "video_frame_count": self.video_frame_count,
+            "stop_reason": stop_reason,
+        }
+        temporary = self.session_dir / "metadata.json.tmp"
+        temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(self.session_dir / "metadata.json")
 
 
 def validate_limits(speed, duration):
