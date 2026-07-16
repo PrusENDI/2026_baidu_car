@@ -150,8 +150,11 @@ class LaneLoopRecordingTests(unittest.TestCase):
         )
         self.assertEqual((0.05, -0.5, 0.75), car.calls[0])
         recorded = recorder.calls[0]
-        self.assertEqual(car.calls[0][1], recorded[10])
-        self.assertEqual(car.calls[0][2], recorded[11])
+        self.assertEqual(
+            ("frame", 0.0, 0, 10.0, 0.0, 0.25, -0.25,
+             -0.5, 0.75, 0.05, -0.5, 0.75),
+            recorded,
+        )
 
 
 class RecorderContractTests(unittest.TestCase):
