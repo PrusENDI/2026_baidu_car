@@ -26,6 +26,10 @@ wbt_car: 0.1
 camera:
   front: 1
   side: 2
+# 侧摄像头光轴相对机械中心的物理偏移，单位 m；负值表示偏左。
+# 当前现场标定为偏左 6 cm，实车遥测后可直接调整此值。
+camera_calibration:
+  side_center_offset_x_m: -0.06
 io:
   left_sensor: 8
   right_sensor: 7
@@ -55,13 +59,15 @@ speed:
 # 巡线 PID - 用于车道线巡航控制
 lane_pid:
   cfg_pid_y:
-    Kp: 5
+    # Orin 2026-07-17 最新巡线标定为 4；修改前 worktree 为 5。
+    Kp: 4
     Ki: 0.1
     Kd: 0
     setpoint: 0
     output_limits: [-0.7, 0.7]
   cfg_pid_angle:
-    Kp: 3
+    # Orin 2026-07-17 最新角度标定为 2；修改前 worktree 为 3。
+    Kp: 2
     Ki: 0
     Kd: 0
     setpoint: 0

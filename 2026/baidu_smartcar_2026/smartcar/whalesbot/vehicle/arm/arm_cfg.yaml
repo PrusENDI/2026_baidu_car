@@ -3,10 +3,12 @@ hand_cfg:
     angle_list:
       LEFT: 93
       MID: 0
+      # Orin 2026-07-17 最新副本标定值；另一运行副本曾使用 RIGHT: -9。
       RIGHT: -93
     port: 2
   hand2:
     angle_list:
+      # Orin 2026-07-17 最新副本标定值；另一运行副本曾使用 UP: -45。
       UP: -90
       MID: -37
       DOWN: 0
@@ -34,9 +36,10 @@ horiz_cfg:
   - 0.315
 pos_cfg:
   pose_enable: true
-  pose_horiz: 0
-  pose_vert: 0.20015250000000004
-  side: RIGHT
+  # Orin 2026-07-21 复位后保存的现场标定位置。
+  pose_horiz: 0.0
+  pose_vert: 0.19760500000000003
+  side: LEFT
 vert_cfg:
   motor:
     id: 3
