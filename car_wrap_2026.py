@@ -339,6 +339,9 @@ class MyCar(MecanumDriver):
         self.yaml_path = os.path.join(self.path_dir, "config_car.yml")
         # 获取配置
         cfg = get_yaml(self.yaml_path)
+        self.side_camera_center_offset_x_m = float(
+            cfg.get("camera_calibration", {}).get("side_center_offset_x_m", 0.0)
+        )
         # 根据配置设置sensor
         self.sensor_init(cfg)
 
@@ -1439,6 +1442,9 @@ class MyCar(MecanumDriver):
         x_c, y_c, w, h = det[4:]
 
         # 计算目标中心点在摄像头中的世界坐标
+        # 同步 Orin 2026-07-17 副本：该版本仍使用检测坐标加半宽/半高的计算。
+        # 修改前 worktree 代码：x = CAMERA_WIDTH * x_c；y = CAMERA_HEIGHT * y_c。
+        # 注意：get_target_location() 当前没有 auto_seeding() 调用方，保留该差异供后续单独标定。
         x = CAMERA_WIDTH * (x_c + w / 2)
         y = CAMERA_HEIGHT * (y_c + h / 2)
 
@@ -1448,14 +1454,28 @@ class MyCar(MecanumDriver):
 
         return loc_x, loc_y
 
+    @staticmethod
+    def _alignment_axis_reached(value, target, tolerance):
+        """判断视觉偏移是否达到指定目标，而不是默认要求偏移为零。"""
+        return abs(value - target) < tolerance
+
+    @staticmethod
+    def _camera_calibrated_delta_x(
+        task_delta_x, side_center_offset_x_m, view_width_m=0.33
+    ):
+        """把侧摄像头物理中心偏移换算并叠加到任务 dx 目标。"""
+        return task_delta_x - side_center_offset_x_m / view_width_m
+
     def move_to_detection_target(
         self,
         delta_x=0.0,
         delta_y: Union[float, None] = 0.0,
         label=None,
-        time_out=2.0,
+        # Orin 2026-07-17 最新超时为 10 秒；修改前 worktree 为 2 秒。
+        time_out=10.0,
         sort_pos=(0, 0),
         num=0,
+        arm_x_bounds=None,
     ):
         """
         前往目标位置
@@ -1483,8 +1503,16 @@ class MyCar(MecanumDriver):
             kp_x = 0.25
             ki_x = 0.05
 
+        calibrated_delta_x = self._camera_calibrated_delta_x(
+            delta_x, self.side_camera_center_offset_x_m
+        )
+        logger.info(
+            f"视觉对齐 dx 校准 task={delta_x:.6f}, "
+            f"camera_offset_m={self.side_camera_center_offset_x_m:.6f}, "
+            f"effective={calibrated_delta_x:.6f}"
+        )
         pid_x = PID(kp_x, ki_x)
-        pid_x.setpoint = delta_x
+        pid_x.setpoint = calibrated_delta_x
         while True:
             if self._stop_flag:
                 self.set_velocity(0, 0, 0)
@@ -1506,8 +1534,28 @@ class MyCar(MecanumDriver):
                 else:
                     out_y = kp_y * (dy - delta_y)
 
-                flag_x = x_count(abs(dx) < 0.04)
-                flag_y = y_count(abs(dy) < 0.02)
+                # 仅当调用方显式提供 arm_x_bounds 时限制机械臂水平修正；
+                # 默认 None 保持所有其他任务的原始视觉控制行为不变。
+                if arm_x_bounds is not None:
+                    x_min, x_max = arm_x_bounds
+                    x_now = self.arm.x_get_position()
+                    if x_now <= x_min and out_y < 0:
+                        out_y = 0
+                    elif x_now >= x_max and out_y > 0:
+                        out_y = 0
+
+                # 修改前直接判断 abs(dx)/abs(dy)，隐含目标永远是 0；
+                # 第一轮播种使用 delta_x=-0.1、delta_y=-0.05，已经达到
+                # 设定偏移时也会被错误判为未完成。
+                flag_x = x_count(
+                    self._alignment_axis_reached(dx, calibrated_delta_x, 0.04)
+                )
+                if delta_y is None:
+                    flag_y = True
+                else:
+                    flag_y = y_count(
+                        self._alignment_axis_reached(dy, delta_y, 0.02)
+                    )
                 if delta_y is None:
                     flag_y = True
 
@@ -1519,7 +1567,16 @@ class MyCar(MecanumDriver):
                     # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
                     self.set_velocity(0, 0, 0)
                     self.arm.x_speed(0)
-                    # return det[0],det[2]
+                    # 修改前这里只停车并继续循环，直到 timeout 才返回，造成
+                    # “明明已对齐却报超时”的假错误；现在立即返回检测结果。
+                    logger.info(
+                        f"视觉对齐完成 dx={dx:.6f}/{calibrated_delta_x:.6f}, "
+                        f"task_dx={delta_x:.6f}, "
+                        f"camera_offset_m={self.side_camera_center_offset_x_m:.6f}, "
+                        f"dy={dy:.6f}/{delta_y if delta_y is not None else 'None'}"
+                    )
+                    # Orin 2026-07-21 现场副本也已恢复达标后立即返回。
+                    return det[0], det[2]
             else:
                 x_count(False)
                 y_count(False)
@@ -1538,13 +1595,19 @@ class MyCar(MecanumDriver):
                 except:
                     return (None, None)
 
-    def adjust_arm_position(self, dis=0.05):
+    # Orin 2026-07-17 最新默认水平补偿为 3 cm。
+    # 修改前 worktree：def adjust_arm_position(self, dis=0.01):
+    def adjust_arm_position(self, dis=0.03):
         # print(f"arm side:{self.arm.side}")
         x_position = self.arm.x_get_position()
         if self.arm.side == "LEFT":
-            self.arm.move_x_position(x_position + dis)
+            # 把编码器闭环移动结果返回给调用方，便于放置前失败即退出。
+            return self.arm.move_x_position(x_position + dis)
         elif self.arm.side == "RIGHT":
-            self.arm.move_x_position(x_position - dis)
+            # RIGHT 侧的外伸方向与 LEFT 相反，因此从当前编码器位置减去补偿量。
+            return self.arm.move_x_position(x_position - dis)
+        logger.error(f"机械臂方向无效，无法执行水平补偿: side={self.arm.side}")
+        return False
 
     def debug(self, inference=False):
         """

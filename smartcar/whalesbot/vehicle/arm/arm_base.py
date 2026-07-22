@@ -33,8 +33,11 @@ from .. import (
 
 
 
-POSITION_ERROR_THRESHOLD = 4e-4 # 位置误差阈值
-STOP_CHECK_THRESHOLD = 1e-10 # 停止检查阈值
+# Orin 2026-07-17 最新阈值；修改前 worktree 分别为 4e-4 和 1e-10。
+POSITION_ERROR_THRESHOLD = 1e-3 # 位置误差阈值
+STOP_CHECK_THRESHOLD = 1e-4 # 停止检查阈值
+ARM_SERVO_COMMAND_RETRIES = 3
+ARM_SERVO_COMMAND_RETRY_DELAY = 0.5
 
 
 def get_path_relative(*args):
@@ -186,15 +189,40 @@ class ArmController:
         Args:
             target: 目标位置
         """
+        # 停止计数器重置为：last_record=None、count=0、stop_cout=10。
+        # 这会清除上一段运动累计的“位置未变”状态。
+        self.y_stop_flag = CountRecord(10)
+        # PID 到位计数器重置为：last_record=None、count=0、stop_cout=5。
+        # 新目标必须重新累计连续到位次数，不继承上一个目标。
+        self.y_pid_flag = CountRecord(5)
+        # 当前位置重置为下位机返回步数换算的竖直位置（米）。
+        # 该位置不是独立编码器测量值，不能反映已经发生的机械丢步。
+        self.y_pose_now = self.y_get_position()
+        # 上次位置重置为同一个当前位置，作为新动作的差分起点。
+        self.y_pose_last = self.y_pose_now
+        # 位置变化量显式重置为 0 米，不保留上一段运动的差值。
+        self.y_distance_change = 0
         self.y_pid.setpoint = target
         while True:
             if self.y_pid_moveto(target):
                 logger.info(f"移动到高度{target}")
                 break
             if self.y_stop_check():
-                logger.info(f"移到高度{target}过程中检测到停止")
+                logger.info(
+                    f"移到高度{target}过程中检测到停止，"
+                    # 已回退的 actual 高度遥测：不再执行。
+                    # f"actual={self.y_get_position():.6f}"
+                )
                 break
+            # 每个未完成循环额外等待 50 ms，让步进电机执行命令并更新步数位置。
+            # CountRecord(10) 最早约 0.5 秒判停，实际还需加上串口 I/O、PID 计算和调度耗时。
+            time.sleep(0.05)
         self.y_speed(0)
+        logger.info(
+            f"竖直运动结束 target={target}, "
+            # 已回退的运动结束 actual 遥测：不再执行。
+            # f"actual={self.y_get_position():.6f}"
+        )
 
     def x_params_init(self, motor, pid, threshold):
         """
@@ -262,48 +290,112 @@ class ArmController:
         else:
             return False
 
-    def move_x_position(self, target, out_time = 6.0):
+    def move_x_position(self, target, out_time=6.0) -> bool:
         """
-        移动水平方向指定位置
+        根据编码器位置移动水平轴，不在普通移动中重新定义零点。
 
         Args:
             target: 目标位置
+            out_time: 最长运动时间
+
+        Returns:
+            bool: 编码器位置到达目标时返回 True；停滞、超时或越界时返回 False。
         """
-        end_time = time.time()+out_time
+        x_min, x_max = self.x_threshold
+        if target < x_min or target > x_max:
+            self.x_speed(0)
+            logger.error(
+                f"水平目标越界 target={target}, "
+                f"allowed=[{x_min}, {x_max}]"
+            )
+            return False
+
+        # 每个新目标都重置停滞计数、到位计数和编码器位置差分基准。
+        # 否则 reset_x() 或上一次移动留下的“已停止”状态会让新动作立即退出。
+        self.x_stop_flag = CountRecord(10)
+        self.x_pid_flag = CountRecord(5)
+        self.x_pose_now = self.x_get_position()
+        self.x_pose_last = self.x_pose_now
+        self.x_distance_change = 0
+
+        # reset_x() 寻零时使用低速限制；普通编码器移动恢复 YAML 中的速度范围。
+        self.x_pid.output_limits = self.x_velocity_limit
+        self.x_pid.reset()
         self.x_pid.setpoint = target
-        while True:
-            if time.time() > end_time:
-                break
-            if self.x_pid_moveto(target):
-                break
-            if self.x_stop_check():
-                dis = self.motor_x.get_dis()
-                if dis <0.15:
-                    self.x_pose_start = dis
-                else:
-                    self.x_pose_start = dis - 0.31
-                break
-            time.sleep(0.05)
-        self.x_speed(0)
+
+        logger.info(f"移动到水平位置{target}")
+        end_time = time.time() + out_time
+        try:
+            while True:
+                if time.time() > end_time:
+                    logger.error(
+                        f"水平移动超时 target={target}, "
+                        f"actual={self.x_get_position():.6f}"
+                    )
+                    return False
+                if self.x_pid_moveto(target):
+                    logger.info(
+                        f"水平移动完成 target={target}, "
+                        f"actual={self.x_get_position():.6f}"
+                    )
+                    return True
+                if self.x_stop_check():
+                    logger.error(
+                        f"水平移动停滞 target={target}, "
+                        f"actual={self.x_get_position():.6f}"
+                    )
+                    return False
+                time.sleep(0.05)
+        finally:
+            # 无论到位、停滞、超时还是异常，都必须撤销水平轴速度。
+            self.x_speed(0)
 
 
 
-    def reset_x(self):
+    def reset_x(self, out_time=8.0) -> bool:
         """
-        重置水平方向位置
+        低速移向机械回收端，编码器持续停止后建立水平零点。
+
+        只有该寻零函数可以修改 x_pose_start。
         """
         target = -0.33
+        self.x_stop_flag = CountRecord(10)
+        self.x_pid_flag = CountRecord(5)
+        self.x_pose_now = self.x_get_position()
+        self.x_pose_last = self.x_pose_now
+        self.x_distance_change = 0
+
         self.x_pid.output_limits = (-0.06, 0.06)
+        self.x_pid.reset()
         self.x_pid.setpoint = target
-        while True:
-            if self.x_pid_moveto(target):
-                break
-            if self.x_stop_check():
-                self.x_pose_start = self.motor_x.get_dis()
-                self.x_pose_now = 0
-                self.x_pose_last = 0
-                break
-        self.x_speed(0)
+        end_time = time.time() + out_time
+        try:
+            while True:
+                if time.time() > end_time:
+                    logger.error(
+                        f"水平轴寻零超时 actual={self.x_get_position():.6f}"
+                    )
+                    return False
+
+                # 寻零的成功条件是回收端持续无位移，不是达到虚拟 target=-0.33。
+                # TODO(reset-x-homing-safety): 当前仅凭“编码器连续无位移”认定到达回收端。
+                # 电机未启动、编码器故障、传动卡滞或中途碰撞也会满足该条件，
+                # 从而把错误的物理位置重新定义为 x=0。后续应至少先确认发生了
+                # 足够的负向位移，再允许停滞建立零点；更可靠的方案是增加独立限位开关。
+                self.x_pid_moveto(target)
+                if self.x_stop_check():
+                    self.x_pose_start = self.motor_x.get_dis()
+                    self.x_pose_now = 0
+                    self.x_pose_last = 0
+                    self.x_distance_change = 0
+                    logger.info("水平轴寻零完成 x=0")
+                    return True
+                time.sleep(0.05)
+        finally:
+            self.x_speed(0)
+            # 寻零结束后恢复普通水平移动的 PID 输出范围。
+            self.x_pid.output_limits = self.x_velocity_limit
+            self.x_pid.reset()
 
     def hand_params_init(self, hand, hand2, grap):
         """
@@ -328,8 +420,9 @@ class ArmController:
         Args:
             value: 抓取状态, True为抓取, False为释放
         """
-        self.pump.set(not value)
-        self.valve.set(value)
+        # Orin 2026-07-17 最新硬件极性；修改前为 pump.set(not value)、valve.set(value)。
+        self.pump.set(value)
+        self.valve.set(not value)
 
 
     def position_params_init(self, pose_enable, pose_horiz, pose_vert, side):
@@ -424,18 +517,45 @@ class ArmController:
         """
         重置机械臂位置
         """
+        print(
+            f"[ARM_RESET] begin side={self.side} "
+            f"angle={getattr(self, '_arm_angle_last', None)} "
+            f"hand_angle={getattr(self, '_hand_angle_last', None)}",
+            flush=True,
+        )
         thread_reset_y = Thread(target=self.reset_y)
         thread_reset_x = Thread(target=self.reset_x)
 
+        print("[ARM_RESET] sending hand=UP", flush=True)
         self.set_hand_angle("UP")
+        print("[ARM_RESET] sending arm=RIGHT", flush=True)
         self.set_arm_angle("RIGHT")
+        print(
+            f"[ARM_RESET] angle command sent side={self.side} "
+            f"angle={self.angle} hand_angle={self.hand_angle}",
+            flush=True,
+        )
         thread_reset_y.daemon = True
         thread_reset_x.daemon = True
         thread_reset_y.start()
         thread_reset_x.start()
         thread_reset_y.join()
         thread_reset_x.join()
+        print(
+            f"[ARM_RESET] linear reset complete x={self.x_get_position():.6f} "
+            f"y={self.y_get_position():.6f}",
+            flush=True,
+        )
+        # Orin 最新便捷属性以毫米为单位；修改前仅由 reset_x/reset_y 更新内部 pose。
+        self.x = 0
+        self.y = 0
         self.save_config()
+        print(
+            f"[ARM_RESET] end side={self.side} angle={self.angle} "
+            f"hand_angle={self.hand_angle} x={self.x_get_position():.6f} "
+            f"y={self.y_get_position():.6f}",
+            flush=True,
+        )
 
     def switch_side(self, side):
         """
@@ -468,8 +588,14 @@ class ArmController:
             self.side = _angle
             assert _angle in ("LEFT", "MID", "RIGHT"), "Direction should be LEFT, MID, or RIGHT"
             _angle = self.hand_angle_list[_angle]
-        # logger.info(f"设置arm转到{_angle}")
-        self.arm_servo.set_angle( _angle, speed)
+        # 保存实际下发角度，供 angle 便捷属性读取；修改前 worktree 不记录最后角度。
+        self._arm_angle_last = _angle
+        # 总线舵机没有通过公共接口返回实际角度或执行结果；首帧立即发送，
+        # 再短间隔重复同一目标，降低共享串口上偶发丢帧造成未翻转的概率。
+        for attempt in range(ARM_SERVO_COMMAND_RETRIES):
+            self.arm_servo.set_angle(_angle, speed)
+            if attempt < ARM_SERVO_COMMAND_RETRIES - 1:
+                time.sleep(ARM_SERVO_COMMAND_RETRY_DELAY)
 
     def set_hand_angle(self, angle: Union[str, int] = "UP", speed=80):
         """
@@ -482,6 +608,8 @@ class ArmController:
         if isinstance(angle, str):
             assert angle in ("UP","MID","DOWN"), "Direction should be UP, MID, or DOWN"
             angle = self.hand_angle_list2[angle]
+        # 保存实际下发角度，供 hand_angle 便捷属性读取。
+        self._hand_angle_last = angle
         self.hand_servo.set_angle(angle, speed)  
 
 
@@ -647,6 +775,46 @@ class ArmController:
             time.sleep(1)
         if hand is not None:
             self.set_hand_angle(hand)
+
+    # ==================== Orin 2026-07-17 便捷属性接口 ====================
+    # 修改前 worktree 没有以下毫米/角度属性，只能直接调用 move_* 和 set_* 方法。
+    @property
+    def y(self) -> float:
+        """获取当前竖直位置（单位：mm）。"""
+        return self.y_get_position() * 1000.0
+
+    @y.setter
+    def y(self, mm: float):
+        """设置目标竖直位置（单位：mm）。"""
+        self.move_y_position(mm / 1000.0)
+
+    @property
+    def x(self) -> float:
+        """获取当前水平位置（单位：mm）。"""
+        return self.x_get_position() * 1000.0
+
+    @x.setter
+    def x(self, mm: float):
+        """设置目标水平位置（单位：mm）。"""
+        self.move_x_position(mm / 1000.0)
+
+    @property
+    def angle(self) -> float:
+        """获取手臂舵机最近一次下发角度。"""
+        return self._arm_angle_last if hasattr(self, '_arm_angle_last') else 0
+
+    @angle.setter
+    def angle(self, val: Union[str, int]):
+        self.set_arm_angle(val)
+
+    @property
+    def hand_angle(self) -> float:
+        """获取手部舵机最近一次下发角度。"""
+        return self._hand_angle_last if hasattr(self, '_hand_angle_last') else 0
+
+    @hand_angle.setter
+    def hand_angle(self, val: Union[str, int]):
+        self.set_hand_angle(val)
 
 
 

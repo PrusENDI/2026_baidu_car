@@ -43,7 +43,38 @@ def init():
     my_car.reset_position()  #
 
 
+def auto_lane_tracing(speed=0.3, dis_hold=0.85):
+    """同步自 Orin 2026-07-17 副本的独立巡线调试入口。"""
+    my_car.lane_dis_offset(speed=speed, dis_hold=dis_hold)
+    print(f"巡线停止的位置：{my_car.get_odometry()}")
+
+
 def auto_seeding():
+
+    # 遥测范围说明：以下两个局部函数只读取状态并打印，不调用任何运动、抓取、释放或停车控制。
+    # latest_detection_offsets() 会在视觉对齐返回后额外读取一帧检测结果，用于记录最后可见的 dx/dy；
+    # 该额外读取不会改变 PID、速度、阈值、超时、标签选择或保存位姿逻辑。
+    def print_arm_telemetry(stage, loop=None, expected_key=None, label=None,
+                            cls_id=None, dx=None, dy=None, saved_pose=None):
+        """打印播种抓取/放置阶段的最小遥测，不改变控制行为。"""
+        odom = my_car.get_odometry()
+        arm_x = my_car.arm.x_get_position()
+        arm_y = my_car.arm.y_get_position()
+        print(
+            "[AUTO_SEEDING_TELEMETRY] "
+            f"stage={stage} loop={loop} expected_key={expected_key} "
+            f"label={label} cls_id={cls_id} dx={dx} dy={dy} "
+            f"arm_x={arm_x:.4f} arm_y={arm_y:.4f} side={my_car.arm.side} "
+            f"odom={odom} saved_pose={saved_pose}",
+            flush=True,
+        )
+
+    def latest_detection_offsets():
+        """读取对齐后的最新检测偏差，仅用于遥测。"""
+        detections = my_car.get_detection_results()
+        if not detections:
+            return None, None
+        return detections[0][4], detections[0][5]
 
     x_length = 0.45  # 基地前方转角的位置，用于计算播种位置
     dis = 0.55  # 转角后第一个播种点的距离
@@ -58,17 +89,42 @@ def auto_seeding():
     cylinder_list = ["cylinder_3", "cylinder_2", "cylinder_1"]
     cylinder_set_list = {}
 
+    # 右侧播种专用参数：第二轮三次抓取均在视觉识别前向车体右侧横移 0.02 m。
+    RIGHT_SEEDING_PRE_DETECTION_OFFSET = [0.0, -0.06, 0.0]
+    RIGHT_SEEDING_ARM_X_PRESET = 0.25
+    RIGHT_SEEDING_ARM_Y_PRESET = 0.20
+    RIGHT_SEEDING_ARM_X_BOUNDS = (0.24, 0.260)
+
     # 设置机械臂初始状态
-    my_car.arm.set_arm_pose(0.0, 0.2, "LEFT", "DOWN")
+    # Orin 2026-07-17 最新值：初始化手部使用 UP；修改前 worktree 为 DOWN。
+    # 修改前代码：my_car.arm.set_arm_pose(0.0, 0.2, "LEFT", "DOWN")
+    my_car.arm.set_arm_pose(0.0, 0.2, "LEFT", "UP")
     my_car.lane_dis_offset(speed=0.3, dis_hold=0.85)
     time.sleep(0.5)
     print(f"巡线停止的位置：{my_car.get_odometry()}")
 
     for i in range(3):
+        # 第一轮仍按原流程保存 odometry 和 arm_x；新增日志用于核对循环 key、识别 label 与保存位姿。
         my_car.move_to_position(cylinder_loc[cylinder_list[i]])
-        my_car.move_to_detection_target()
+        # Orin 2026-07-17 最新标定：图像目标偏置为 (-0.1, -0.05)。
+        # 修改前代码：first_cls_id, first_label = my_car.move_to_detection_target()
+        first_cls_id, first_label = my_car.move_to_detection_target(
+            delta_x=-0.1, delta_y=-0.05
+        )
+        first_dx, first_dy = latest_detection_offsets()
+        print_arm_telemetry(
+            "save_pose_after_alignment",
+            loop=i,
+            expected_key=cylinder_list[i],
+            label=first_label,
+            cls_id=first_cls_id,
+            dx=first_dx,
+            dy=first_dy,
+        )
         x, y, z = my_car.get_odometry()
-        pose = [x, y, z, my_car.arm.x_get_position()]
+        corrected_x = x + 0.05 * math.cos(z)
+        corrected_y = y + 0.05 * math.sin(z)
+        pose = [corrected_x, corrected_y, z, my_car.arm.x_get_position()]
         print(f"第{i}个播种位置{pose}")
         cylinder_set_list[cylinder_list[i]] = pose
         my_car.beep()
@@ -76,39 +132,161 @@ def auto_seeding():
     print(cylinder_set_list)
 
     for i in range(3):
+        # 第二轮仍按原流程执行右侧抓取、恢复保存位姿、左侧放置；各日志点只标记控制动作前后状态。
         # 移动手臂到右侧高处
-        my_car.arm.move_y_position(0.2)
-        my_car.arm.move_x_position(0.3)
+        # 先抬高机械臂，再在当前一侧收回水平轴，避免伸出状态旋转时碰撞限位。
+        my_car.arm.move_y_position(RIGHT_SEEDING_ARM_Y_PRESET)
+        # 旋转前必须低速触达物理回收端并重新建立 x=0，避免编码器累计漂移。
+        if not my_car.arm.reset_x():
+            raise RuntimeError("右侧抓取前水平轴物理回收端寻零失败，禁止旋转到 RIGHT")
+
+        # 只有水平轴收回成功后才旋转到 RIGHT；set_arm_pose() 内部会等待舅机动作。
         my_car.arm.set_arm_pose(arm="RIGHT")
 
+        # 旋转完成后再伸到右侧播种专用预抓取位置，其他任务的水平位置不受影响。
+        if not my_car.arm.move_x_position(RIGHT_SEEDING_ARM_X_PRESET):
+            raise RuntimeError(
+                f"旋转到 RIGHT 后水平轴预伸出失败: "
+                f"target={RIGHT_SEEDING_ARM_X_PRESET}"
+            )
+        print_arm_telemetry(
+            "right_pre_alignment",
+            loop=i,
+            expected_key=cylinder_list[i],
+        )
+
         # 对齐目标，识别
-        my_car.move_to_position(cylinder_loc[cylinder_list[i]])
+        # 完整执行原有到点轨迹；三次抓取均在到点停车后、视觉识别前修正车体坐标。
+        base_pose = cylinder_loc[cylinder_list[i]]
+        my_car.move_to_position(base_pose)
         time.sleep(0.5)
-        cls_id, label = my_car.move_to_detection_target()
+        correction_before = my_car.get_odometry()
+        print(
+            "[AUTO_SEEDING_COORD_CORRECTION] "
+            f"stage=right_pre_detection_offset loop={i} "
+            f"expected_key={cylinder_list[i]} "
+            f"offset={RIGHT_SEEDING_PRE_DETECTION_OFFSET} "
+            f"odom={correction_before}",
+            flush=True,
+        )
+        my_car.move_for(RIGHT_SEEDING_PRE_DETECTION_OFFSET)
+        correction_after = my_car.get_odometry()
+        print(
+            "[AUTO_SEEDING_COORD_CORRECTION] "
+            f"stage=right_post_detection_offset loop={i} "
+            f"expected_key={cylinder_list[i]} "
+            f"offset={RIGHT_SEEDING_PRE_DETECTION_OFFSET} "
+            f"odom={correction_after}",
+            flush=True,
+        )
+        time.sleep(0.5)
+        cls_id, label = my_car.move_to_detection_target(
+            arm_x_bounds=RIGHT_SEEDING_ARM_X_BOUNDS
+        )
+        dx, dy = latest_detection_offsets()
+        print_arm_telemetry(
+            "right_after_alignment",
+            loop=i,
+            expected_key=cylinder_list[i],
+            label=label,
+            cls_id=cls_id,
+            dx=dx,
+            dy=dy,
+        )
         print(f"识别到目标{cls_id}-{label}")
         my_car.beep()
         pose = cylinder_set_list[label]
 
         # 调整气泵吸嘴对齐目标
+        # 右侧抓取前尝试水平补偿；即使补偿未到位，也按现场要求继续抓取。
         my_car.adjust_arm_position()
+        print_arm_telemetry(
+            "right_after_adjust",
+            loop=i,
+            expected_key=cylinder_list[i],
+            label=label,
+            cls_id=cls_id,
+            dx=dx,
+            dy=dy,
+            saved_pose=pose,
+        )
         # 吸起目标
+        print_arm_telemetry(
+            "right_before_grasp",
+            loop=i,
+            expected_key=cylinder_list[i],
+            label=label,
+            cls_id=cls_id,
+            dx=dx,
+            dy=dy,
+            saved_pose=pose,
+        )
         my_car.arm.grasp(True)
+        print_arm_telemetry(
+            "right_after_grasp",
+            loop=i,
+            expected_key=cylinder_list[i],
+            label=label,
+            cls_id=cls_id,
+            dx=dx,
+            dy=dy,
+            saved_pose=pose,
+        )
         my_car.arm.move_y_position(0.01)
         time.sleep(0.5)
+        # Orin 2026-07-21 现场调整：抓取后抬升到 0.2 m。
         my_car.arm.move_y_position(0.2)
 
-        # 移动到目标播种处
-        my_car.arm.move_x_position(pose[3])
+        # 抓取后仍保持 RIGHT，低速触达物理回收端并重建 x=0；
+        # 只有寻零成功后才允许旋转到 LEFT，避免编码器漂移造成误判。
+        if not my_car.arm.reset_x():
+            raise RuntimeError("右侧抓取后水平轴物理回收端寻零失败，禁止旋转到 LEFT")
         my_car.arm.set_arm_pose(arm="LEFT")
         time.sleep(1)
+        if not my_car.arm.move_x_position(pose[3]):
+            raise RuntimeError(
+                f"LEFT 侧水平轴伸出失败: target={pose[3]}"
+            )
+        time.sleep(1)
+        print_arm_telemetry(
+            "left_before_place_alignment",
+            loop=i,
+            expected_key=cylinder_list[i],
+            label=label,
+            cls_id=cls_id,
+            saved_pose=pose,
+        )
         my_car.move_to_position(pose[:3])
-        my_car.adjust_arm_position()
+        if not my_car.adjust_arm_position():
+            raise RuntimeError("LEFT 侧放置前水平补偿失败，禁止继续释放")
+        place_detection = next((det for det in my_car.get_detection_results() if det[2] == label), None)
+        place_dx, place_dy = place_detection[4:6] if place_detection else (None, None)
+        print_arm_telemetry(
+            "left_after_adjust_before_release",
+            loop=i,
+            expected_key=cylinder_list[i],
+            label=label,
+            cls_id=cls_id,
+            dx=place_dx,
+            dy=place_dy,
+            saved_pose=pose,
+        )
         my_car.arm.move_y_position(0.04)
         my_car.arm.grasp(False)
+        print_arm_telemetry(
+            "left_after_release",
+            loop=i,
+            expected_key=cylinder_list[i],
+            label=label,
+            cls_id=cls_id,
+            saved_pose=pose,
+        )
         time.sleep(1)
 
     my_car.arm.move_y_position(0.1)
-    my_car.arm.set_arm_pose(hand="UP")
+    # Orin 2026-07-17 最新结束姿态为 DOWN；修改前 worktree 为 UP。
+    # 修改前代码：my_car.arm.set_arm_pose(hand="UP")
+    my_car.arm.set_arm_pose(hand="DOWN")
     my_car.arm.move_x_position(0.15)
     my_car.move_to_position(cylinder_loc[cylinder_list[0]])
     print("播种完成")
