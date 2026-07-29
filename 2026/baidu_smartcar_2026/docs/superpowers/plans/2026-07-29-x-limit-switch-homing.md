@@ -166,3 +166,76 @@ rg -n "x_pose_start\s*=" smartcar/whalesbot/vehicle/arm/arm_base.py
 Expected: task code has no direct `reset_x()` calls; startup keeps no-argument `reset_position()`; `get_order()` uses `rehome_x=False`; only initialization/pose restoration and the stable-switch success branch assign `x_pose_start`.
 
 > Per the user's explicit instruction, this implementation plan adds no tests and performs no red/green TDD cycle. It does not run the diagnostic reader, real switch reads, motor homing, or any `move_x_position()` hardware action.
+
+### Task 6: Stop on the first triggered sample before debounce
+
+**Files:**
+- Modify: `smartcar/whalesbot/vehicle/arm/arm_base.py:511-552`
+
+- [ ] **Step 1: Separate moving detection from stopped confirmation**
+
+In `reset_x()`, keep the initial negative speed command. During the movement loop, read AI1 before refreshing the negative speed. On the first triggered sample, immediately call `self.x_speed(0)`, count that sample as the first stable sample, and leave the movement loop. Only released samples may refresh the negative speed and participate in encoder-stall detection.
+
+```python
+self.x_speed(-homing_speed)
+triggered_samples = 0
+while True:
+    if time.time() > end_time:
+        logger.error(
+            f"水平轴寻零超时 actual={self.x_get_position():.6f}"
+        )
+        return False
+
+    raw = self._read_x_limit_fresh()
+    if self._x_limit_is_triggered(raw):
+        self.x_speed(0)
+        triggered_samples = 1
+        break
+
+    self.x_speed(-homing_speed)
+    self.x_pose_now = self.x_get_position()
+    self.x_distance_change = self.x_pose_now - self.x_pose_last
+    self.x_pose_last = self.x_pose_now
+    if self.x_stop_check():
+        logger.error(
+            f"X 轴归零期间编码器停滞，未建立零点 "
+            f"actual={self.x_get_position():.6f}, raw={raw:.1f}"
+        )
+        return False
+    time.sleep(0.05)
+```
+
+- [ ] **Step 2: Confirm the remaining samples while stopped**
+
+After leaving the movement loop, keep X stopped and collect the remaining samples at the existing 20 ms debounce interval. A timeout, read error, or released sample returns `False`; a released sample must not restart the motor.
+
+```python
+while triggered_samples < self.x_limit_stable_samples:
+    if time.time() > end_time:
+        logger.error("X 轴触发后稳定确认超时，未建立零点")
+        return False
+    time.sleep(0.02)
+    raw = self._read_x_limit_fresh()
+    if not self._x_limit_is_triggered(raw):
+        logger.error(
+            f"X 轴触发后信号回落，未建立零点 "
+            f"port=AI{self.x_limit_port}, raw={raw:.1f}, "
+            f"stable_samples={triggered_samples}/"
+            f"{self.x_limit_stable_samples}"
+        )
+        return False
+    triggered_samples += 1
+```
+
+Leave the existing success branch after this loop: read the stopped encoder position, update `x_pose_start`, clear X position state, set `x_zero_valid = True`, and return `True`. Retain the unconditional `x_speed(0)` in `finally`.
+
+- [ ] **Step 3: Perform static verification only**
+
+Run:
+
+```powershell
+git diff --check -- smartcar/whalesbot/vehicle/arm/arm_base.py
+python -m py_compile smartcar/whalesbot/vehicle/arm/arm_base.py
+```
+
+Expected: both commands exit with code 0. Do not import the hardware stack, run the diagnostic reader, or execute any real motor or homing command.
