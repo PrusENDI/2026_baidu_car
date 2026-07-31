@@ -37,6 +37,7 @@ from ..base.controller_wrap import AnalogInput2
 # Orin 2026-07-17 最新阈值；修改前 worktree 分别为 4e-4 和 1e-10。
 POSITION_ERROR_THRESHOLD = 1e-3 # 位置误差阈值
 STOP_CHECK_THRESHOLD = 1e-4 # 停止检查阈值
+X_LIMIT_CONFIRM_TIMEOUT = 0.5 # 首次触发后静止消抖的最长时间
 ARM_SERVO_COMMAND_RETRIES = 3
 ARM_SERVO_COMMAND_RETRY_DELAY = 0.5
 
@@ -334,6 +335,87 @@ class ArmController:
             return raw >= self.x_limit_threshold
         return raw <= self.x_limit_threshold
 
+    def _read_x_encoder_fresh(self):
+        """读取一次新鲜 X 编码器位置，不复用 MC602 的旧缓存。"""
+        motor = getattr(self, "motor_x", None)
+        device = getattr(getattr(motor, "motor", None), "encoder_2", None)
+        if device is None or not hasattr(device, "last_data"):
+            raise RuntimeError("X 轴编码器不支持新鲜采样检查")
+
+        device.last_data = None
+        try:
+            position = float(motor.get_dis())
+        except (TypeError, ValueError) as exc:
+            if device.last_data is None:
+                raise RuntimeError("MC602 未返回新的 X 轴编码器样本") from exc
+            raise RuntimeError("X 轴编码器样本无法转换为数值") from exc
+        if device.last_data is None:
+            raise RuntimeError("MC602 未返回新的 X 轴编码器样本")
+        if not math.isfinite(position):
+            raise RuntimeError(
+                f"X 轴编码器样本不是有限数值 position={position!r}"
+            )
+        return position - self.x_pose_start
+
+    def _confirm_x_limit_stopped(self, trigger_reason, initial_raw, end_time):
+        """停止 X 后，在限定时间内确认 AI1 连续稳定触发。"""
+        self.x_speed(0)
+        confirm_start = time.time()
+        confirm_end = min(end_time, confirm_start + X_LIMIT_CONFIRM_TIMEOUT)
+        raw = initial_raw
+        triggered_samples = (
+            1 if self._x_limit_is_triggered(initial_raw) else 0
+        )
+        max_triggered_samples = triggered_samples
+
+        try:
+            while triggered_samples < self.x_limit_stable_samples:
+                remaining = confirm_end - time.time()
+                if remaining <= 0:
+                    logger.error(
+                        f"X 轴静止限位确认超时，未建立零点 "
+                        f"reason={trigger_reason}, port=AI{self.x_limit_port}, "
+                        f"raw={raw:.1f}, stable_samples={triggered_samples}/"
+                        f"{self.x_limit_stable_samples}, "
+                        f"max_stable_samples={max_triggered_samples}, "
+                        f"elapsed={time.time() - confirm_start:.3f}s"
+                    )
+                    return False, raw, triggered_samples
+
+                time.sleep(min(0.02, remaining))
+                raw = self._read_x_limit_fresh()
+                if self._x_limit_is_triggered(raw):
+                    triggered_samples += 1
+                    max_triggered_samples = max(
+                        max_triggered_samples, triggered_samples
+                    )
+                    continue
+
+                if triggered_samples > 0:
+                    logger.warning(
+                        f"X 轴静止限位确认检测到抖动，保持停止并重新计数 "
+                        f"reason={trigger_reason}, port=AI{self.x_limit_port}, "
+                        f"raw={raw:.1f}, stable_samples={triggered_samples}/"
+                        f"{self.x_limit_stable_samples}"
+                    )
+                triggered_samples = 0
+
+            logger.info(
+                f"X 轴静止限位确认完成 reason={trigger_reason}, "
+                f"port=AI{self.x_limit_port}, raw={raw:.1f}, "
+                f"stable_samples={triggered_samples}, "
+                f"elapsed={time.time() - confirm_start:.3f}s"
+            )
+            return True, raw, triggered_samples
+        except Exception as exc:
+            logger.error(
+                f"X 轴静止限位确认异常 reason={trigger_reason}, "
+                f"type={type(exc).__name__}, error={exc}, "
+                f"max_stable_samples={max_triggered_samples}, "
+                f"elapsed={time.time() - confirm_start:.3f}s"
+            )
+            return False, raw, triggered_samples
+
     def x_stop_check(self):
         """
         检查水平方向是否停止
@@ -509,7 +591,8 @@ class ArmController:
                     time.sleep(0.02)
 
             self.x_speed(-homing_speed)
-            triggered_samples = 0
+            confirm_reason = None
+            confirm_initial_raw = None
             while True:
                 if time.time() > end_time:
                     logger.error(
@@ -519,46 +602,44 @@ class ArmController:
 
                 raw = self._read_x_limit_fresh()
                 if self._x_limit_is_triggered(raw):
-                    # 首次触发立即停止；后续消抖只能在静止状态下进行，不能继续
-                    # 向机械限位方向顶压微动开关。
-                    self.x_speed(0)
-                    triggered_samples = 1
+                    confirm_reason = "limit_triggered_while_moving"
+                    confirm_initial_raw = raw
                     break
 
                 # MC602 速度命令需要周期刷新；仅在开关仍松开时继续发送负向
                 # 速度，避免下位机看门狗停止输出后被误判为编码器停滞。
                 self.x_speed(-homing_speed)
-                self.x_pose_now = self.x_get_position()
+                try:
+                    self.x_pose_now = self._read_x_encoder_fresh()
+                except Exception as exc:
+                    # 编码器本次无新响应时不能把旧缓存当作“停滞”。
+                    # 进入统一静止确认，不能用一次 AI1 低电平直接判失败。
+                    confirm_reason = (
+                        f"encoder_read_error:{type(exc).__name__}:{exc}"
+                    )
+                    confirm_initial_raw = raw
+                    break
                 self.x_distance_change = self.x_pose_now - self.x_pose_last
                 self.x_pose_last = self.x_pose_now
 
                 if self.x_stop_check():
-                    logger.error(
-                        f"X 轴归零期间编码器停滞，未建立零点 "
-                        f"actual={self.x_get_position():.6f}, raw={raw:.1f}"
+                    # 停滞判断只发生在非零速度运动阶段。机械触发后编码器
+                    # 停止可能是预期机械触发，必须进入统一静止确认。
+                    confirm_reason = (
+                        f"encoder_stall:actual={self.x_pose_now:.6f}"
                     )
-                    return False
+                    confirm_initial_raw = raw
+                    break
                 time.sleep(0.05)
 
-            # 首次高电平已经停止电机；在静止状态下补采剩余触发样本。
-            # 信号一旦回落就保持停止并失败，不恢复运动，也不建立零点。
-            while triggered_samples < self.x_limit_stable_samples:
-                if time.time() > end_time:
-                    logger.error("X 轴触发后稳定确认超时，未建立零点")
-                    return False
-                time.sleep(0.02)
-                raw = self._read_x_limit_fresh()
-                if not self._x_limit_is_triggered(raw):
-                    logger.error(
-                        f"X 轴触发后信号回落，未建立零点 "
-                        f"port=AI{self.x_limit_port}, raw={raw:.1f}, "
-                        f"stable_samples={triggered_samples}/"
-                        f"{self.x_limit_stable_samples}"
-                    )
-                    return False
-                triggered_samples += 1
+            confirmed, raw, triggered_samples = self._confirm_x_limit_stopped(
+                confirm_reason, confirm_initial_raw, end_time
+            )
+            if not confirmed:
+                return False
 
-            self.x_pose_start = self.motor_x.get_dis()
+            # 机械零点必须使用停止后的新鲜编码器帧，不能复用运动阶段缓存。
+            self.x_pose_start += self._read_x_encoder_fresh()
             self.x_pose_now = 0
             self.x_pose_last = 0
             self.x_distance_change = 0
