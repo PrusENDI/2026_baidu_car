@@ -28,6 +28,7 @@ from .. import (
     AnalogInput, MotorWrap, Key4Btn, ServoPwm,
     ServoBus, StepperWrap, PoutD
 )
+from ..base.controller_wrap import AnalogInput2
 
 # 常量定义
 
@@ -75,6 +76,7 @@ class ArmController:
         """
         初始化机械臂控制类
         """
+        # 初始化对象状态。
         self.yaml_path = get_path_relative("arm_cfg.yaml")
 
         with open(self.yaml_path, 'r') as f:
@@ -100,6 +102,7 @@ class ArmController:
             pid: PID参数
             threshold: 位置阈值
         """
+        # 初始化相关资源。
         self.motor_y = StepperWrap(**motor)
         self.y_limit_sensor = AnalogInput(limit_port)
 
@@ -121,6 +124,7 @@ class ArmController:
         Returns:
             bool: 是否到达限位
         """
+        # 复位相关状态。
         return self.y_limit_sensor.read() > 1000  # 磁敏传感器的值大于1000时, 则认为到达限位位置
 
     def y_stop_check(self):
@@ -130,10 +134,12 @@ class ArmController:
         Returns:
             bool: 是否停止
         """
+        # 停止相关流程。
         return self.y_stop_flag(
             abs(self.y_distance_change) < STOP_CHECK_THRESHOLD
         )
     def y_get_position(self):
+        # 获取相关数据。
         self.y_pose_now = (
             self.motor_y.get_dis() - self.y_pose_start
         )
@@ -172,6 +178,7 @@ class ArmController:
         """
         重置竖直方向位置
         """
+        # 复位相关状态。
         self.y_pid.setpoint = -0.25
         while True:
             if self.y_pid_moveto(-0.25):
@@ -224,7 +231,7 @@ class ArmController:
             # f"actual={self.y_get_position():.6f}"
         )
 
-    def x_params_init(self, motor, pid, threshold):
+    def x_params_init(self, motor, pid, threshold, homing):
         """
         初始化水平方向电机参数
 
@@ -232,6 +239,7 @@ class ArmController:
             motor: 电机配置
             pid: PID参数
             threshold: 位置阈值
+            homing: X 轴微动开关归零配置
         """
         # 定义水平移动电机,PID参数
         self.motor_x = MotorWrap(**motor)
@@ -247,6 +255,85 @@ class ArmController:
         self.x_stop_flag = CountRecord(10)
         self.x_pid_flag = CountRecord(5)
 
+        limit_port = homing.get("limit_port")
+        active = homing.get("active")
+        stable_samples = homing.get("stable_samples")
+        try:
+            trigger_threshold = float(homing.get("threshold"))
+            homing_speed = float(homing.get("speed"))
+            homing_timeout = float(homing.get("timeout"))
+            safe_position = float(homing.get("safe_position"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("X 轴归零数值配置无效") from exc
+
+        if (
+            isinstance(limit_port, bool)
+            or not isinstance(limit_port, int)
+            or not 1 <= limit_port <= 3
+        ):
+            raise ValueError("X 轴归零端口必须是 AI1、AI2 或 AI3")
+        if active not in ("above", "below"):
+            raise ValueError("X 轴归零 active 必须是 above 或 below")
+        if not math.isfinite(trigger_threshold):
+            raise ValueError("X 轴归零阈值必须是有限数值")
+        if (
+            isinstance(stable_samples, bool)
+            or not isinstance(stable_samples, int)
+            or stable_samples <= 0
+        ):
+            raise ValueError("X 轴归零 stable_samples 必须是正整数")
+        if not math.isfinite(homing_speed) or homing_speed <= 0:
+            raise ValueError("X 轴归零速度必须是正的有限数值")
+        if (
+            self.x_velocity_limit[0] >= 0
+            or homing_speed > abs(self.x_velocity_limit[0])
+        ):
+            raise ValueError("X 轴归零速度超出电机负向速度范围")
+        if not math.isfinite(homing_timeout) or homing_timeout <= 0:
+            raise ValueError("X 轴归零超时必须是正的有限数值")
+        if (
+            not math.isfinite(safe_position)
+            or safe_position <= self.x_threshold[0]
+            or safe_position > self.x_threshold[1]
+        ):
+            raise ValueError("X 轴安全回收位置必须位于有效行程内并离开机械零点")
+
+        self.x_limit_port = limit_port
+        self.x_limit_active = active
+        self.x_limit_threshold = trigger_threshold
+        self.x_limit_stable_samples = stable_samples
+        self.x_homing_speed = homing_speed
+        self.x_homing_timeout = homing_timeout
+        self.x_safe_position = safe_position
+        self.x_limit_sensor = AnalogInput2(limit_port)
+        # 历史 YAML 位置不能代表本次启动已经完成机械归零。
+        self.x_zero_valid = False
+
+    def _read_x_limit_fresh(self):
+        """读取一次新鲜 AI1 数据，不允许复用 MC602 的缓存旧值。"""
+        mc602_sensor = getattr(self.x_limit_sensor, "sensor_2", None)
+        if mc602_sensor is None or not hasattr(mc602_sensor, "last_data"):
+            raise RuntimeError("X 轴限位传感器不支持新鲜采样检查")
+
+        mc602_sensor.last_data = None
+        try:
+            raw = float(self.x_limit_sensor.read())
+        except (TypeError, ValueError) as exc:
+            if mc602_sensor.last_data is None:
+                raise RuntimeError("MC602 未返回新的 X 轴限位样本") from exc
+            raise RuntimeError("X 轴限位样本无法转换为数值") from exc
+        if mc602_sensor.last_data is None:
+            raise RuntimeError("MC602 未返回新的 X 轴限位样本")
+        if not math.isfinite(raw):
+            raise RuntimeError(f"X 轴限位样本不是有限数值 raw={raw!r}")
+        return raw
+
+    def _x_limit_is_triggered(self, raw):
+        """根据配置判断 X 轴微动开关是否触发。"""
+        if self.x_limit_active == "above":
+            return raw >= self.x_limit_threshold
+        return raw <= self.x_limit_threshold
+
     def x_stop_check(self):
         """
         检查水平方向是否停止
@@ -254,10 +341,12 @@ class ArmController:
         Returns:
             bool: 是否停止
         """
+        # 停止相关流程。
         return self.x_stop_flag(
             abs(self.x_distance_change) < STOP_CHECK_THRESHOLD
         )
     def x_get_position(self):
+        # 获取相关数据。
         self.x_pose_now = self.motor_x.get_dis() - self.x_pose_start
         return self.x_pose_now
 
@@ -272,6 +361,7 @@ class ArmController:
         Returns:
             bool: 是否到达目标位置
         """
+        # 处理 PID 控制。
         self.x_pose_now = (
             self.motor_x.get_dis() - self.x_pose_start
         )
@@ -352,24 +442,74 @@ class ArmController:
 
 
 
-    def reset_x(self, out_time=8.0) -> bool:
+    def reset_x(self, out_time=None, speed_limit=None) -> bool:
         """
-        低速移向机械回收端，编码器持续停止后建立水平零点。
+        低速移向机械回收端，仅在微动开关稳定触发后建立水平零点。
 
         只有该寻零函数可以修改 x_pose_start。
-        """
-        target = -0.33
-        self.x_stop_flag = CountRecord(10)
-        self.x_pid_flag = CountRecord(5)
-        self.x_pose_now = self.x_get_position()
-        self.x_pose_last = self.x_pose_now
-        self.x_distance_change = 0
 
-        self.x_pid.output_limits = (-0.06, 0.06)
-        self.x_pid.reset()
-        self.x_pid.setpoint = target
-        end_time = time.time() + out_time
+        Args:
+            out_time: 最长寻零时间。
+            speed_limit: 寻零期间水平轴速度绝对值上限。
+        """
+        # 一旦请求重新归零，旧零点不再作为本次运行的可信机械零点。
+        self.x_zero_valid = False
         try:
+            self.x_speed(0)
+            try:
+                homing_timeout = (
+                    self.x_homing_timeout if out_time is None else float(out_time)
+                )
+                homing_speed = (
+                    self.x_homing_speed if speed_limit is None else float(speed_limit)
+                )
+            except (TypeError, ValueError):
+                logger.error(
+                    f"X 轴归零参数无效 out_time={out_time!r}, "
+                    f"speed_limit={speed_limit!r}"
+                )
+                return False
+
+            if not math.isfinite(homing_timeout) or homing_timeout <= 0:
+                logger.error(f"X 轴归零超时参数无效 timeout={homing_timeout!r}")
+                return False
+            if (
+                not math.isfinite(homing_speed)
+                or homing_speed <= 0
+                or self.x_velocity_limit[0] >= 0
+                or homing_speed > abs(self.x_velocity_limit[0])
+            ):
+                logger.error(f"X 轴归零速度参数无效 speed={homing_speed!r}")
+                return False
+
+            self.x_stop_flag = CountRecord(10)
+            self.x_pid_flag = CountRecord(5)
+            self.x_pose_now = self.x_get_position()
+            self.x_pose_last = self.x_pose_now
+            self.x_distance_change = 0
+
+            self.x_pid.output_limits = (-homing_speed, homing_speed)
+            self.x_pid.reset()
+            end_time = time.time() + homing_timeout
+
+            # 启动时必须先连续确认开关处于松开低电平；此阶段不发送运动命令。
+            for sample_index in range(self.x_limit_stable_samples):
+                if time.time() > end_time:
+                    logger.error("X 轴归零启动采样超时")
+                    return False
+                raw = self._read_x_limit_fresh()
+                if self._x_limit_is_triggered(raw):
+                    logger.error(
+                        f"X 轴归零启动未稳定松开 port=AI{self.x_limit_port}, "
+                        f"raw={raw:.1f}, sample={sample_index + 1}/"
+                        f"{self.x_limit_stable_samples}"
+                    )
+                    return False
+                if sample_index + 1 < self.x_limit_stable_samples:
+                    time.sleep(0.02)
+
+            self.x_speed(-homing_speed)
+            triggered_samples = 0
             while True:
                 if time.time() > end_time:
                     logger.error(
@@ -377,25 +517,116 @@ class ArmController:
                     )
                     return False
 
-                # 寻零的成功条件是回收端持续无位移，不是达到虚拟 target=-0.33。
-                # TODO(reset-x-homing-safety): 当前仅凭“编码器连续无位移”认定到达回收端。
-                # 电机未启动、编码器故障、传动卡滞或中途碰撞也会满足该条件，
-                # 从而把错误的物理位置重新定义为 x=0。后续应至少先确认发生了
-                # 足够的负向位移，再允许停滞建立零点；更可靠的方案是增加独立限位开关。
-                self.x_pid_moveto(target)
+                raw = self._read_x_limit_fresh()
+                if self._x_limit_is_triggered(raw):
+                    # 首次触发立即停止；后续消抖只能在静止状态下进行，不能继续
+                    # 向机械限位方向顶压微动开关。
+                    self.x_speed(0)
+                    triggered_samples = 1
+                    break
+
+                # MC602 速度命令需要周期刷新；仅在开关仍松开时继续发送负向
+                # 速度，避免下位机看门狗停止输出后被误判为编码器停滞。
+                self.x_speed(-homing_speed)
+                self.x_pose_now = self.x_get_position()
+                self.x_distance_change = self.x_pose_now - self.x_pose_last
+                self.x_pose_last = self.x_pose_now
+
                 if self.x_stop_check():
-                    self.x_pose_start = self.motor_x.get_dis()
-                    self.x_pose_now = 0
-                    self.x_pose_last = 0
-                    self.x_distance_change = 0
-                    logger.info("水平轴寻零完成 x=0")
-                    return True
+                    logger.error(
+                        f"X 轴归零期间编码器停滞，未建立零点 "
+                        f"actual={self.x_get_position():.6f}, raw={raw:.1f}"
+                    )
+                    return False
                 time.sleep(0.05)
+
+            # 首次高电平已经停止电机；在静止状态下补采剩余触发样本。
+            # 信号一旦回落就保持停止并失败，不恢复运动，也不建立零点。
+            while triggered_samples < self.x_limit_stable_samples:
+                if time.time() > end_time:
+                    logger.error("X 轴触发后稳定确认超时，未建立零点")
+                    return False
+                time.sleep(0.02)
+                raw = self._read_x_limit_fresh()
+                if not self._x_limit_is_triggered(raw):
+                    logger.error(
+                        f"X 轴触发后信号回落，未建立零点 "
+                        f"port=AI{self.x_limit_port}, raw={raw:.1f}, "
+                        f"stable_samples={triggered_samples}/"
+                        f"{self.x_limit_stable_samples}"
+                    )
+                    return False
+                triggered_samples += 1
+
+            self.x_pose_start = self.motor_x.get_dis()
+            self.x_pose_now = 0
+            self.x_pose_last = 0
+            self.x_distance_change = 0
+            self.x_zero_valid = True
+            logger.info(
+                f"X 轴机械归零完成 port=AI{self.x_limit_port}, "
+                f"raw={raw:.1f}, stable_samples={triggered_samples}, x=0"
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                f"X 轴归零异常 type={type(exc).__name__}, error={exc}"
+            )
+            return False
         finally:
             self.x_speed(0)
             # 寻零结束后恢复普通水平移动的 PID 输出范围。
             self.x_pid.output_limits = self.x_velocity_limit
             self.x_pid.reset()
+
+    def retract_x_safe(self, out_time=6.0) -> bool:
+        """返回 1.5 cm 安全位置，并确认 X 轴微动开关稳定释放。"""
+        try:
+            self.x_speed(0)
+            if not self.x_zero_valid:
+                logger.error("X 轴零点无效，禁止执行安全回收")
+                return False
+            try:
+                move_timeout = float(out_time)
+            except (TypeError, ValueError):
+                logger.error(f"X 轴安全回收超时参数无效 out_time={out_time!r}")
+                return False
+            if not math.isfinite(move_timeout) or move_timeout <= 0:
+                logger.error(f"X 轴安全回收超时参数无效 timeout={move_timeout!r}")
+                return False
+
+            if not self.move_x_position(self.x_safe_position, out_time=move_timeout):
+                logger.error(
+                    f"X 轴未能到达安全回收位置 target={self.x_safe_position}"
+                )
+                return False
+
+            last_raw = None
+            for sample_index in range(self.x_limit_stable_samples):
+                last_raw = self._read_x_limit_fresh()
+                if self._x_limit_is_triggered(last_raw):
+                    logger.error(
+                        f"X 轴到达安全位置后开关未释放 "
+                        f"port=AI{self.x_limit_port}, raw={last_raw:.1f}, "
+                        f"sample={sample_index + 1}/{self.x_limit_stable_samples}"
+                    )
+                    return False
+                if sample_index + 1 < self.x_limit_stable_samples:
+                    time.sleep(0.02)
+
+            logger.info(
+                f"X 轴安全回收完成 target={self.x_safe_position}, "
+                f"port=AI{self.x_limit_port}, raw={last_raw:.1f}, "
+                f"stable_samples={self.x_limit_stable_samples}"
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                f"X 轴安全回收异常 type={type(exc).__name__}, error={exc}"
+            )
+            return False
+        finally:
+            self.x_speed(0)
 
     def hand_params_init(self, hand, hand2, grap):
         """
@@ -406,6 +637,7 @@ class ArmController:
             hand2: 手部舵机配置
             grap: 抓取机构配置
         """
+        # 初始化相关资源。
         self.hand_servo = ServoPwm(hand2["port"], mode=hand2["mode"])
         self.hand_angle_list2 = hand2["angle_list"]
         self.arm_servo = ServoBus(hand["port"])
@@ -435,6 +667,7 @@ class ArmController:
             pose_vert: 竖直位置
             side: 方向
         """
+        # 初始化相关资源。
         self.pose_enable = pose_enable
         self.y_pose_start = (
             self.motor_y.get_dis() - pose_vert
@@ -453,6 +686,7 @@ class ArmController:
         Args:
             pose_enable: 是否启用位置
         """
+        # 保存数据。
         self.config["pos_cfg"] = {
             "pose_enable": pose_enable,
             "pose_horiz": self.x_pose_now,
@@ -469,6 +703,7 @@ class ArmController:
         Args:
             velocity: 速度值
         """
+        # 处理速度控制。
         velocity = limit_val(velocity, *self.y_velocity_limit)
         self.motor_y.set_velocity(velocity)
 
@@ -479,6 +714,7 @@ class ArmController:
         Args:
             velocity: 速度值
         """
+        # 处理速度控制。
         velocity = limit_val(velocity, *self.x_velocity_limit)
         self.motor_x.set_linear(velocity)
 
@@ -489,6 +725,7 @@ class ArmController:
         Args:
             y_position: 竖直位置
         """
+        # 启动相关流程。
         self.y_pose_start = self.y_pose_now
         self.x_pose_start = self.x_pose_now
         self.save_config()
@@ -497,6 +734,7 @@ class ArmController:
         """
         使用【4键】控制机械臂
         """
+        # 设置相关参数。
         self.key = Key4Btn(4)
         logger.info("Using 4 keys to control arm...")
         while True:
@@ -513,18 +751,38 @@ class ArmController:
                 self.x_speed(0)
                 self.y_speed(0)
 
-    def reset_position(self):
+    def reset_position(self, rehome_x=True):
         """
-        重置机械臂位置
+        重置机械臂位置。
+
+        Args:
+            rehome_x: True 时机械归零后回到 1.5 cm；False 时复用当前可信零点，
+                只执行安全回收。
         """
+        x_reset_result = {
+            "ok": False,
+            "error": None,
+            "stage": "mechanical_homing" if rehome_x else "safe_retract",
+        }
+
+        def reset_x_operation():
+            try:
+                if rehome_x:
+                    if not self.reset_x():
+                        return
+                    x_reset_result["stage"] = "safe_retract_after_homing"
+                x_reset_result["ok"] = self.retract_x_safe()
+            except Exception as exc:
+                x_reset_result["error"] = exc
+
         print(
-            f"[ARM_RESET] begin side={self.side} "
+            f"[ARM_RESET] begin rehome_x={rehome_x} side={self.side} "
             f"angle={getattr(self, '_arm_angle_last', None)} "
             f"hand_angle={getattr(self, '_hand_angle_last', None)}",
             flush=True,
         )
         thread_reset_y = Thread(target=self.reset_y)
-        thread_reset_x = Thread(target=self.reset_x)
+        thread_reset_x = Thread(target=reset_x_operation)
 
         print("[ARM_RESET] sending hand=UP", flush=True)
         self.set_hand_angle("UP")
@@ -541,14 +799,24 @@ class ArmController:
         thread_reset_x.start()
         thread_reset_y.join()
         thread_reset_x.join()
+        if not x_reset_result["ok"]:
+            self.x_speed(0)
+            error = x_reset_result["error"]
+            detail = (
+                f"{type(error).__name__}: {error}" if error is not None
+                else "operation returned False"
+            )
+            raise RuntimeError(
+                f"X 轴重置失败 stage={x_reset_result['stage']}, detail={detail}"
+            ) from error
         print(
             f"[ARM_RESET] linear reset complete x={self.x_get_position():.6f} "
             f"y={self.y_get_position():.6f}",
             flush=True,
         )
-        # Orin 最新便捷属性以毫米为单位；修改前仅由 reset_x/reset_y 更新内部 pose。
-        self.x = 0
+        # self.x 的 setter 会再次发送水平运动命令；安全回收完成后不能再回到开关。
         self.y = 0
+        self.x_get_position()
         self.save_config()
         print(
             f"[ARM_RESET] end side={self.side} angle={self.angle} "
@@ -556,6 +824,7 @@ class ArmController:
             f"y={self.y_get_position():.6f}",
             flush=True,
         )
+        return True
 
     def switch_side(self, side):
         """
@@ -564,6 +833,7 @@ class ArmController:
         Args:
             side: 机械臂的方向, LEFT、RIGHT或MID
         """
+        # 执行该方法的核心功能。
         if self.side != side:
             self.side = side
             logger.info(f"Changing side to {self.side}")
@@ -575,7 +845,8 @@ class ArmController:
 
     
     
-    def set_arm_angle(self, angle: Union[str, int] = "RIGHT", speed=80):
+    # 同步自 Orin 2026-07-23 现场版本：降低总线舵机默认速度；保留本地重复发送与复位遥测。
+    def set_arm_angle(self, angle: Union[str, int] = "RIGHT", speed=60):
         """
         设置机械臂角度
 
@@ -583,6 +854,7 @@ class ArmController:
             angle: 目标角度，可以是字符串（"LEFT", "MID", "RIGHT"）或数字
             speed: 速度
         """
+        # 设置相关参数。
         _angle = angle
         if isinstance(_angle, str):
             self.side = _angle
@@ -605,12 +877,27 @@ class ArmController:
             angle: 目标角度，可以是字符串（"UP", "MID", "DOWN"）或数字
             speed: 速度
         """
+        # 设置相关参数。
+        requested_angle = angle
+        previous_angle = getattr(self, "_hand_angle_last", None)
         if isinstance(angle, str):
             assert angle in ("UP","MID","DOWN"), "Direction should be UP, MID, or DOWN"
             angle = self.hand_angle_list2[angle]
+        pwm_angle = int(angle / self.hand_servo.mode * 180 + 90)
+        print(
+            f"[HAND_SERVO] command requested={requested_angle} "
+            f"resolved_angle={angle} pwm_angle={pwm_angle} speed={speed} "
+            f"previous_angle={previous_angle}",
+            flush=True,
+        )
         # 保存实际下发角度，供 hand_angle 便捷属性读取。
         self._hand_angle_last = angle
-        self.hand_servo.set_angle(angle, speed)  
+        result = self.hand_servo.set_angle(angle, speed)
+        print(
+            f"[HAND_SERVO] command_complete requested={requested_angle} "
+            f"resolved_angle={angle} pwm_angle={pwm_angle} result={result}",
+            flush=True,
+        )
 
 
     def go_for(self, x_offset, y_offset,time_run=None, speed=[0.15, 0.04]):
@@ -623,6 +910,7 @@ class ArmController:
             time_run: 运行时间
             speed: 速度 [水平速度, 竖直速度]
         """
+        # 执行该方法的核心功能。
         x_pos = self.x_pose_now + x_offset
         y_pos = self.y_pose_now + y_offset
         self.goto_position(x_pos, y_pos, time_run, speed)
@@ -768,6 +1056,7 @@ class ArmController:
             hand: 手部角度，可以是字符串（"UP", "MID", "DOWN"）或数字
         
         '''
+        # 设置相关参数。
         self.goto_position(x, y)
         # time.sleep(0.2)
         if arm is not None:
