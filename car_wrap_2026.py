@@ -46,6 +46,49 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from smartcar import logger
 
 
+ORDER_GOODS = frozenset(
+    {
+        "青椒",
+        "蘑菇",
+        "芹菜",
+        "番茄",
+        "油菜",
+        "豆角",
+        "西兰花",
+        "土豆",
+        "金针菇",
+    }
+)
+
+MULTIMODAL_TASKS = {
+    "animal": {
+        "label": "animal",
+        "crop_scale": 1.1,
+        "prompt": (
+            "识别图片中的动物，并判断它对农田有害还是有益。"
+            "只返回一个 JSON 对象，字段必须且只能是 result 和 analysis。"
+            "result 必须是整数：有害返回 0，有益返回 1；"
+            "analysis 必须是非空中文字符串。不要返回 Markdown。"
+        ),
+    },
+    "order": {
+        "label": "order",
+        "crop_scale": 1.15,
+        "prompt": (
+            "读取图片中的订单，提取收货人姓名、所需货物和楼号。"
+            "订单可能通过菜名和已有食材间接描述需求；应推断缺少的主要食材，"
+            "并将西红柿规范为番茄。"
+            "只返回一个 JSON 对象，字段必须且只能是 name、goods、address。"
+            "goods 只能是青椒、蘑菇、芹菜、番茄、油菜、豆角、西兰花、"
+            "土豆、金针菇之一；address 只能是整数 1 或 2。"
+            "例如，‘2号楼的张三想做西红柿炒鸡蛋，已有鸡蛋’应返回"
+            "{\"name\":\"张三\",\"goods\":\"番茄\",\"address\":2}。"
+            "不要返回 Markdown 或解释文字。"
+        ),
+    },
+}
+
+
 def filter_chinese_letter(text: str) -> str:
     # 正则：汉字 \u4e00-\u9fff + 大小写字母 a-zA-Z
     res = re.findall(r"[\u4e00-\u9fffa-zA-Z]", text)
@@ -153,6 +196,7 @@ class PidCal2:
             cfg_pid_y: y轴PID控制器的配置参数
             cfg_pid_angle: 角度PID控制器的配置参数
         """
+        # 初始化对象状态。
         self.pid_y = PID(**cfg_pid_y)
         self.pid_angle = PID(**cfg_pid_angle)
 
@@ -167,6 +211,7 @@ class PidCal2:
         返回:
             tuple: (y轴PID输出, 角度PID输出)
         """
+        # 获取相关数据。
         pid_y_out = self.pid_y(error_y)
         pid_angle_out = self.pid_angle(error_angle)
         return pid_y_out, pid_angle_out
@@ -212,6 +257,7 @@ class LanePidCal:
         返回:
             tuple: (y轴PID输出, 角度PID输出)
         """
+        # 获取相关数据。
         pid_y_out = self.pid_y(error_y)
         pid_angle_out = self.pid_angle(error_angle)
         return pid_y_out, pid_angle_out
@@ -232,6 +278,7 @@ class DetPidCal:
             cfg_pid_y: y轴PID控制器的配置参数（可选）
             cfg_pid_angle: 角度PID控制器的配置参数（可选）
         """
+        # 初始化对象状态。
         y_out_limit = 0.7
         self.pid_y = PID(0.3, 0, 0)
         self.pid_y.setpoint = 0
@@ -253,6 +300,7 @@ class DetPidCal:
         返回:
             tuple: (y轴PID输出, 角度PID输出)
         """
+        # 获取相关数据。
         pid_y_out = self.pid_y(error_y)
         pid_angle_out = self.pid_angle(error_angle)
         return pid_y_out, pid_angle_out
@@ -271,6 +319,7 @@ class LocatePidCal:
 
         初始化x轴和y轴的PID控制器，设置默认参数和输出限制。
         """
+        # 初始化对象状态。
         y_out_limit = 0.3
         self.pid_y = PID(0.5, 0, 0)
         self.pid_y.setpoint = 0
@@ -289,6 +338,7 @@ class LocatePidCal:
             x: x轴目标位置
             y: y轴目标位置
         """
+        # 设置相关参数。
         self.pid_y.setpoint = y
         self.pid_x.setpoint = x
 
@@ -303,6 +353,7 @@ class LocatePidCal:
         返回:
             tuple: (x轴PID输出, y轴PID输出)
         """
+        # 获取相关数据。
         pid_y_out = self.pid_y(error_y)
         pid_x_out = self.pid_x(error_x)
         return pid_x_out, pid_y_out
@@ -370,6 +421,7 @@ class MyCar(MecanumDriver):
 
         控制蜂鸣器发出一声蜂鸣音，并等待0.2秒。
         """
+        # 控制蜂鸣器提示。
         self.ring.rings()
         time.sleep(0.2)
 
@@ -383,14 +435,15 @@ class MyCar(MecanumDriver):
             cfg: 配置字典，包含传感器的配置信息
 
         """
+        # 初始化相关资源。
         cfg_sensor = cfg["io"]
         # print(cfg_sensor)
         self.key = Key4Btn(cfg_sensor["key"])
         # self.light = LedLight(cfg_sensor['light'])
         # self.left_sensor = Infrared(cfg_sensor['left_sensor'])
         # self.right_sensor = Infrared(cfg_sensor['right_sensor'])
-        self.servo_1_angle_list = [-42, 165]
-        self.servo_1_flag = 0
+        self.servo_1_angle_list = [0, -85]  # 储存仓角度，收起165，放下-85
+        self.servo_1_flag = 1
         self.servo_1 = ServoPwm(1, 180)
         self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
         self.blue_pad = BluetoothPad()
@@ -405,10 +458,12 @@ class MyCar(MecanumDriver):
         参数:
             state (bool): 储存仓状态。False 表示放下，True 表示收起。默认为 False。
         """
+        # 设置相关参数。
         flag = 1 if state else 0
         self.servo_1.set_angle(self.servo_1_angle_list[flag])
 
     def shooting(self):
+        # 执行该方法的核心功能。
         self.shoot.set(1)
         time.sleep(0.3)
         self.shoot.set(0)
@@ -463,54 +518,125 @@ class MyCar(MecanumDriver):
 
     def ernie_bot_init(self):
         """
-        初始化文心一言分析
+        初始化千帆多模态分析
 
-        初始化、图像分析和订单分析的文心一言接口。
+        动物和订单图片共用一个 OpenAI 兼容客户端。
         """
         self.image_analysis = ErnieBotWrap()
 
-        self.order_analysis = ErnieBotWrap()
-        self.order_analysis.set_promt(str(OrderPrompt()))
+    def _encode_detection_crop(self, label, crop_scale):
+        """裁剪指定检测标签并编码为 JPEG Base64，不执行任何运动。"""
+        detections = [
+            item for item in self.get_detection_results() if item[2] == label
+        ]
+        if not detections:
+            raise ValueError(f"未检测到多模态目标: label={label}")
+
+        image = getattr(self, "side_image", None)
+        if image is None:
+            raise ValueError("侧摄像头图像不存在")
+        image = image.copy()
+        if image.size == 0:
+            raise ValueError("侧摄像头图像为空")
+
+        detection = detections[0]
+        if len(detection) < 8:
+            raise ValueError("多模态目标检测结果字段不足")
+        x_c, y_c, width, height = detection[4:8]
+        img_h, img_w = image.shape[:2]
+        center_x = (x_c + 1.0) * img_w / 2.0
+        center_y = (y_c + 1.0) * img_h / 2.0
+        box_w = width * img_w * crop_scale / 2.0
+        box_h = height * img_h * crop_scale / 2.0
+        x1 = max(0, int(center_x - box_w / 2.0))
+        y1 = max(0, int(center_y - box_h / 2.0))
+        x2 = min(img_w, int(center_x + box_w / 2.0))
+        y2 = min(img_h, int(center_y + box_h / 2.0))
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("多模态目标裁剪区域为空")
+
+        encoded_ok, encoded = cv2.imencode(".jpg", image[y1:y2, x1:x2])
+        if not encoded_ok:
+            raise ValueError("多模态目标 JPEG 编码失败")
+        return base64.b64encode(encoded.tobytes()).decode("ascii")
+
+    @staticmethod
+    def _validate_task_image_result(task, data):
+        """校验并规范化动物或订单的多模态 JSON。"""
+        if not isinstance(data, dict):
+            raise ValueError("多模态结果必须是 JSON 对象")
+
+        if task == "animal":
+            if set(data) != {"result", "analysis"}:
+                raise ValueError("动物结果字段必须且只能是 result、analysis")
+            result = data["result"]
+            analysis = data["analysis"]
+            if isinstance(result, bool) or not isinstance(result, int):
+                raise ValueError("动物 result 必须是整数")
+            if result not in (0, 1):
+                raise ValueError("动物 result 只能是 0 或 1")
+            if not isinstance(analysis, str) or not analysis.strip():
+                raise ValueError("动物 analysis 必须是非空字符串")
+            return {"result": result, "analysis": analysis.strip()}
+
+        if task == "order":
+            if set(data) != {"name", "goods", "address"}:
+                raise ValueError("订单结果字段必须且只能是 name、goods、address")
+            name = data["name"]
+            goods = data["goods"]
+            address = data["address"]
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("订单 name 必须是非空字符串")
+            if not isinstance(goods, str) or goods.strip() not in ORDER_GOODS:
+                raise ValueError("订单 goods 不在允许的货物集合中")
+            if isinstance(address, bool) or not isinstance(address, int):
+                raise ValueError("订单 address 必须是整数")
+            if address not in (1, 2):
+                raise ValueError("订单 address 只能是 1 或 2")
+            return {
+                "name": name.strip(),
+                "goods": goods.strip(),
+                "address": address,
+            }
+
+        raise ValueError(f"未知多模态任务: task={task}")
+
+    def analyze_task_image(self, task, label=None):
+        """裁图并调用统一多模态模型，失败时重新取帧重试一次。"""
+        if task not in MULTIMODAL_TASKS:
+            raise ValueError(f"未知多模态任务: task={task}")
+        spec = MULTIMODAL_TASKS[task]
+        detection_label = spec["label"] if label is None else label
+
+        for attempt in range(1, 3):
+            try:
+                image = self._encode_detection_crop(
+                    detection_label, spec["crop_scale"]
+                )
+                data = self.image_analysis.get_multimodal_json(
+                    image, spec["prompt"]
+                )
+                validated = self._validate_task_image_result(task, data)
+                print(f"[MULTIMODAL_RESULT] task={task} result={validated}")
+                logger.info(
+                    f"多模态识别成功 task={task} attempt={attempt} "
+                    f"model={self.image_analysis.image_model}"
+                )
+                return validated
+            except Exception as exc:
+                logger.error(
+                    "多模态识别失败 "
+                    f"task={task} attempt={attempt} "
+                    f"error_type={type(exc).__name__}"
+                )
+                if attempt == 1:
+                    time.sleep(0.05)
+
+        raise RuntimeError(f"多模态识别失败，已停止任务: task={task}")
 
     def animal_image_analysis(self):
-        dets = self.get_detection_results()
-        if len(dets) <= 0:
-            print("未检测到任何目标，无法裁剪")
-            return None, None
-        cls_id, det_id, label, score, x_c, y_c, w, h = dets[0]
-        image = self.side_image.copy()
-
-        # 将归一化坐标转换为像素坐标
-        img_h, img_w = image.shape[:2]
-        x_c = int((x_c + 1) / 2 * img_w)
-        y_c = int((y_c + 1) / 2 * img_h)
-        w = int(w * img_w / 2)
-        h = int(h * img_h / 2)
-        x1 = int(x_c - w / 2)
-        y1 = int(y_c - h / 2)
-        x2 = int(x_c + w / 2)
-        y2 = int(y_c + h / 2)
-
-        # img_h, img_w = image.shape[:2]
-
-        # # 计算坐标 + 强制边界保护（核心修复！）
-        # x1 = int(max(0, x_c - w / 2))
-        # y1 = int(max(0, y_c - h / 2))
-        # x2 = int(min(img_w, x_c + w / 2))
-        # y2 = int(min(img_h, y_c + h / 2))
-        # 防止裁剪出空图（核心修复！）
-        if x2 <= x1 or y2 <= y1:
-            print("裁剪区域无效，跳过")
-            return None, None
-        cropped_img = image[y1:y2, x1:x2]
-
-        _, img_encoded = cv2.imencode(".jpg", cropped_img)
-        # 转 base64 字符串
-        base64_image = base64.b64encode(img_encoded.tobytes()).decode("utf-8")
-
-        result, analysis = self.image_analysis.get_image_res(base64_image)
-        print(f"image result: {result}  \nanalysis:{analysis}")
-        return result, analysis
+        data = self.analyze_task_image(task="animal", label="animal")
+        return data["result"], data["analysis"]
 
     @staticmethod
     def get_cfg(path):
@@ -522,6 +648,7 @@ class MyCar(MecanumDriver):
         参数:
             path: 配置文件路径
         """
+        # 获取相关数据。
         from yaml import load, Loader
 
         # 把配置文件读取到内存
@@ -543,6 +670,7 @@ class MyCar(MecanumDriver):
         参数:
             time_hold: 延时时间（秒）
         """
+        # 执行该方法的核心功能。
         start_time = time.time()
         while True:
             if self._stop_flag:
@@ -557,6 +685,7 @@ class MyCar(MecanumDriver):
 
         持续检测按键状态，当检测到按键3时设置停止标志。
         """
+        # 执行该方法的核心功能。
         while True:
             if not self._stop_flag:
                 if self._end_flag:
@@ -581,6 +710,7 @@ class MyCar(MecanumDriver):
         返回:
             匹配的元素，如果没有匹配的则返回None
         """
+        # 获取相关数据。
         for det in list:
             if det[index] == val:
                 return det
@@ -597,6 +727,7 @@ class MyCar(MecanumDriver):
             end_fuction: 结束条件函数，返回True时停止移动
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        # 控制运动到目标状态。
         self.set_velocity(sp[0], sp[1], sp[2])
         while True:
             if self._stop_flag:
@@ -657,6 +788,7 @@ class MyCar(MecanumDriver):
             dur_time: 移动时间（秒），默认为1
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        # 控制运动到目标状态。
         self.set_velocity_for_duration(sp[0], sp[1], sp[2], dur_time)
         if stop:
             self.stop()
@@ -672,6 +804,7 @@ class MyCar(MecanumDriver):
             dis: 移动距离，默认为0.1
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        # 控制运动到目标状态。
         end_dis = self.get_distance() + dis
 
         def end_func():
@@ -693,6 +826,7 @@ class MyCar(MecanumDriver):
         返回:
             float: 两个坐标之间的距离
         """
+        # 计算相关结果。
         return math.sqrt(
             (pos_dst[0] - pos_src[0]) ** 2 + (pos_dst[1] - pos_src[1]) ** 2
         )
@@ -746,6 +880,7 @@ class MyCar(MecanumDriver):
         返回:
             int: 目标索引，如果超时或距离超出限制则返回False
         """
+        # 处理巡线相关逻辑。
         end_time = time.time() + time_out
         infer = self.task_det
         loc_pid = get_yaml(self.yaml_path)["location_pid"]  # type: ignore
@@ -911,6 +1046,7 @@ class MyCar(MecanumDriver):
             end_fuction: 结束条件函数，返回True时停止
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        # 处理巡线相关逻辑。
         while True:
             if self._stop_flag:
                 return
@@ -1004,6 +1140,7 @@ class MyCar(MecanumDriver):
             time_dur: 持续时间（秒）
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        # 处理巡线相关逻辑。
         time_end = time.time() + time_dur
 
         def end_fuction():
@@ -1041,6 +1178,7 @@ class MyCar(MecanumDriver):
             dis_hold: 距离偏移量
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        # 处理巡线相关逻辑。
         dis_start = self.get_distance()
         dis_stop = dis_start + dis_hold
         self.lane_dis(speed, dis_stop, stop=stop)
@@ -1112,6 +1250,7 @@ class MyCar(MecanumDriver):
     #             elif det_label == 'turn_left':
     #                 return 1
     def get_det_ocr(self, det, label="name", time_out=5.0):
+        # 获取相关数据。
         time_stop = time.time() + time_out
         # 简单滤波,三次检测到相同的值，认为稳定并返回
         text_count = CountRecord(3)
@@ -1192,6 +1331,7 @@ class MyCar(MecanumDriver):
         返回:
             str: 识别到的文本，如果超时或未检测到则返回None
         """
+        # 获取相关数据。
         time_stop = time.time() + time_out
         # 简单滤波,三次检测到相同的值，认为稳定并返回
         text_count = CountRecord(3)
@@ -1281,6 +1421,7 @@ class MyCar(MecanumDriver):
         返回:
             dict: 人类属性分析结果
         """
+        # 获取相关数据。
         return self.hum_analysis.get_res_json(text)
 
     def yiyan_get_actions(self, text):
@@ -1295,6 +1436,7 @@ class MyCar(MecanumDriver):
         返回:
             dict: 动作分析结果
         """
+        # 获取相关数据。
         return self.action_bot.get_res_json(text)
 
     def draw_detection_results(self, img, dets_ret):
@@ -1360,6 +1502,7 @@ class MyCar(MecanumDriver):
         返回:
             list: - 检测结果列表，每个元素包含 [cls_id, det_id, label, score, x_c, y_c, w, h]
         """
+        # 获取相关数据。
         self.side_image = self.cap_side.read()
         image = self.side_image.copy()
         det_task = self.task_det(image)
@@ -1375,6 +1518,7 @@ class MyCar(MecanumDriver):
         return det_task
 
     def get_lane_results(self):
+        # 获取相关数据。
         image = self.cap_front.read().copy()
         res = self.crusie(image)
         error, angle = res[0], res[1]
@@ -1597,7 +1741,9 @@ class MyCar(MecanumDriver):
 
     # Orin 2026-07-17 最新默认水平补偿为 3 cm。
     # 修改前 worktree：def adjust_arm_position(self, dis=0.01):
-    def adjust_arm_position(self, dis=0.03):
+    # 同步自 Orin 2026-07-23 现场标定：摄像头与吸嘴的默认水平补偿为 0.06 m。
+    # 保留本地布尔返回值，使调用方仍可在补偿失败时禁止释放。
+    def adjust_arm_position(self, dis=0.06):
         # print(f"arm side:{self.arm.side}")
         x_position = self.arm.x_get_position()
         if self.arm.side == "LEFT":
@@ -1615,6 +1761,7 @@ class MyCar(MecanumDriver):
 
         inference: 是否进行推理，默认为False
         """
+        # 执行该方法的核心功能。
         inference_flag = False
         grasp_flag = False
         while True:
@@ -1698,6 +1845,8 @@ class MyCar(MecanumDriver):
         测试车道保持功能，以固定速度行驶。
         """
 
+# 处理巡线相关逻辑。
+
         def end_function():
             return True
 
@@ -1709,6 +1858,7 @@ class MyCar(MecanumDriver):
 
         关闭所有线程和资源，包括按键线程、摄像头和流处理器。
         """
+        # 关闭并释放资源。
         self._stop_flag = False
         self._end_flag = True
         self.thread_key.join()
@@ -1727,6 +1877,8 @@ class MyCar(MecanumDriver):
             programs_list: 程序列表，包含要执行的函数
             order_index: 初始选中的程序索引，默认为0
         """
+
+# 执行该方法的核心功能。
 
         def all_task():
             time.sleep(4)

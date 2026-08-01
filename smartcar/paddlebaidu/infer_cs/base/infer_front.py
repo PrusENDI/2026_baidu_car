@@ -8,7 +8,7 @@ import subprocess
 import psutil
 import yaml
 
-import time, os, sys
+import time, os, sys, socket
 # 添加上两层目录
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..","..", ".."))) 
 from smartcar.whalesbot.tools.log_wrap import logger
@@ -49,6 +49,40 @@ def get_python_processes():
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass
     return python_processes
+
+
+def command_contains_script(cmdline, script_name):
+    """判断命令行是否真正执行目标脚本，而非仅在字符串中提到它。"""
+    if not cmdline:
+        return False
+    for index, arg in enumerate(cmdline[1:], start=1):
+        # python -c "...infer_back_end.py..." 不是后端脚本进程，不能按文件名误认。
+        if "-c" in cmdline[1:index]:
+            continue
+        if os.path.basename(str(arg)) == script_name:
+            return True
+    return False
+
+
+def is_process_in_project(project_root, process_cwd):
+    """判断进程工作目录是否属于当前项目，避免误认其他 worktree。"""
+    if not process_cwd:
+        return False
+    root = os.path.realpath(os.path.abspath(project_root))
+    cwd = os.path.realpath(os.path.abspath(process_cwd))
+    try:
+        return os.path.commonpath([root, cwd]) == root
+    except ValueError:
+        return False
+
+
+def is_port_listening(port, host="127.0.0.1", timeout=0.2):
+    """用 TCP connect 检查推理后端端口是否确实可连接。"""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError, TypeError):
+        return False
     # for process in python_processes:
     #     print(f"PID: {process['pid']}, Name: {process['name']}, Cmdline: {process['cmdline']}")
     # print("    ")
@@ -127,11 +161,12 @@ class ClintInterface:
         logger.info("{}连接服务器...".format(name))
         model_cfg = self.get_config(name)
         self.img_size = model_cfg['img_size']
+        self.infer_port = model_cfg['port']
         self.client = self.get_zmp_client(model_cfg['port'])
         
         infer_back_end_file = "infer_back_end.py"
         # 检查后台程序是否运行, 如果未开启, 则开启
-        self.check_back_python(infer_back_end_file)
+        self.check_back_python(infer_back_end_file, port=self.infer_port)
 
         flag = False
         while True:
@@ -174,6 +209,81 @@ class ClintInterface:
             # 这里的> /dev/null 2>&1将标准输出和标准错误都重定向到/dev/null，实现与之前subprocess.Popen相同的效果
             # os.system(cmd_str + " > /dev/null 2>&1")
         
+
+    # 修改后的实现放在原方法之后，保留上方旧实现作为审计记录；类定义中后出现的
+    # 同名方法会覆盖旧实现，但不会删除现场曾使用过的代码。
+    def check_back_python(self, file_name, port=None):
+        """按当前项目目录和端口确认后端，必要时启动并输出诊断信息。"""
+        dir_file = os.path.abspath(os.path.dirname(__file__))
+        file_path = os.path.join(dir_file, file_name)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"推理后端脚本不存在: {file_path}")
+
+        project_root = os.path.abspath(os.path.join(dir_file, "..", "..", "..", ".."))
+        print(f"[infer-backend] project_root={project_root}")
+        print(f"[infer-backend] script={file_path}")
+        print(f"[infer-backend] required_port={port}")
+
+        same_project_process = False
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = proc.info.get('cmdline') or []
+                if not command_contains_script(cmdline, file_name):
+                    continue
+                process_cwd = proc.cwd()
+                in_project = is_process_in_project(project_root, process_cwd)
+                print(
+                    f"[infer-backend] candidate pid={proc.pid} cwd={process_cwd!r} "
+                    f"same_project={in_project} cmdline={cmdline!r}"
+                )
+                if not in_project:
+                    print(
+                        f"[infer-backend][WARN] 忽略其他项目目录的 {file_name}: "
+                        f"pid={proc.pid}, cwd={process_cwd!r}"
+                    )
+                    continue
+                same_project_process = True
+                if port is None or is_port_listening(port):
+                    print(f"[infer-backend] 当前项目后端已运行: pid={proc.pid}, port={port}")
+                    return True
+                print(
+                    f"[infer-backend][WARN] 当前项目进程存在但端口 {port} 尚未监听，"
+                    "不重复启动；继续等待其完成初始化。"
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as exc:
+                print(f"[infer-backend][WARN] 读取候选进程失败: {exc}")
+
+        if same_project_process:
+            return False
+
+        print(
+            f"[infer-backend] 未找到当前项目中可用的 {file_name}，"
+            "准备启动；其他目录同名进程不会复用。"
+        )
+        try:
+            # 修改前使用 shell=True 且将 stdout/stderr 丢到 DEVNULL，会隐藏后端 traceback。
+            process = subprocess.Popen(
+                [sys.executable, file_path],
+                cwd=project_root,
+                stdout=None,
+                stderr=None,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            print(f"[infer-backend][ERROR] 启动 {file_name} 失败: {exc!r}")
+            raise
+
+        print(f"[infer-backend] 已启动 pid={process.pid}, cwd={project_root}")
+        time.sleep(1)
+        if port is not None and not is_port_listening(port):
+            print(
+                f"[infer-backend][ERROR] 后端进程已启动但端口 {port} 尚未监听；"
+                "请检查后端 traceback、模型加载和串口占用。"
+            )
+            return False
+        if port is not None:
+            print(f"[infer-backend] 端口 {port} 已开始监听")
+        return True
 
     def get_config(self, name):
         for conf in self.configs:

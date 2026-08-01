@@ -39,6 +39,7 @@ class DataCollector:
         :param save_dir: 数据保存目录
         :param cam_id: 摄像头标识（用于日志）
         """
+        # 初始化对象状态。
         self.cap = camera
         self.cam_id = cam_id
         self.loop_delay = loop_delay
@@ -68,16 +69,19 @@ class DataCollector:
 
     def set_car_state(self, car_state):
         """设置当前车辆状态（用于保存到JSON）"""
+        # 设置相关参数。
         self.car_state = car_state.copy()
 
     def start(self):
         """开始收集数据"""
+        # 启动相关流程。
         if not self.run_flag:
             self.run_flag = True
             logger.info(f"[{self.cam_id}] dataset start!!")
 
     def stop(self):
         """停止收集数据"""
+        # 停止相关流程。
         if self.run_flag:
             self.run_flag = False
             self.save_json()
@@ -85,6 +89,7 @@ class DataCollector:
 
     def delete_last_n(self, n: int = 30):
         """删除最近 n 张图片和对应数据"""
+        # 执行该方法的核心功能。
         deleted_count = 0
         for i in range(n):
             try:
@@ -127,6 +132,7 @@ class DataCollector:
 
     def save_json(self):
         """保存 JSON 数据到文件"""
+        # 保存数据。
         try:
             with open(self.json_path, 'w') as fp:
                 json.dump(self.json_data, fp)
@@ -135,6 +141,7 @@ class DataCollector:
 
     def _collect_process(self):
         """数据收集主循环（线程内部运行）"""
+        # 处理输入数据。
         name_length = 4
         
         while not self.exit_flag:
@@ -174,6 +181,7 @@ class DataCollector:
 
     def close(self):
         """关闭收集器"""
+        # 关闭并释放资源。
         self.exit_flag = True
         self.stop()
         if self.collect_thread.is_alive():
@@ -191,6 +199,7 @@ class CollectControlCar:
         ) -> None:
         # ==================== 1. 双摄像头初始化 ====================
         # cam1: 原有车道摄像头（保持原有逻辑）
+        # 初始化对象状态。
         if cap1 is None:
             self.cap1 = Camera(1, 320, 240)  # 保持原有参数
         else:
@@ -253,12 +262,14 @@ class CollectControlCar:
         self.car_process()
 
     def beep(self):
+        # 控制蜂鸣器提示。
         self.rings.rings()
 
 
 
     def _stream_process(self):
         """双路流媒体推送循环"""
+        # 处理输入数据。
         while not self.exit_flag:
             try:
                 # 读取两个摄像头的画面
@@ -278,6 +289,8 @@ class CollectControlCar:
 
     def car_process(self):
         """遥控车主循环（处理按键、车辆控制）"""
+
+# 处理输入数据。
 
         grasp_flag = False
         self.arm.grasp(grasp_flag)
@@ -391,6 +404,7 @@ class CollectControlCar:
 
     def close(self):
         """关闭系统"""
+        # 关闭并释放资源。
         logger.info("正在关闭系统...")
         
         # 1. 停止车辆

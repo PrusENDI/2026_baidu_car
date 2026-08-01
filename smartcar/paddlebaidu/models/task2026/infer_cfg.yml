@@ -42,8 +42,10 @@ label_list:
 - ball_blue
 - ball_yellow
 - storage
-- lable_yellow
+# 修正标签英文拼写；修改前为 lable_yellow。
+- label_yellow
 - order
 - h_mo_gu
 - name
-- lable_blue
+# 修正标签英文拼写；修改前为 lable_blue。
+- label_blue

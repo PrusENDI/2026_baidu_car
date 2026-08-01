@@ -52,6 +52,7 @@ from ...tools import logger
 
 class StructData():
     def __init__(self, format=None) -> None:
+        # 初始化对象状态。
         if format is None:
             format=''
         self.format = '<b'+ format
@@ -59,14 +60,17 @@ class StructData():
         self.len = len(self.format)-1
         
     def set_format(self, format):
+        # 设置相关参数。
         self.format = '<b'+ format
         self.size = struct.calcsize(self.format)
         self.len = len(self.format)-1
         
     def __sizeof__(self) -> int:
+        # 执行该方法的核心功能。
         return self.size
     
     def unpack_data(self, data, index_start):
+        # 执行该方法的核心功能。
         try:
             s = index_start
             e = index_start + self.size
@@ -79,15 +83,18 @@ class StructData():
         return re_list
 
     def pack_data(self, data):
+        # 执行该方法的核心功能。
         bytes_t = struct.pack(self.format, *data)
         return bytes_t
 
     # 定义len函数的定义
     def __len__(self):
+        # 执行该方法的核心功能。
         return self.len
 
 class DevCmdInterface:
     def __init__(self, dev_id=None, mode=None, port_id=None, format='bb') -> None:
+        # 初始化对象状态。
         global serial_mc602
         self.ser = serial_mc602
         self.data_struct = StructData(format)
@@ -101,13 +108,16 @@ class DevCmdInterface:
         self.arg_reg = 1
 
     def set_time_out(self, time_out):
+        # 设置相关参数。
         self.time_out = time_out
 
     def set_port(self, port_id):
+        # 设置相关参数。
         self.port_id = port_id
     
     def get_bytes(self, *args, mode=None, port_id=None):
         # 根据参数补充所有参数
+        # 获取相关数据。
         data = []
         # print(args)
         data.append(self.dev_id)
@@ -141,6 +151,7 @@ class DevCmdInterface:
         return self.data_struct.pack_data(data)
     
     def get_result(self, bytes_all, index=0):
+        # 获取相关数据。
         data = self.data_struct.unpack_data(bytes_all, index)[self.arg_reg:]
         # 如果只有一个结果
         if len(data) == 1:
@@ -148,50 +159,65 @@ class DevCmdInterface:
         return data
     
     def send_get(self, bytes_tmp:bytes):
+        # 每条命令只允许返回本次通讯的新响应。旧实现会在本次超时时返回
+        # last_data，运动控制可能把陈旧的步数/编码器值误判为当前位置。
+        self.last_data = None
         ret = self.ser.get_anwser(bytes_tmp, self.time_out)
-        if ret is not None:
-            self.last_data = self.get_result(ret)
+        if ret is None:
+            return None
+        result = self.get_result(ret)
+        if result == []:
+            return None
+        self.last_data = result
         return self.last_data
     
     def act_mode(self, *args, mode=None, port_id=None):
+        # 执行该方法的核心功能。
         data_bytes = self.get_bytes(*args, mode=mode, port_id=port_id)
         return self.send_get(data_bytes)
     
     def reset(self, *args, port_id=None):
+        # 复位相关状态。
         data_bytes = self.get_bytes(*args, mode=3, port_id=port_id)
         return self.send_get(data_bytes)
     
     # 设置操作
     def set(self, *args, port_id=None):
         # print(args)
+        # 设置相关参数。
         data_bytes = self.get_bytes(*args, mode=2, port_id=port_id)
         # print(data_bytes.hex(" "))
         return self.send_get(data_bytes)
     
     # 获取操作
     def get(self, *args, port_id=None):
+        # 获取相关数据。
         data_bytes = self.get_bytes(*args, mode=1, port_id=port_id)
         # print(data_bytes)
         return self.send_get(data_bytes)
     
     # 没有操作符号时
     def no_act(self, port_id=None):
+        # 执行该方法的核心功能。
         data_bytes = self.get_bytes(port_id=port_id)
         # print(data_bytes)
         return self.send_get(data_bytes)
     
     def act_default(self, *args, port_id=None):
+        # 执行该方法的核心功能。
         data_bytes = self.get_bytes(*args, port_id=port_id)
         return data_bytes
 
 class DevListWrap:
     def __init__(self, dev_list=None) -> None:
+        # 初始化对象状态。
         if dev_list is None:
             self.dev_list = []
         else:
             self.dev_list = dev_list
 
     def get_all(self, args, mode=1):
+        # 获取相关数据。
         bytes_all = b''
         for i in range(len(self.dev_list)):
             bytes_all += self.dev_list[i].get_bytes(args[i], mode=mode)
@@ -209,26 +235,32 @@ class DevListWrap:
             return [0,0,0,0]
         return data_ret
     def __getattr__(self, name):
+        # 获取相关数据。
         return getattr(self.dev_list, name)
     
 class Buzzer_2(DevCmdInterface):
     def __init__(self) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["beep"])
 
     def rings(self, freq=262, duration=0.2):
         # 音调hz 时间s
+        # 执行该方法的核心功能。
         res = super().set(int(freq/2), int(duration*20))
         return res
     
 class Motor_2(DevCmdInterface):
     def __init__(self, port_id=None, reverse=1) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["motor"], port_id=port_id)
         self.reverse = reverse
     
     def set_dir(self, reverse):
+        # 设置相关参数。
         self.reverse = reverse
         
     def set_speed(self, *args):
+        # 设置相关参数。
         args = list(args)
         if len(args) == 2:
             args[1] = int(args[1] * self.reverse)
@@ -239,22 +271,27 @@ class Motor_2(DevCmdInterface):
     
 class AnalogInput_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["sensor_analog"], port_id=port_id)
 
 # 红外传感器
 class Infrared_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["sensor_infrared"], port_id=port_id)
 
 class Sensor_Analog2_2(DevCmdInterface):
     def __init__(self, port_id=None):
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["sensor_analog_a"], port_id=port_id)
     def read(self):
+        # 读取数据。
         return self.no_act()
 
 class BluetoothPad_2(DevCmdInterface):
     def __init__(self) -> None:
         # 调用父对象初始化
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["bluetooth"])
         self.throsheld_mid = [97, 97, 97, 97, 0]
         self.stick_min = 40
@@ -265,6 +302,7 @@ class BluetoothPad_2(DevCmdInterface):
         self.margin = 6
 
     def calibrate(self):
+        # 执行该方法的核心功能。
         info_tmp = self.no_act()
 
         # print(info_tmp)
@@ -277,6 +315,7 @@ class BluetoothPad_2(DevCmdInterface):
             self.divisor_min[i] = self.throsheld_mid[i] - self.stick_min - self.margin
 
     def get_stick(self):
+        # 获取相关数据。
         data = self.no_act()
         # print(data)
         re_data = []
@@ -299,19 +338,24 @@ class BluetoothPad_2(DevCmdInterface):
 
 class BoardKey_2(DevCmdInterface):
     def __init__(self) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["board_key"])
     
     def no_act(self):
+        # 执行该方法的核心功能。
         return super().no_act()[1:]
 
 class LedLight_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["led_light"], port_id=port_id)
     
     def set_light(self, led_id, r, g, b, port_id=None):
+        # 设置相关参数。
         return super().set(led_id, r, g, b, port_id=port_id)
     
     def set(self, *args, port_id=None):
+        # 设置相关参数。
         return super().set(*args, port_id=port_id)
 
 class Key4Btn_2(AnalogInput_2):
@@ -324,6 +368,7 @@ class Key4Btn_2(AnalogInput_2):
     short_time = 0.4
     
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         super().__init__(port_id=port_id)
         self.key_map = {3:355,1:1366,2:2137, 4:2988}
         self.threshold = 0.1
@@ -333,6 +378,7 @@ class Key4Btn_2(AnalogInput_2):
             self.btn_sta.append([False, 0.0, 0.0])
 
     def key_map_btn(self, val):
+        # 执行该方法的核心功能。
         r_key = 0
         diff = 1
         for key, value in self.key_map.items():
@@ -346,11 +392,13 @@ class Key4Btn_2(AnalogInput_2):
         return r_key
     
     def get_key(self, port_id=None):
+        # 获取相关数据。
         val = self.no_act(port_id=port_id)
         # print(val)
         return self.key_map_btn(val)
     
     def get_btn(self, port_id=None):
+        # 获取相关数据。
         self.event()
         time.sleep(0.01)
         if len(self.state) > 0:
@@ -361,6 +409,7 @@ class Key4Btn_2(AnalogInput_2):
             return 0
 
     def event(self):
+        # 执行该方法的核心功能。
         self.bak_time = time.time()
             
         index = 0
@@ -404,20 +453,25 @@ class Key4Btn_2(AnalogInput_2):
 
 class NixieTube_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["nixietube"], port_id=port_id)
         
     def set_number(self, num, port_id=None):
+        # 设置相关参数。
         return super().set(num, port_id=port_id)
     
 class Motor4_2(DevCmdInterface):
     def __init__(self) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["motor4"])
     
     def set_speed(self, speeds):
+        # 设置相关参数。
         return super().set(*speeds)
 
 class Motors_2():
     def __init__(self, ports, reverse=False) -> None:
+        # 初始化对象状态。
         self.moto_ports = ports
         self.motors = []
         self.encoders = []
@@ -432,18 +486,21 @@ class Motors_2():
         
     # 设置速度
     def set_speed(self, speeds):
+        # 设置相关参数。
         if not self.reverse:
             speeds = [-i for i in speeds]
         # print(speeds)
         return self.motors_wrap.get_all(speeds, mode=2)
 
     def get_speed(self):
+        # 获取相关数据。
         speed = self.motors_wrap.get_all(self.args_none, mode=1)
         if self.reverse:
             speed = [-i for i in speed]
         return speed
     
     def get_encoder(self):
+        # 获取相关数据。
         encoders = self.encoders_wrap.get_all(self.args_none, mode=1)
         if isinstance(encoders[0], list):
             encoders = encoders[0]  # 解开嵌套列表
@@ -453,47 +510,62 @@ class Motors_2():
         return encoders
 
     def reset_encoder(self):
+        # 复位相关状态。
         return self.encoders_wrap.get_all(self.args_none, mode=3)
     
     def reset(self):
+        # 复位相关状态。
         self.motors_wrap.get_all(self.args_none, mode=3)
         return self.encoders_wrap.get_all(self.args_none, mode=3)
     
 class EncoderMotor_2(DevCmdInterface):
     def __init__(self, port_id=None, reverse=-1) -> None:
+        # 初始化对象状态。
         self.reverse = reverse
         super().__init__(**ctl602_dev_list["encoder"], port_id=port_id)
     
     def get_encoder(self):
+        # 获取相关数据。
         return self.get()*self.reverse
 
 class EncoderMotors4_2(DevCmdInterface):
     def __init__(self) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["encoder4"])
 
 class ServoPwm_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["servo_pwm"], port_id=port_id)
 
     def set_angle(self, angle, speed=100):
+        # 设置相关参数。
         self.set(int(speed), int(angle))
 
 class ServoBus_2(DevCmdInterface):
     def __init__(self,port_id=None) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["servo_bus"], port_id=port_id)
-        self.set_time_out(1)
+        # 串口层现在会真正执行设备超时；保持历史有效的 0.2 s 上限，
+        # 禁止一次舵机等待独占 MC602 总线超过 600 ms 轴速度看门狗。
+        self.set_time_out(0.2)
     
     def set_angle(self, angle, speed=100):
-        self.act_mode(1, speed, angle, mode=2)
+        # 只接受本次舵机命令对应的新响应，避免沿用上一条命令的缓存结果。
+        self.last_data = None
+        return self.act_mode(1, speed, angle, mode=2)
 
     def set_speed(self, speed):
+        # 设置相关参数。
         self.act_mode(2, speed, mode=2)
 
 class ScreenShow_2(DevCmdInterface):
     def __init__(self) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["led_show"])
     
     def show(self, args):
+        # 显示相关画面。
         if type(args) != str:
             args = str(args)
         int_values = [ord(arg) for arg in args]
@@ -502,29 +574,39 @@ class ScreenShow_2(DevCmdInterface):
     
 class Battry_2(DevCmdInterface):
     def __init__(self) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["power"])
 
     def read(self):
+        # 读取数据。
         res = super().get()
         bat = float(res) / 1000
         return bat
     
 class PoutD_2(DevCmdInterface):
     def __init__(self, port_id=1) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["dout"], port_id=port_id)
     
     def set(self, *args):
+        # 设置相关参数。
         super().set(*args)
         
 class Stepper_2(DevCmdInterface):
     def __init__(self, port_id=1) -> None:
+        # 初始化对象状态。
         super().__init__(**ctl602_dev_list["stepper"], port_id=port_id)
 
     def set_pwm(self, freq):
+        # 设置相关参数。
         super().set(int(freq))
     
     def get_step(self):
-        return super().get()[1]
+        # 步数反馈必须来自本次新响应，禁止使用上一次 SET/GET 的缓存结果。
+        result = super().get()
+        if not isinstance(result, (list, tuple)) or len(result) < 2:
+            raise RuntimeError(f"MC602 未返回有效步进电机位置 result={result!r}")
+        return result[1]
 
 def beep_test():
     beep = Buzzer_2()

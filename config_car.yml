@@ -29,7 +29,7 @@ camera:
 # 侧摄像头光轴相对机械中心的物理偏移，单位 m；负值表示偏左。
 # 当前现场标定为偏左 6 cm，实车遥测后可直接调整此值。
 camera_calibration:
-  side_center_offset_x_m: -0.06
+  side_center_offset_x_m: 0
 io:
   left_sensor: 8
   right_sensor: 7
@@ -162,7 +162,9 @@ infer_cfg:
     run_mode: paddle
 
 # ============================================================
-# 文心一言 Access Token 配置
-# 获取地址：https://aistudio.baidu.com/account/accessToken
+# 千帆 OpenAI 兼容多模态接口配置；API Key 从 /home/jetson/qianfan.env 读取。
 # ============================================================
-ernie_access_token: REPLACE_YOUR_ACCESS_TOKEN_HERE
+qianfan:
+  base_url: "https://qianfan.baidubce.com/v2"
+  multimodal_model: "ernie-4.5-turbo-vl"
+  request_timeout: 10.0

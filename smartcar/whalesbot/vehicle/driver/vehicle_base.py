@@ -26,6 +26,7 @@ def get_path_relative(*args):
 class OdometryBase:
     def __init__(self) -> None:
         # x, y, theta
+        # 初始化对象状态。
         self.pose = np.array([.0, .0, .0])
         self.twist = np.array([.0, .0, .0])
         # 车子整体前进的路程变量
@@ -34,6 +35,7 @@ class OdometryBase:
     # odometry update,间隔时间不宜过长
     def odom_update(self, d_vect):
         # 位置变化矩阵
+        # 更新内部状态。
         z_angle = self.pose[2]
         d_pose_transform = np.array([[math.cos(z_angle), math.sin(z_angle)], 
                                     [-math.sin(z_angle), math.cos(z_angle)]])
@@ -50,16 +52,19 @@ class OdometryBase:
         self.pose += d_pose
     
     def reset(self):
+        # 复位相关状态。
         self.pose = np.array([.0, .0, .0])
         
 # 底盘功能抽象
 class ChassisBase:
     def __init__(self):
+        # 初始化对象状态。
         self.odom = OdometryBase()
         self.wheel_radius = 0.1
     
     def params_init(self):
         # 运动正解逆解转换矩阵参数初始化,可能包含尺寸参数
+        # 初始化相关资源。
         self.transform_forward = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
         self.transform_inverse = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
 
@@ -74,13 +79,16 @@ class ChassisBase:
     #     pass
 
     def forward_cal(self, wheel_vel):
+        # 控制前进。
         return np.dot(wheel_vel, self.transform_forward)
     
     def inverse_cal(self, car_vel):
+        # 执行该方法的核心功能。
         return np.dot(car_vel, self.transform_inverse)
 
     def get_velocity(self, linear_vx, linear_vy, angular_v):
         # 计算小车每个轮子的线速度
+        # 获取相关数据。
         wheel_vel = self.inverse_cal(np.array([linear_vx, linear_vy, angular_v]))
         return wheel_vel
         # 计算每个小车轮子的角速度
@@ -89,6 +97,7 @@ class ChassisBase:
 
     def updata_odom(self, wheel_vect):
         # 计算小车的位置变化
+        # 执行该方法的核心功能。
         car_vect = self.forward_cal(wheel_vect)
         # print("car_vect:", car_vect)
         # 更新小车的位姿
@@ -102,12 +111,14 @@ class TricycleChassis(ChassisBase):
         ***B***C***
     '''
     def __init__(self, raduis_base=0.1) -> None:
+        # 初始化对象状态。
         super().__init__()
         # 三轮全向车轮子到中心的距离半径
         self.radius = raduis_base
         self.params_init()
 
     def params_init(self):
+        # 初始化相关资源。
         r = self.radius
         cos_a = math.cos(math.pi/6)
         sin_a = math.sin(math.pi/6)
@@ -130,6 +141,7 @@ class Diff2Chassis(ChassisBase):
     差速二轮序号定义, 轮子速度定义为轮子顺时针转动为正
     '''
     def __init__(self, track=0.2) -> None:
+        # 初始化对象状态。
         logger.info("diff init")
         super().__init__()
         # 配置文件存储路径
@@ -138,6 +150,7 @@ class Diff2Chassis(ChassisBase):
         self.params_init()
     
     def params_init(self):
+        # 初始化相关资源。
         r = self.track
         # 根据小车差速二轮运动计算小车运动， 正解
         self.transform_forward = np.array([[-1/2, 0, 1/r],
@@ -158,6 +171,7 @@ class Diff4Chassis(ChassisBase):
     差速四轮序号定义, 轮子速度定义为轮子顺时针转动为正
     '''
     def __init__(self, track=0.2) -> None:
+        # 初始化对象状态。
         logger.info("diff4 init")
         super().__init__()
         # 配置文件存储路径
@@ -165,6 +179,7 @@ class Diff4Chassis(ChassisBase):
         self.params_init()
     
     def params_init(self):
+        # 初始化相关资源。
         r = self.track / 2
         # 根据小车差速四轮运动计算小车运动， 正解
         self.transform_forward = np.array([[ 1/4, 0, 1/4/r],
@@ -188,6 +203,7 @@ class MecanumChassis(ChassisBase):
     轮子速度定义为轮子顺时针转动为正
     '''
     def __init__(self, track=0.17, wheel_base=0.2) -> None:
+        # 初始化对象状态。
         logger.info("mecanum init")
         super().__init__()
         # 轮距 轴距 
@@ -196,6 +212,7 @@ class MecanumChassis(ChassisBase):
         self.params_init()
     
     def params_init(self):
+        # 初始化相关资源。
         rad_rolls = math.pi/4*1.052
         t = math.tan(rad_rolls);
         r = self.rx*t + self.ry
@@ -220,6 +237,7 @@ class QuadricycleChassis(ChassisBase):
     四轮全向序号定义, 轮子速度定义为轮子顺时针转动为正
     '''
     def __init__(self, raduis_base=0.1115) -> None:
+        # 初始化对象状态。
         logger.info("Quadricycle init")
         super().__init__()
         # 轴距 轮距 轮直径转周长
@@ -228,6 +246,7 @@ class QuadricycleChassis(ChassisBase):
         self.params_init()
     
     def params_init(self):
+        # 初始化相关资源。
         s_th = math.sin(math.pi/4)
         r = (self.rx + self.ry) / 2
         # 根据小车四轮运动计算小车运动, 正解
@@ -243,9 +262,11 @@ class QuadricycleChassis(ChassisBase):
         
 class MapWrap():
     def __init__(self) -> None:
+        # 初始化对象状态。
         pass
 
     def load_map(self, path):
+        # 加载数据。
         import json
         with open(path, "r", encoding='utf-8') as f:
             self.map = json.load(f)
@@ -253,11 +274,13 @@ class MapWrap():
         self.map_index = 0
 
     def get_path(self, pose_start, pose_end):
+        # 获取相关数据。
         path = [[1, 1], [2, 2]]
         return path
 
 class RoadMap():
     def __init__(self, path):
+        # 初始化对象状态。
         self.path = path
         self.road_map = []
         self.road_map_index = 0
@@ -265,6 +288,7 @@ class RoadMap():
         self.load_road_map()
     
     def load_road_map(self):
+        # 加载数据。
         import json
         with open(self.path, "r", encoding='utf-8') as f:
             self.road_map = json.load(f)
@@ -272,12 +296,14 @@ class RoadMap():
 
 class Pos2VelPid():
     def __init__(self):
+        # 初始化对象状态。
         self.pid_x = 0
         self.pid_y = 0
         
         
 class CarBase():
     def __init__(self):
+        # 初始化对象状态。
         path = get_path_relative("cfg_vehicle.yaml")
         cfg = yaml.load(open(path, "r", encoding='utf-8'), Loader=yaml.FullLoader)
         
@@ -291,9 +317,11 @@ class CarBase():
         self.odom_process.start()
 
     def reset_pose(self):
+        # 复位相关状态。
         self.chassis.odom.reset()
 
     def chassis_init(self, cfg):
+        # 初始化相关资源。
         try:
             # 获取底盘类型
             chassis_type = cfg["vehicle_cfg"]["chassis_type"]
@@ -321,6 +349,7 @@ class CarBase():
         '''
         世界坐标系到车坐标系
         '''
+        # 执行该方法的核心功能。
         sin_car = np.sin(angle_car)
         cos_car = np.cos(angle_car)
         # print(sin_car, cos_car)
@@ -335,6 +364,7 @@ class CarBase():
         '''
         车坐标系到世界坐标系
         '''
+        # 执行该方法的核心功能。
         sin_car = np.sin(angle_car)
         cos_car = np.cos(angle_car)
         # print(sin_car, cos_car)
@@ -346,6 +376,7 @@ class CarBase():
     
     def set_velocity(self, linear_vx, linear_vy, angular_v):
         # 根据速度计算四个轮子速度
+        # 设置相关参数。
         wheel_linear = self.chassis.get_velocity(linear_vx, linear_vy, angular_v)
         # print(wheel_linear)
         # 根据线速度计算轮胎的角速度, 计算A,B,C的电机速度
@@ -355,6 +386,7 @@ class CarBase():
         self.wheels_chassis.set_linear(wheel_linear)
     
     def set_vel_time(self, linear_vx, linear_vy, angular_v, during=1.0):
+        # 设置相关参数。
         time_st = time.time()
         while True:
             if time.time() - time_st > during:
@@ -365,6 +397,7 @@ class CarBase():
 
     def odomery_update(self):
         # encoders_last = np.array(self.motors_chassis.get_encoder())
+        # 更新内部状态。
         linear_wheel_last = np.array(self.wheels_chassis.get_linear())
         # print(linear_wheel_last)
         while True:
@@ -390,21 +423,26 @@ class CarBase():
             time.sleep(0.05)
         
     def get_odometry(self):
+        # 获取相关数据。
         return self.chassis.odom.pose
     
     def get_dis_traveled(self):
+        # 获取相关数据。
         return self.chassis.odom.dis_traveled
     
     def stop(self):
+        # 停止相关流程。
         self.set_velocity(0, 0, 0)
 
     def close(self):
+        # 关闭并释放资源。
         self.end_flag = True
         self.odom_process.join()
     
     
     def set_pose(self, pose, during=None, vel=[0.15, 0.15, math.pi/3], threshold=[0.004, 0.004, 0.02]):
         
+        # 设置相关参数。
         if during is not None:
             vel = (np.abs(np.array(pose) - self.chassis.odom.pose)) / during
             # print(vel)
@@ -446,6 +484,7 @@ class CarBase():
         self.set_velocity(0, 0, 0)
 
     def set_pose_offset(self, pose, during=None, vel=[0.2, 0.2, math.pi/3], threshold=[0.002, 0.002, 0.02]):
+        # 设置相关参数。
         start_pos = self.chassis.odom.pose
         tar_pos = [0, 0, 0]
         tar_pos[0] = start_pos[0] + pose[0]*math.cos(start_pos[2]) - pose[1]*math.sin(start_pos[2])

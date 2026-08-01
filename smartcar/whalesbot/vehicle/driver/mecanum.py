@@ -112,6 +112,7 @@ class Odometry:
         返回:
             numpy.ndarray: 车辆坐标系下的速度向量 [vx, vy, vtheta]
         """
+        # 执行该方法的核心功能。
         sin_car = np.sin(angle_car)
         cos_car = np.cos(angle_car)
         # 世界坐标系到车辆坐标系的转换矩阵
@@ -130,6 +131,7 @@ class Odometry:
         返回:
             numpy.ndarray: 世界坐标系下的速度向量 [vx, vy, vtheta]
         """
+        # 执行该方法的核心功能。
         sin_car = np.sin(angle_car)
         cos_car = np.cos(angle_car)
         # 车辆坐标系到世界坐标系的转换矩阵
@@ -173,6 +175,7 @@ class MecanumChassis:
         """
         初始化麦克纳姆轮底盘的转换矩阵
         """
+        # 初始化相关资源。
         roller_angle = math.pi / 4 * 1.052
         tan_roller = math.tan(roller_angle)
         wheel_constant = self.half_track * tan_roller + self.half_wheel_base
@@ -205,6 +208,7 @@ class MecanumChassis:
         返回:
             numpy.ndarray: 车辆速度向量
         """
+        # 控制前进。
         return wheel_velocity @ self.wheel_to_vehicle_matrix
 
     def inverse_kinematics(self, car_velocity: np.ndarray) -> np.ndarray:
@@ -217,6 +221,7 @@ class MecanumChassis:
         返回:
             numpy.ndarray: 轮子速度向量
         """
+        # 执行该方法的核心功能。
         return car_velocity @ self.vehicle_to_wheel_matrix
 
     def calculate_wheel_velocities(self, x: float, y: float, z: float) -> np.ndarray:
@@ -303,6 +308,7 @@ class MecanumDriver:
         参数:
             config_file: 配置文件路径
         """
+        # 加载数据。
         with open(config_file, "r", encoding="utf-8") as f:
             self.config = yaml.load(f, Loader=yaml.FullLoader)
 
@@ -310,6 +316,7 @@ class MecanumDriver:
         """
         加载默认配置
         """
+        # 加载数据。
         self.config = {
             "vehicle_cfg": {
                 "chassis_type": "MecanumChassis",
@@ -354,6 +361,7 @@ class MecanumDriver:
             z: theta角度
             distance: 前进的距离
         """
+        # 复位相关状态。
         with self._lock:
             self.chassis.odometry.reset(x, y, z,distance)
 
@@ -368,6 +376,7 @@ class MecanumDriver:
         返回:
             numpy.ndarray: 车辆坐标系下的速度向量 [vx, vy, vtheta]
         """
+        # 执行该方法的核心功能。
         return self.chassis.odometry.world_to_car_velocity(vel_world, angle_car)
 
     def car_to_world_velocity(self, vel_car, angle_car):
@@ -381,6 +390,7 @@ class MecanumDriver:
         返回:
             numpy.ndarray: 世界坐标系下的速度向量 [vx, vy, vtheta]
         """
+        # 执行该方法的核心功能。
         return self.chassis.odometry.car_to_world_velocity(vel_car, angle_car)
 
     def set_velocity(self, x, y, z):
@@ -407,6 +417,7 @@ class MecanumDriver:
             z: 角速度
             duration: 持续时间（秒）
         """
+        # 设置相关参数。
         start_time = time.time()
         while True:
             if time.time() - start_time > duration:
@@ -421,6 +432,7 @@ class MecanumDriver:
 
         定期更新车辆位姿信息
         """
+        # 更新内部状态。
         previous_wheel_linear_velocities = np.array(self.wheels_chassis.get_linear())
         while True:
             if self._stop_thread:
@@ -443,6 +455,7 @@ class MecanumDriver:
         返回:
             numpy.ndarray: 当前位姿 [x, y, theta]
         """
+        # 获取相关数据。
         with self._lock:
             if show_info:
                 logger.info(f"当前位姿: [{self.chassis.odometry.position[0]:.4f}, {self.chassis.odometry.position[1]:.4f}, {self.chassis.odometry.position[2]:.4f}]")
@@ -455,6 +468,7 @@ class MecanumDriver:
         返回:
             float: 行驶距离
         """
+        # 获取相关数据。
         with self._lock:
             if show_info:
                 logger.info(f"当前行驶距离: {self.chassis.odometry.distance:.4f}")
@@ -464,12 +478,14 @@ class MecanumDriver:
         """
         停止车辆
         """
+        # 停止相关流程。
         self.set_velocity(0, 0, 0)
 
     def close(self):
         """
         关闭线程
         """
+        # 关闭并释放资源。
         self._stop_thread = True
         self.odometry_thread.join()
 
@@ -477,8 +493,10 @@ class MecanumDriver:
         self,
         target_position,
         duration=None,
-        max_velocities=(0.2, 0.2, math.pi / 3),
-        tolerance=(0.004, 0.004, 0.02),
+        # 同步自 Orin 2026-07-23 现场版本：默认定位降速并收紧到位容差；
+        # 不改变显式传入 duration/max_velocities/tolerance 时的原有行为。
+        max_velocities=(0.1, 0.1, math.pi / 6),
+        tolerance=(0.002, 0.002, 0.01),
         timeout=30.0,  # 添加超时参数
     ):
         """
@@ -491,6 +509,8 @@ class MecanumDriver:
             tolerance: 位置误差阈值 [x误差, y误差, 角度误差]
             timeout: 超时时间（秒），超过此时间将停止尝试
         """
+
+# 控制运动到目标状态。
 
         with self._lock:
             current_position = self.chassis.odometry.position.copy()
@@ -566,6 +586,7 @@ class MecanumDriver:
             max_velocities: 速度上限 [x轴速度, y轴速度, 角速度]，默认值 [0.2, 0.2, π/3]
             tolerance: 位置误差阈值 [x误差, y误差, 角度误差]，单位：米、弧度，默认值 [0.002, 0.002, 0.02]
         """
+        # 控制运动到目标状态。
         if max_velocities is None:
             max_velocities = [0.2, 0.2, math.pi / 3]
         if tolerance is None:

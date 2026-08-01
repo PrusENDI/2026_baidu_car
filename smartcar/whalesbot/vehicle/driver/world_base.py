@@ -25,12 +25,14 @@ def get_path_relative(*args):
 
 class WorldBase:
     def __init__(self):
+        # 初始化对象状态。
         pass
 
     def speed_transform(self, vel_car, angle_car):
         '''
         速度转换
         '''
+        # 处理速度控制。
         sin_car = np.sin(angle_car)
         cos_car = np.cos(angle_car)
         # print(sin_car, cos_car)
@@ -46,6 +48,7 @@ class WorldBase:
         '''
         世界坐标系到车坐标系
         '''
+        # 执行该方法的核心功能。
         sin_car = np.sin(angle_car)
         cos_car = np.cos(angle_car)
         # print(sin_car, cos_car)
@@ -58,6 +61,7 @@ class WorldBase:
 
 class RoadMap():
     def __init__(self, path):
+        # 初始化对象状态。
         self.path = path
         self.road_map = []
         self.road_map_index = 0
@@ -65,6 +69,7 @@ class RoadMap():
         self.load_road_map()
     
     def load_road_map(self):
+        # 加载数据。
         import json
         with open(self.path, "r", encoding='utf-8') as f:
             self.road_map = json.load(f)
