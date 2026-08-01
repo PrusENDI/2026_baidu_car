@@ -23,28 +23,35 @@ from ...tools import logger
 
 class CotrollerInfo:
     def __init__(self, baudrate, timeout=0.1, mode="USB") -> None:
+        # 初始化对象状态。
         self.baudrate = baudrate
         self.timeout = timeout
         self.connect_mode = mode
         self.name:str = None
 
     def send_cmd(self, cmd):
+        # 发送数据。
         pass
 
     def get_anwser(self, cmd):
+        # 获取相关数据。
         pass
     
     def ping_rx(self):
+        # 执行该方法的核心功能。
         pass
     
     def download_bin(self, obj):
+        # 执行该方法的核心功能。
         pass
 
     def __str__(self) -> str:
+        # 执行该方法的核心功能。
         return "baudrate:{},timeout:{},mode:{}".format(self.baudrate, self.timeout, self.connect_mode)
 
 class SerialWrap(serial.Serial):
     def __init__(self):
+        # 初始化对象状态。
         super(SerialWrap, self).__init__(port=None, baudrate=115200, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, \
                                          stopbits=serial.STOPBITS_ONE, timeout=0.03, xonxoff=False, rtscts=False, \
                                          dsrdtr=False)
@@ -68,27 +75,31 @@ class SerialWrap(serial.Serial):
         self.timeout = 0.1
         
     def get_anwser(self, cmd:bytes, time_out=0.1)->bytes:
+        # 串行化一次完整的发送和接收，并把调用方设置的超时传给控制器。
         self.lock.acquire()
-        res = None
         try:
             self.reset_buffer()
             self.dev.send_cmd(self, cmd)
-            res = self.dev.get_anwser(self)
+            return self.dev.get_anwser(self, time_out)
         except Exception as e:
             logger.error("get_anwser error:{}".format(e))
-        self.lock.release()
-        return res
+            return None
+        finally:
+            self.lock.release()
 
     def set_bps(self, bps):
+        # 设置相关参数。
         self.baudrate = bps
 
     def set_port(self, port):
+        # 设置相关参数。
         if self.connect_flag:
             self.close()
             self.connect_flag = False
         self.port = port
         
     def open(self):
+        # 打开相关资源。
         try:
             if self.port is None:
                 return False
@@ -100,6 +111,7 @@ class SerialWrap(serial.Serial):
             return False
 
     def get_serial_list(self):
+        # 获取相关数据。
         port_list = list_ports.comports()
         # for port in port_list:
         #     print('端口号：' + port[0] + '   端口名：' + port[1])
@@ -108,9 +120,11 @@ class SerialWrap(serial.Serial):
         return port_list
     
     def set_ctl_serial(self, ctl_dev:CotrollerInfo):
+        # 设置相关参数。
         self.baudrate = ctl_dev.baudrate
 
     def ping_port(self):
+        # 执行该方法的核心功能。
         serial_list = self.get_serial_list()
         if len(serial_list) == 0:
             logger.error("未找到串口,查看是否插入了串口,或者查看下位机是否开机")
@@ -142,11 +156,13 @@ class SerialWrap(serial.Serial):
         return None
     
     def reset_buffer(self):
+        # 复位相关状态。
         self.reset_input_buffer()
         self.reset_output_buffer()
 
     def assert_dev(self, name_test:str):
         # 转成小写对比
+        # 执行该方法的核心功能。
         name_dev = self.dev.name.lower()
         name_test = name_test.lower()
         if name_test in name_dev or name_dev in name_test:
@@ -158,6 +174,7 @@ class SerialWrap(serial.Serial):
 
 class MC601(CotrollerInfo):
     def __init__(self, baudrate=380400, timeout=0.1, mode="USB") -> None:
+        # 初始化对象状态。
         super().__init__(baudrate, timeout, mode)
         self.name = "mc601"
         self.header = bytes.fromhex('77 68')
@@ -168,9 +185,11 @@ class MC601(CotrollerInfo):
         # # 加入头尾数据帧
         # cmd_all = self.header + cmd_len + cmd + self.tail
         # serial_obj.write(cmd_all)
+        # 发送数据。
         serial_obj.write(cmd)
 
     def get_anwser(self, serial_obj:SerialWrap, time_out=0.05):
+        # 获取相关数据。
         time_start = time.time()
         dst_len = 0
         res = serial_obj.read(3)
@@ -195,6 +214,7 @@ class MC601(CotrollerInfo):
             res = res + serial_obj.read(dst_len - len(res))
     
     def ping_rx(self, serial_obj:SerialWrap, time_out=0.05):
+        # 执行该方法的核心功能。
         time_start = time.time()
         while time.time() - time_start < time_out:
             serial_obj.reset_buffer()
@@ -207,12 +227,14 @@ class MC601(CotrollerInfo):
         
 class MC602(CotrollerInfo):
     def __init__(self, baudrate=1000000, timeout=0.1, mode="USB") -> None:
+        # 初始化对象状态。
         super().__init__(baudrate, timeout, mode)
         self.name = "mc602"
         self.header = bytes.fromhex('77 68')
         self.tail = bytes.fromhex('0A')
 
     def send_cmd(self, serial_obj:SerialWrap, cmd:bytes):
+        # 发送数据。
         cmd_len = (len(cmd) + 4).to_bytes(1, 'big')
         # 加入头尾数据帧
         cmd_all = self.header + cmd_len + cmd + self.tail
@@ -223,29 +245,55 @@ class MC602(CotrollerInfo):
         # time.sleep(0.1)
         # res = serial_obj.read(2)
         # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
-        time_start = time.time()
-        dst_len = 0
-        res = serial_obj.read(3)
-        if len(res) != 3:
+        # 获取相关数据。
+        try:
+            receive_timeout = float(time_out)
+        except (TypeError, ValueError):
             return None
-        # 总帧长
-        dst_len = res[2]
-        # 获取剩余数据
-        res = res + serial_obj.read(dst_len-3)
-        while True:
-            if time.time() - time_start > time_out:
-                return None
-            # data = res[3:-1]
-            # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
-            if len(res) == dst_len:
-                if res[0] == self.header[0] and res[-1] == self.tail[0]:
-                    return res[3:-1]
-                else:
+        if receive_timeout <= 0:
+            return None
+
+        deadline = time.monotonic() + receive_timeout
+        original_timeout = serial_obj.timeout
+
+        def read_exact(size):
+            data = b''
+            while len(data) < size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return None
-            res = res + serial_obj.read(dst_len - len(res))
+                # pyserial 的 timeout 也必须受同一个截止时间约束，避免一次
+                # 阻塞 read() 越过上层 MC602 事务的时间预算。
+                serial_obj.timeout = (
+                    remaining if original_timeout is None
+                    else min(original_timeout, remaining)
+                )
+                chunk = serial_obj.read(size - len(data))
+                if not chunk:
+                    return None
+                data += chunk
+            return data
+
+        try:
+            header = read_exact(3)
+            if header is None or header[0] != self.header[0]:
+                return None
+            dst_len = header[2]
+            if dst_len < 4:
+                return None
+            remainder = read_exact(dst_len - 3)
+            if remainder is None:
+                return None
+            res = header + remainder
+            if res[-1] != self.tail[0]:
+                return None
+            return res[3:-1]
+        finally:
+            serial_obj.timeout = original_timeout
 
     
     def ping_rx(self, serial_obj:SerialWrap, time_out=0.05):
+        # 执行该方法的核心功能。
         time_start = time.time()
 
         while time.time() - time_start < time_out:
@@ -257,6 +305,7 @@ class MC602(CotrollerInfo):
         return False
 
     def download_bin(self, serial_obj:SerialWrap):
+        # 执行该方法的核心功能。
         is_mc602 = False
         serial_obj.write(bytes.fromhex('55 AA 00 01 08 00 00 F7'))
         time.sleep(0.01)
@@ -291,6 +340,7 @@ class MC602(CotrollerInfo):
     
 class MC602Wireness(CotrollerInfo):
     def __init__(self, baudrate=115200, timeout=0.2, mode="Wireness") -> None:
+        # 初始化对象状态。
         super().__init__(baudrate, timeout, mode)
         self.name = "mc602_wireness"
         self.header = bytes.fromhex('FE')
@@ -302,9 +352,11 @@ class MC602Wireness(CotrollerInfo):
         self.target_id = bytes.fromhex('5D 3D')
 
     def set_target_id(self, target_id:bytes):
+        # 设置相关参数。
         self.target_id = target_id
 
     def send_cmd(self, serial_obj:SerialWrap, cmd:bytes):
+        # 发送数据。
         cmd_len = (len(cmd) + 4).to_bytes(1, 'big')
         # 端口地址数据组合
         cmd_data = self.port_src + self.port_dst + self.target_id + cmd
@@ -317,6 +369,7 @@ class MC602Wireness(CotrollerInfo):
 
     def get_anwser(self, serial_obj:SerialWrap, time_out=0.15):
         # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
+        # 获取相关数据。
         time_start = time.time()
         res = b''
         while True:
@@ -341,6 +394,7 @@ class MC602Wireness(CotrollerInfo):
             res = res + serial_obj.read(dst_len - len(res))
     
     def ping_rx(self, serial_obj:SerialWrap, time_out=0.3):
+        # 执行该方法的核心功能。
         self.send_cmd(serial_obj, bytes.fromhex('02 01 10'))
         # serial_obj.flush()   # 直到发送完毕
         # time.sleep(0.01)

@@ -34,6 +34,7 @@ labels_list = []
 
 class MyEncoder(json.JSONEncoder):
     def default(self, obj):
+        # 执行该方法的核心功能。
         if isinstance(obj, np.integer):
             return int(obj)
         elif isinstance(obj, np.floating):

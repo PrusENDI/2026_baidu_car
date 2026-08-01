@@ -27,6 +27,7 @@ class Button_1:
     BUTTON = {"1": "01", "2": "02", "3": "03", "4": "04"}
 
     def __init__(self, port, button):
+        # 初始化对象状态。
         self.state = False
         self.port = port
         button_str = self.BUTTON[button]
@@ -34,6 +35,7 @@ class Button_1:
         self.cmd_data = bytes.fromhex('77 68 05 00 01 DB {} {} 0A'.format(port_str, button_str))
 
     def clicked(self):
+        # 执行该方法的核心功能。
         response = serial_mc601.get_answer1(self.cmd_data)
         # print(response)
         if len(response) == 8 and response[4] == 0xDB and response[5] == self.port:
@@ -55,6 +57,7 @@ class ButtonAll_1:
     long_time = 0.7
 
     def __init__(self, port):
+        # 初始化对象状态。
         self.port = port
         for i in range(5):
             self.btn_sta.append([False, 0.0, 0.0])
@@ -64,6 +67,7 @@ class ButtonAll_1:
         self.cmd_data = bytes.fromhex('77 68 05 00 01 E1 {} 00 0A'.format(port_str))
 
     def clicked(self):
+        # 执行该方法的核心功能。
         response = serial_mc601.get_answer1(self.cmd_data)
         # print("resp=",len(response))
         button_v = 0
@@ -84,6 +88,7 @@ class ButtonAll_1:
         return button_v
 
     def get_btn(self):
+        # 获取相关数据。
         self.event()
         if len(self.state) > 0:
             key_v, key_state = self.state[0][0], self.state[0][1]
@@ -93,6 +98,7 @@ class ButtonAll_1:
             return 0
 
     def event(self):
+        # 执行该方法的核心功能。
         self.bak_time = time.time()
         index = 0
         while index < len(self.state):
@@ -133,6 +139,7 @@ class ButtonAll_1:
 
 class LimitSwitch_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port = port
         port_str = '{:02x}'.format(port)
         # print (port_str)
@@ -140,6 +147,7 @@ class LimitSwitch_1:
 
     def clicked(self):
         # serial_mc601.write(self.cmd_data)
+        # 执行该方法的核心功能。
         response = serial_mc601.get_answer1(self.cmd_data)  # 77 68 01 00 0D 0A
         # print(response)
         if len(response) < 8 or response[4] != 0xDD or response[5] != self.port \
@@ -159,11 +167,13 @@ class LimitSwitch_1:
 
 class UltrasonicSensor_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port = port
         port_str = '{:02x}'.format(port)
         self.cmd_data = bytes.fromhex('77 68 04 00 01 D1 {} 0A'.format(port_str))
 
     def read(self):
+        # 读取数据。
         return_data = serial_mc601.get_answer1(self.cmd_data)
         # print(return_data)
         if len(return_data) < 11 or return_data[7] != 0xD1 or return_data[8] != self.port:
@@ -177,9 +187,11 @@ class UltrasonicSensor_1:
 
 class ServoBus_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port_str = '{:02x}'.format(port)
 
     def set_angle(self, angle, speed):
+        # 设置相关参数。
         angle = int(angle)
         speed = int(speed)
         cmd_servo_data = (bytes.fromhex('77 68 08 00 02 36 {}'.format(self.port_str)) +
@@ -191,6 +203,7 @@ class ServoBus_1:
         # serial_mc601.write(cmd_servo_data)
     
     def set_speed(self, speed):
+        # 设置相关参数。
         speed = int(speed)
         angle = 1
         cmd_servo_data = (bytes.fromhex('77 68 06 00 02 37 {}'.format(self.port_str)) +
@@ -203,15 +216,18 @@ class ServoBus_1:
         serial_mc601.write(cmd_servo_data)
 
     def reset(self):
+        # 复位相关状态。
         cmd_servo_data = bytes.fromhex('77 68 04 00 02 64 0A')
         serial_mc601.reset_buffer()
         serial_mc601.write(cmd_servo_data)
 
 class ServoPwm_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port_str = '{:02x}'.format(port)
 
     def set_angle(self, angle, speed):
+        # 设置相关参数。
         angle = int(angle)
         speed = int(speed)
         if angle < 0:
@@ -234,9 +250,11 @@ class ServoPwm_1:
 
 class LedLight_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port_str = '{:02x}'.format(port)
 
     def set_light(self, led_id, red, green, blue):  # 0代表全亮，其他值对应灯珠亮，1~4
+        # 设置相关参数。
         which_str = '{:02x}'.format(led_id)
         red_str = '{:02x}'.format(red)
         green_str = '{:02x}'.format(green)
@@ -248,10 +266,12 @@ class LedLight_1:
 
 class DigitOut_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port = port
         self.port_str = '{:02x}'.format(port)
 
     def out(self, value):  # 1断 2通
+        # 执行该方法的核心功能。
         value_str = '{:02x}'.format(value)
         cmd_servo_data = bytes.fromhex('77 68 05 00 02 1E {} {} 0A'.format(self.port_str, value_str))
         serial_mc601.write(cmd_servo_data)
@@ -262,6 +282,7 @@ import numpy as np
 class EncoderMotorAllSim_1:
     def __init__(self):
         # 编码器一圈的值
+        # 初始化对象状态。
         self.encoder_resolution = 2016
         # 编码器与速度转换值
         self.speed_rate = 100
@@ -272,6 +293,7 @@ class EncoderMotorAllSim_1:
     # 计算速度变化时的编码器值
     def set_speed(self, speed4:List[int]):
         # 更新编码器的值
+        # 设置相关参数。
         self.encoder4 = self.encoder4 + (self.speed4 * self.speed_rate * (time.time() - self.last_time)).astype(np.int32)
         # 更新速度
         self.speed4 = np.array(speed4)
@@ -280,11 +302,13 @@ class EncoderMotorAllSim_1:
     # 速度不变时，获取编码器的值
     def get(self):
         # 根据最后一次更新的速度和时间，计算当前的编码器值
+        # 获取相关数据。
         encoder4 = self.encoder4 + (self.speed4 * self.speed_rate * (time.time() - self.last_time)).astype(np.int32)
         # print(self.encoder4)
         return encoder4
 
     def reset(self):
+        # 复位相关状态。
         self.encoder4 = np.array([0, 0, 0, 0])
 
 # 定义所有模拟电机编码器的类
@@ -292,6 +316,7 @@ encoder_motor_all_sim1 = EncoderMotorAllSim_1()
 # 77 68 06 00 01 e9 01 54 01 0A
 class Motor_1:
     def __init__(self, driver_id=1, port=1):
+        # 初始化对象状态。
         self.driver_id_str = '{:02x}'.format(driver_id)
         self.port_str = '{:02x}'.format(port)
         # 编码器与速度转换值
@@ -303,6 +328,7 @@ class Motor_1:
     def rotate(self, speed):
         # print("---------------------")
         # 根据速度变化更新模拟编码值
+        # 控制旋转动作。
         self.encoder += self.speed * self.speed_rate * (time.time() - self.last_time)
         self.last_time = time.time()
         # print("after", self.encoder)
@@ -316,12 +342,15 @@ class Motor_1:
     
     def get_encoder(self):
         # 根据最后一次更新的速度和时间，计算当前的模拟编码器值
+        # 获取相关数据。
         encoder = self.encoder + self.speed * self.speed_rate * (time.time() - self.last_time)
         return int(encoder)
     def reset_encoder(self):
+        # 复位相关状态。
         self.encoder = 0
         
     def reset(self):
+        # 复位相关状态。
         self.rotate(0)
         self.encoder = 0
 
@@ -329,6 +358,7 @@ class Motor_1:
 class EncoderMotor4Sim_1:
     def __init__(self):
         # 编码器一圈的值
+        # 初始化对象状态。
         self.encoder_resolution = 2016
         # 编码器与速度转换值
         self.speed_rate = 100
@@ -339,6 +369,7 @@ class EncoderMotor4Sim_1:
 
     # 计算速度变化时的编码器值
     def set_speed(self, speed4:List[int]):
+        # 设置相关参数。
         self.speed4_last = self.speed4
         self.speed4 = np.array(speed4)
         self.encoder4 = self.encoder4 + (self.speed4_last * self.speed_rate * (time.time() - self.last_time)).astype(np.int32)
@@ -346,22 +377,26 @@ class EncoderMotor4Sim_1:
 
     # 速度不变时，获取编码器的值
     def get(self):
+        # 获取相关数据。
         encoder4 = self.encoder4 + (self.speed4 * self.speed_rate * (time.time() - self.last_time)).astype(np.int32)
         # print(self.encoder4)
         return encoder4
 
     def reset(self):
+        # 复位相关状态。
         self.encoder4 = np.array([0, 0, 0, 0])
         
 # encoder4_sim_ctl1 = EncoderMotor4Sim_1()
 class Motor4_1:
     def __init__(self):
+        # 初始化对象状态。
         self.comma_head_all_motor = bytes.fromhex('77 68 0c 00 02 7a 01')
         self.comma_trail = bytes.fromhex('0A')
         self.sp_struct = struct.Struct('>bbbb')
         self.encoder4_sim_ctl1 = EncoderMotor4Sim_1()
 
     def set_speed(self, speeds:List[int]):
+        # 设置相关参数。
         cmd_m4 = self.comma_head_all_motor
         for i in range(4):
             sp_bytes = (i+1).to_bytes(1, byteorder='big') + speeds[i].to_bytes(1, byteorder='big', signed=True)
@@ -373,17 +408,21 @@ class Motor4_1:
         serial_mc601.write(cmd_m4)
 
     def get_encoders(self):
+        # 获取相关数据。
         return self.encoder4_sim_ctl1.get()
 
     def reset(self):
+        # 复位相关状态。
         self.encoder4_sim_ctl1.reset()
         
 class Infrared_1:
     def __init__(self, port):
+        # 初始化对象状态。
         port_str = '{:02x}'.format(port)
         self.cmd_data = bytes.fromhex('77 68 04 00 01 D4 {} 0A'.format(port_str))
 
     def read(self):
+        # 读取数据。
         return_data = serial_mc601.get_answer1(self.cmd_data)
         # print(return_data)
         return_data_infrared = return_data[3:7]
@@ -393,9 +432,11 @@ class Infrared_1:
 
 class Buzzer_1:
     def __init__(self):
+        # 初始化对象状态。
         self.cmd_data = bytes.fromhex('77 68 05 00 02 3D 03 02 0A')
 
     def rings(self, *args):
+        # 执行该方法的核心功能。
         serial_mc601.write(self.cmd_data)
         # serial_mc601.get_answer
         time.sleep(0.4)
@@ -405,11 +446,13 @@ class Buzzer_1:
 
 class MagneticSensor_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port = port
         port_str = '{:02x}'.format(self.port)
         self.cmd_data = bytes.fromhex('77 68 04 00 01 CF {} 0A'.format(port_str))
 
     def read(self):
+        # 读取数据。
         return_data = serial_mc601.get_anwser(self.cmd_data)
         # return_data = serial_mc601.read()
         # print("return_data=",return_data[8])
@@ -423,12 +466,14 @@ class MagneticSensor_1:
 
 class AnalogInput_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port = port
         port_str = '{:02x}'.format(self.port)
         self.cmd_data = bytes.fromhex('77 68 04 00 01 E1 {} 0A'.format(port_str))
         self.last_val = 0
 
     def read(self):
+        # 读取数据。
         return_data = serial_mc601.get_anwser(self.cmd_data)
         # print("return_data=", return_data, "len:", len(return_data))
         if len(return_data) != 9 or return_data[-4] != 0xE1 or return_data[-3] != self.port:
@@ -441,10 +486,12 @@ class AnalogInput_1:
 
 class PortOut_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port = port
         self.port_str = '{:02x}'.format(port)
 
     def out(self, value):  # 1断 2通
+        # 执行该方法的核心功能。
         value_str = '{:02x}'.format(value)
         cmd_servo_data = bytes.fromhex('77 68 05 00 02 3A {} {} 0A'.format(self.port_str, value_str))
         serial_mc601.write(cmd_servo_data)
@@ -453,9 +500,11 @@ class PortOut_1:
 class NixieTube_1:
     def __init__(self, port):
         # self.port = port
+        # 初始化对象状态。
         self.port_str = '{:02x}'.format(port)
 
     def set_number(self, value):
+        # 设置相关参数。
         if value > 9999:
             value = 9999
         elif value < 0:
@@ -470,11 +519,13 @@ class NixieTube_1:
 
 class AiCam_1:
     def __init__(self, port):
+        # 初始化对象状态。
         self.port = port
         port_str = '{:02x}'.format(self.port)
         self.cmd_data = bytes.fromhex('77 68 06 00 01 E9 {} 54 18 0A'.format(port_str))
 
     def read(self):
+        # 读取数据。
         return_data = [0] * 8
         read_data = serial_mc601.get_answer1(self.cmd_data)
         time.sleep(0.03)

@@ -57,6 +57,7 @@ class Camera:
         # elif src == 1:
         #     self.src = "/dev/video1"
 
+        # 初始化对象状态。
         self.width = width
         self.height = height
         self.index = index
@@ -78,6 +79,7 @@ class Camera:
         # self.start()
 
     def init(self):
+        # 初始化相关资源。
         while True:
             try:
                 if 'Windows' in platform.platform():
@@ -100,6 +102,7 @@ class Camera:
     
     def start_back_thread(self):
         # 如果未开启线程，开启线程
+        # 启动相关流程。
         if not self.flag_thread:
             self.cap_thread = threading.Thread(target=self.update, args=())
             self.cap_thread.daemon = True
@@ -108,6 +111,7 @@ class Camera:
         time.sleep(0.5)
             
     def update(self):
+        # 更新内部状态。
         while True:
             if self.stop_flag:
                 break
@@ -131,17 +135,20 @@ class Camera:
                 self.set_size(self.width, self.height)
 
     def set_size(self, width, height):
+        # 设置相关参数。
         self.width = width
         self.height = height
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
 
     def read(self):
+        # 读取数据。
         while self.frame is None:
             time.sleep(0.1)
         return self.frame
 
     def close(self):
+        # 关闭并释放资源。
         self.stop_flag = True
         # 等待进程结束
         self.cap_thread.join()

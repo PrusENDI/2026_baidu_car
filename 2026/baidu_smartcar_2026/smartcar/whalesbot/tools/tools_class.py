@@ -67,6 +67,7 @@ class PID(object):
             output the PID should give when first calling it to avoid the PID outputting zero and
             moving the system away from the setpoint.
         """
+        # 初始化对象状态。
         self.Kp, self.Ki, self.Kd = Kp, Ki, Kd
         self.setpoint = setpoint
         self.sample_time = sample_time
@@ -116,6 +117,7 @@ class PID(object):
         :param dt: If set, uses this value for timestep instead of real time. This can be used in
             simulations when simulation time is different from real time.
         """
+        # 执行该方法的核心功能。
         if not self.auto_mode:
             return self._last_output
 
@@ -174,6 +176,7 @@ class PID(object):
         return output
 
     def __repr__(self):
+        # 执行该方法的核心功能。
         return (
             '{self.__class__.__name__}('
             'Kp={self.Kp!r}, Ki={self.Ki!r}, Kd={self.Kd!r}, '
@@ -191,26 +194,31 @@ class PID(object):
         The P-, I- and D-terms from the last computation as separate components as a tuple. Useful
         for visualizing what the controller is doing or when tuning hard-to-tune systems.
         """
+        # 执行该方法的核心功能。
         return self._proportional, self._integral, self._derivative
 
     @property
     def tunings(self):
         """The tunings used by the controller as a tuple: (Kp, Ki, Kd)."""
+        # 执行该方法的核心功能。
         return self.Kp, self.Ki, self.Kd
 
     @tunings.setter
     def tunings(self, tunings):
         """Set the PID tunings."""
+        # 执行该方法的核心功能。
         self.Kp, self.Ki, self.Kd = tunings
 
     @property
     def auto_mode(self):
         """Whether the controller is currently enabled (in auto mode) or not."""
+        # 执行该方法的核心功能。
         return self._auto_mode
 
     @auto_mode.setter
     def auto_mode(self, enabled):
         """Enable or disable the PID controller."""
+        # 执行该方法的核心功能。
         self.set_auto_mode(enabled)
 
     def set_auto_mode(self, enabled, last_output=None):
@@ -227,6 +235,7 @@ class PID(object):
             from when going from manual mode to auto mode. Has no effect if the PID is already in
             auto mode.
         """
+        # 设置相关参数。
         if enabled and not self._auto_mode:
             # Switching from manual mode to auto, reset
             self.reset()
@@ -243,11 +252,13 @@ class PID(object):
 
         See also the *output_limits* parameter in :meth:`PID.__init__`.
         """
+        # 执行该方法的核心功能。
         return self._min_output, self._max_output
 
     @output_limits.setter
     def output_limits(self, limits):
         """Set the output limits."""
+        # 执行该方法的核心功能。
         if limits is None:
             self._min_output, self._max_output = None, None
             return
@@ -269,6 +280,7 @@ class PID(object):
         This sets each term to 0 as well as clearing the integral, the last output and the last
         input (derivative calculation).
         """
+        # 复位相关状态。
         self._proportional = 0
         self._integral = 0
         self._derivative = 0
@@ -298,28 +310,34 @@ def get_yaml(path):
 class PidWrap:
 
     def __init__(self, kp, ki, kd, setpoint=0, output_limits=1):
+        # 初始化对象状态。
         self.pid_t = PID(kp, ki, kd, setpoint, output_limits=(0-output_limits, output_limits))
         
     def set_target(self, target):
+        # 设置相关参数。
         self.pid_t.setpoint = target
 
     def set(self, kp, ki, kd):
+        # 设置相关参数。
         self.pid_t.kp = kp
         self.pid_t.ki = ki
         self.pid_t.kd = kd
 
     def get(self, val_in):
+        # 获取相关数据。
         return self.pid_t(val_in)
 
 
 # 次数记录进行简单滤波，到达一定次数为真
 class CountRecord:
     def __init__(self, stop_count=2) -> None:
+        # 初始化对象状态。
         self.last_record = None
         self.count = 0
         self.stop_cout = stop_count
 
     def get_count(self, val):
+        # 获取相关数据。
         try:
             if val == self.last_record:
                 self.count += 1
@@ -331,6 +349,7 @@ class CountRecord:
             print(e)
     
     def __call__(self, val):
+        # 执行该方法的核心功能。
         self.get_count(val)
         # print("count:{}, val:{}".format(self.count, val))
         # 检测val的类型
@@ -344,6 +363,7 @@ class CountRecord:
 
 class IndexWrap:
     def __init__(self, num, circle=False) -> None:
+        # 初始化对象状态。
         self.index = 0
         self.max = num-1
         self.min = 0
@@ -351,6 +371,7 @@ class IndexWrap:
         self.circle = circle
     
     def next(self):
+        # 执行该方法的核心功能。
         self.index += 1
         if self.index > self.max:
             if self.circle:
@@ -360,6 +381,7 @@ class IndexWrap:
         return self.index
 
     def before(self):
+        # 执行该方法的核心功能。
         self.index -= 1
         if self.index < self.min:
             if self.circle:
@@ -369,15 +391,19 @@ class IndexWrap:
         return self.index
 
     def get_index(self):
+        # 获取相关数据。
         return self.index
     
     def __call__(self):
+        # 执行该方法的核心功能。
         return self.index
 
     def __str__(self) -> str:
+        # 执行该方法的核心功能。
         return 'min:{}, max:{}, index:{}'.format(self.min, self.max, self.index)
     
     def __repr__(self) -> str:
+        # 执行该方法的核心功能。
         return 'min:{}, max:{}, index:{}'.format(self.min, self.max, self.index)
     
 def count_test():

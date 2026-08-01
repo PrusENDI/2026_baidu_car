@@ -21,10 +21,11 @@ sys.path.append(deploy_path)
 
 
 from .deploy.python.infer import Detector
-from .deploy.pptracking.python.mot_sde_infer import SDE_Detector
-from .deploy.pipeline.pphuman.attr_infer import AttrDetector
-from .deploy.pipeline.ppvehicle.vehicle_plate import PlateRecognizer, PlateDetector, TextRecognizer
 from .deploy.python.utils import nms
+# Orin 2026-07-17 将以下重型依赖改为对应类内延迟导入，避免普通播种初始化加载 MOT/sklearn。
+# 修改前代码：from .deploy.pptracking.python.mot_sde_infer import SDE_Detector
+# 修改前代码：from .deploy.pipeline.pphuman.attr_infer import AttrDetector
+# 修改前代码：from .deploy.pipeline.ppvehicle.vehicle_plate import PlateRecognizer, PlateDetector, TextRecognizer
 # from ...ernie_bot import HumAttrPrompt
 
 
@@ -138,6 +139,9 @@ class InferInterface:
     
 class MotHuman(InferInterface):
     def __init__(self, model_dir='mot_ppyoloe_s_36e_pipeline', run_mode='paddle') -> None:
+        # 延迟导入：仅创建 MOT 推理实例时加载跟踪依赖。
+        from .deploy.pptracking.python.mot_sde_infer import SDE_Detector
+
         # 加载模型文件夹
         super().__init__(model_dir)
         config_path = os.path.join(get_current_dir(), 'deploy/pipeline/config/tracker_config.yml')
@@ -298,6 +302,9 @@ def parse_mot_res(input):
 
 class HummanAtrr(InferInterface):
     def __init__(self, model_dir="PPLCNet_x1_0_person_attribute_945_infer", run_mode='paddle') -> None:
+        # 延迟导入：普通 lane/task/OCR 初始化不加载人体属性依赖。
+        from .deploy.pipeline.pphuman.attr_infer import AttrDetector
+
         super().__init__(model_dir)
         self.predictor = AttrDetector(
                     model_dir=self.model_dir,
@@ -435,6 +442,9 @@ def get_rotate_crop_image(img, points):
 
 class OCRReco(InferInterface):
     def __init__(self, det_model_dir="ch_PP-OCRv3_det_infer", rec_model_dir="ch_PP-OCRv3_rec_infer", run_mode='paddle') -> None:
+        # 延迟导入：仅创建 OCR 实例时加载车牌检测与文字识别实现。
+        from .deploy.pipeline.ppvehicle.vehicle_plate import PlateDetector, TextRecognizer
+
         parser = argparse.ArgumentParser()
         parser.add_argument('--device', default="GPU", help='foo help')
         parser.add_argument('--run_mode', default=run_mode, help='foo help')

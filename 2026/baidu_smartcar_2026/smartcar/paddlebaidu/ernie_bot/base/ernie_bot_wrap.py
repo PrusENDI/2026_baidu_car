@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 import re
-import erniebot, json
-from jsonschema import validate
+import json
+import math
 import os
 import yaml
-import base64
 from openai import OpenAI
 
 class PromptJson:
@@ -252,19 +251,39 @@ class ErnieBotWrap():
 		config_path = os.path.join(module_dir, '..', '..', '..', '..', 'config_car.yml')
 		with open(config_path, 'r', encoding='utf-8') as f:
 			config = yaml.safe_load(f)
-			access_token = config['ernie_access_token']
 
-		self.client = OpenAI(
-			api_key=access_token,
-			base_url="https://aistudio.baidu.com/llm/lmapi/v3",
-		)
-		self.image_model = "ernie-4.5-turbo-vl"
+		qianfan_cfg = config.get('qianfan', {})
+		api_key_path = '/home/jetson/qianfan.env'
+		try:
+			with open(api_key_path, 'r', encoding='utf-8') as f:
+				api_key_line = f.read().strip()
+		except OSError as exc:
+			raise RuntimeError(f'无法读取千帆 API Key 文件: {api_key_path}') from exc
+		api_key_prefix = 'QIANFAN_API_KEY='
+		if not api_key_line.startswith(api_key_prefix):
+			raise RuntimeError(
+				f'千帆 API Key 文件格式错误: {api_key_path}'
+			)
+		api_key = api_key_line[len(api_key_prefix):].strip()
+		base_url = str(qianfan_cfg.get('base_url', '')).strip()
+		model = str(qianfan_cfg.get('multimodal_model', '')).strip()
+		request_timeout = float(qianfan_cfg.get('request_timeout', 10.0))
 
-		erniebot.api_type = 'aistudio'
-		erniebot.access_token = access_token
+		if not api_key:
+			raise RuntimeError(f'千帆 API Key 文件内容为空: {api_key_path}')
+		if not base_url.startswith('https://'):
+			raise ValueError('千帆 base_url 必须是 HTTPS 地址')
+		if not model:
+			raise ValueError('千帆 multimodal_model 不能为空')
+		if not math.isfinite(request_timeout) or request_timeout <= 0:
+			raise ValueError('千帆 request_timeout 必须是有限正数')
+
+		self.client = OpenAI(api_key=api_key, base_url=base_url)
+		self.image_model = model
+		self.request_timeout = request_timeout
 
 		self.msgs = []
-		self.model = 'ernie-4.0'
+		self.model = model
 		self.prompt_str = '请根据下面的描述生成给定格式json'
 
 	@staticmethod
@@ -289,74 +308,47 @@ class ErnieBotWrap():
 		self.prompt_str = prompt_str
 		# print(self.prompt_str)
 	
-	def get_image_res(self, image):
-		"""获取图片识别结果"""
-		
-		# base64_image  = base64.b64encode(image).decode("utf-8")
-		base64_image  = image
+	@staticmethod
+	def parse_json_object(content):
+		"""解析纯 JSON 或单个 Markdown JSON 代码块。"""
+		if not isinstance(content, str) or not content.strip():
+			raise ValueError('千帆响应为空')
+		text = content.strip()
+		fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+		if fenced:
+			text = fenced.group(1).strip()
+		data = json.loads(text)
+		if not isinstance(data, dict):
+			raise ValueError('千帆响应必须是单个 JSON 对象')
+		return data
 
-		system_prompt = '''你是一个动物识别专家，需要根据输入的图片识别动物种类，并判断该动物是对农田有害动物还是有益动物。
-						严格按照下面的scheame描述生成给定格式json，只返回json数据:
-						输出要求（严格遵守）：
-						- 必须返回一个 JSON 对象，不要包含任何 Markdown 标记（如 ```json）或其他解释文字。
-						- JSON 必须包含以下两个字段：
-						1. "analysis": (字符串类型) 描述你的分析过程，包括你识别出了什么动物，以及判断它有益/有害的理由。
-						2. "result": (整数类型) 如果是有害动物，返回数字 0；如果是有益动物，返回数字 1。
-
-						JSON 格式示例：
-						{
-							"result": 1,
-							"analysis": "图片中识别到的动物是一只蜜蜂，蜜蜂可以帮助植物传粉，对农作物和生态系统有益。"
-						}
-					''' 
-		self.set_promt(system_prompt)
-		messages=[
-            {
-                'role': 'user', 'content': [
-                    {
-                        "type": "text",
-                        "text": system_prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{base64_image}"
-                        }
-                    }
-                ]   
-            }
-        ]
-		my_json_schema = {
-			"type": "json_schema",  # 固定值
-			"json_schema": {
-				"name": "animal_schema", # 给你的 Schema 起个名字
-				# "strict": True,            # 【重要】设为 True，强制模型严格遵守
-				"schema": {
-					# 这里写标准的 JSON Schema 定义
-					"type": "object",
-					"properties": { 							
-						"analysis":{'type':"string", "description":"动物识别的分析过程，包括动物识别和有害/有益判断的理由"},
-						"result": {'type':'integer', "description": "判断结果，有害动物返回0，有益动物返回1"}
-					},
-					"required": [ "analysis", "result" ],
-					            # 可以加上这个，防止额外字段（百度可能支持）
-            		"additionalProperties": False 
-				}
-			}
-		}
-
+	def get_multimodal_json(self, base64_image, prompt, request_timeout=None):
+		"""调用千帆多模态模型并返回单个 JSON 对象。"""
+		if not isinstance(base64_image, str) or not base64_image:
+			raise ValueError('多模态图片 Base64 不能为空')
+		if not isinstance(prompt, str) or not prompt.strip():
+			raise ValueError('多模态提示词不能为空')
+		timeout = self.request_timeout if request_timeout is None else request_timeout
 		response = self.client.chat.completions.create(
-			# model="ernie-4.5-8k-preview",
 			model=self.image_model,
-			messages=messages,
+			messages=[
+				{
+					'role': 'user',
+					'content': [
+						{'type': 'text', 'text': prompt},
+						{
+							'type': 'image_url',
+							'image_url': {
+								'url': f'data:image/jpeg;base64,{base64_image}'
+							},
+						},
+					],
+				}
+			],
 			top_p=0.1,
-			)
-		content = response.choices[0].message.content
-		data = json.loads(content)
-		analysis = data["analysis"]
-		result = data["result"]
-
-		return result,analysis
+			timeout=timeout,
+		)
+		return self.parse_json_object(response.choices[0].message.content)
 
 	def get_res(self, str_input, record=False, request_timeout=5):
 		if len(str_input)<1:
@@ -370,21 +362,20 @@ class ErnieBotWrap():
 			msgs = self.msgs
 		else:
 			msgs = [msg_tmp]
-		# Create a chat completion
 		try:
-			# print(msgs)
-			# print("-----------------")
-			# print(self.prompt_str)
-			response = erniebot.ChatCompletion.create(model=self.model, messages=msgs, system=self.prompt_str, top_p=0.1,
-											_config_=dict(api_type="AISTUDIO",), request_timeout=request_timeout)
-			# print(response)
-		except Exception as e:
-			# print(e)
+			request_messages = []
+			if self.prompt_str:
+				request_messages.append({'role': 'system', 'content': self.prompt_str})
+			request_messages.extend(msgs)
+			response = self.client.chat.completions.create(
+				model=self.model,
+				messages=request_messages,
+				top_p=0.1,
+				timeout=request_timeout,
+			)
+		except Exception:
 			return False, None
-		# _config_=dict(api_type="QIANFAN",)
-		# _config_=dict(api_type="AISTUDIO",)
-		# print(response)
-		str_res = response.get_result()
+		str_res = response.choices[0].message.content
 		if record:
 			self.msgs.append(self.get_mes(1, str_res))
 		return True, str_res
@@ -396,48 +387,9 @@ class ErnieBotWrap():
 	@staticmethod
 	def get_json_str(json_str:str):
 		try:
-			index_s = json_str.find("```json")
-			if index_s == -1:
-				index_s = json_str.find("```") 
-				if index_s == -1:
-					return None
-				else:
-					index_s += 3
-					
-			else:
-				index_s += 7
-			# print(json_str[index_s:])
-			index_e = json_str[index_s:].find("```") + index_s
-			if index_e == -1:
-				return None
-			# json_str = json_str[index_s:index_e]
-			# print(json_str[index_s:index_e])
-			# print(index_s, index_e)
-			json_str = json_str[index_s:index_e]
-			# 找到注释内容并删除
-			json_str.replace("\n", "")
-			# print(json_str)
-			msg_json = json.loads(json_str)
-			return msg_json
-			# print(index_s)
-			# return json_str
-		except Exception as e:
-			# print(e)
-			return json_str
-			'''
-			try:
-				index_s = json_str.find("```json") + 7
-				# index_s = json_str.find("```json") + 7
-			except Exception as e:
-				index_s = 0
-			try:
-				index_e = json_str[index_s:].find("```") + index_s
-			except Exception as e:
-				index_e = len(json_str)
-			import json
-			msg_json = json.loads(json_str[index_s:index_e])
-			return msg_json
-			'''
+			return ErnieBotWrap.parse_json_object(json_str)
+		except (TypeError, ValueError, json.JSONDecodeError):
+			return None
 	
 	def get_res_json(self, str_input, record=False, request_timeout=10):
 		state, str_res = self.get_res(str_input, record, request_timeout)

@@ -42,6 +42,7 @@ def limit_val(val, min_val, max_val):
 class MotorConvert:
     def __init__(self, perimeter=None) -> None:
         # 编码器一圈12栅格编码值48 , 减速比(28/11)^4=41.98183184208729，输出一圈2015.12792842019
+        # 初始化对象状态。
         self.encoder_resolution = 2015.12792842019
         # 编码速度转换值
         self.speed_rate = 100
@@ -50,14 +51,17 @@ class MotorConvert:
         self.dis_resolution = perimeter / self.encoder_resolution
     
     def set_perimeter(self, perimeter):
+        # 设置相关参数。
         self.dis_resolution = perimeter / self.encoder_resolution
         # print(self.dis_resolution)
     
     def set_diameter(self, diameter):
+        # 设置相关参数。
         self.dis_resolution = diameter * math.pi / self.encoder_resolution
     
     def sp2virtual(self, speed:np.any):
         # 速度转为encoder输出
+        # 执行该方法的核心功能。
         speed_encoder = speed / self.dis_resolution
         
         # encoder转为控制器设置值
@@ -68,76 +72,96 @@ class MotorConvert:
         return speed_out
     
     def dis2true(self, encoder_dis):
+        # 执行该方法的核心功能。
         dis_out = encoder_dis * self.dis_resolution
         return dis_out
     
     def sp2true(self, speed):
         # 控制器速度转为encoder输出
+        # 执行该方法的核心功能。
         speed_encoder = int(speed * self.speed_rate)
         speed_out = speed_encoder * self.dis_resolution
         return speed_out
     
     def encoder2dis(self, encoder_dis):
+        # 执行该方法的核心功能。
         dis_out = encoder_dis * self.dis_resolution
         return dis_out
     
     def dis2encoder(self, dis):
+        # 执行该方法的核心功能。
         encoder_out = dis / self.dis_resolution
         return encoder_out
     
 class NoneDev:
     def __init__(self) -> None:
+        # 初始化对象状态。
         pass
     
     def not_support(self):
+        # 执行该方法的核心功能。
         logger.info("dev not support")
         while True:
             time.sleep(1)
     
     def read(self, *args, **kwargs):
+        # 读取数据。
         self.not_support()
 
     def get_stick(self, *args, **kwargs):
+        # 获取相关数据。
         self.not_support()
 
     def set_light(self, *args, **kwargs):
+        # 设置相关参数。
         self.not_support()
 
     def set_angle(self, *args, **kwargs):
+        # 设置相关参数。
         self.not_support()
     
     def show(self, *args, **kwargs):
+        # 显示相关画面。
         self.not_support()
 
     def reset(self, *args, **kwargs):
+        # 复位相关状态。
         self.not_support()
 
     def set_speed(self, *args, **kwargs):
+        # 设置相关参数。
         self.not_support()
 
     def rings(self, *args, **kwargs):
+        # 执行该方法的核心功能。
         self.not_support()
 
     def set_number(self, *args, **kwargs):
+        # 设置相关参数。
         self.not_support()
 
     def set_speed(self, *args, **kwargs):
+        # 设置相关参数。
         self.not_support()
     
     def get_encoders(self, *args, **kwargs):
+        # 获取相关数据。
         self.not_support()
     
     def reset_encoders(self, *args, **kwargs):
+        # 复位相关状态。
         self.not_support()
     
 class DevWrapInterface:
     def __init__(self, dev_id=None, port_id=None) -> None:
+        # 初始化对象状态。
         self.dev_id = dev_id
         self.port_id = port_id
         self.dev = None
         self.init_dev()
     
     def init_dev(self):
+        # 初始化相关资源。
         if self.dev_id == 1:
             self.dev = Motor_1(driver_id=self.dev_id, port=self.port_id)
         elif self.dev_id == 2:
@@ -145,87 +169,105 @@ class DevWrapInterface:
     
 class Beep():
     def __init__(self) -> None:
+        # 初始化对象状态。
         self.beep1 = Buzzer_1()
         self.beep2 = Buzzer_2()
 
     def rings(self, freq=200, duration=0.2):
+        # 执行该方法的核心功能。
         funcs = [self.beep1.rings, self.beep2.rings]
         funcs[ctl_id](freq, duration)
         # time.sleep(duration+0.3)
     
 class Motors():
     def __init__(self, port_id=None, id=1, reverse=1) -> None:
+        # 初始化对象状态。
         self.motor_1 = Motor_1(driver_id=id, port=port_id)
         self.motor_2 = Motor_2(port_id=port_id)
         self.encoder_2 = EncoderMotor_2(port_id=port_id)
         self.reverse = reverse
     
     def set_dir(self, reverse):
+        # 设置相关参数。
         self.reverse = reverse
     
     def set_speed(self, speed):
+        # 设置相关参数。
         speed = speed * self.reverse
         fucs = [self.motor_1.rotate, self.motor_2.set_speed]
         fucs[ctl_id](speed)
     
     def set_angular(self, angular):
         # angular = self.motor_convert.linear2angluar(angular)
+        # 设置相关参数。
         pass
     
     def get_encoder(self):
+        # 获取相关数据。
         fucs = [self.motor_1.get_encoder, self.encoder_2.get]
         encoder = fucs[ctl_id]() * self.reverse
         return encoder
     
     def reset_encoder(self):
+        # 复位相关状态。
         fucs = [self.motor_1.reset_encoder, self.encoder_2.reset]
         return fucs[ctl_id]()
     
     def reset(self):
+        # 复位相关状态。
         fucs = [self.motor_1.reset, self.encoder_2.reset]
         return fucs[ctl_id]()
     
 class AnalogInput():
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         self.sensor_1 = AnalogInput_1(port_id)
         self.sensor_2 = AnalogInput_2(port_id)
     
     def read(self):
+        # 读取数据。
         funcs = [self.sensor_1.read, self.sensor_2.no_act]
         return float(funcs[ctl_id]())
 
 class AnalogInput2():
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         self.sensor_1 = NoneDev()
         self.sensor_2 = Sensor_Analog2_2(port_id)
     
     def read(self):
+        # 读取数据。
         funcs = [self.sensor_1.read, self.sensor_2.no_act]
         return float(funcs[ctl_id]())
 
 # 红外传感器
 class Infrared():
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         self.infrared_1 = Infrared_1(port_id)
         self.infrared_2 = Infrared_2(port_id)
     
     def read(self):
+        # 读取数据。
         funcs = [self.infrared_1.read, self.infrared_2.no_act]
         # 模拟量的结果转为浮点数单位 m
         return funcs[ctl_id]() / 1000
 
 class NixieTube():
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         self.nixie_tube_1 = NixieTube_1(port_id)
         self.nixie_tube_2 = NixieTube_2(port_id)
     
     def set_number(self, number):
+        # 设置相关参数。
         funcs = [self.nixie_tube_1.set_number, self.nixie_tube_2.set_number]
         return funcs[ctl_id](number)
     
 class BluetoothPad():
     def __init__(self) -> None:
         # 调用父对象初始化
+        # 初始化对象状态。
         self.blue_pad_1 = NoneDev()
         self.blue_pad_2 = BluetoothPad_2()
 
@@ -252,41 +294,50 @@ class BluetoothPad():
         │  ╰───────────╯          ╰───────────╯  │ 
         ╰────────────────────────────────────────╯ 
         ```'''
+        # 读取数据。
         funcs = [self.blue_pad_1.get_stick, self.blue_pad_2.get_stick]
         return funcs[ctl_id]()
     
 class BoardKey():
     def __init__(self) -> None:
+        # 初始化对象状态。
         self.board_key_1 = NoneDev()
         self.board_key_2 = BoardKey_2()
     
     def read(self):
+        # 读取数据。
         funcs = [self.board_key_1.read(), self.board_key_2.no_act]
         return funcs[ctl_id]()
 
 class LedLight():
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         self.led = [LedLight_1(port_id), LedLight_2(port_id)]
     
     def set_light(self, led_id, r, g, b):
+        # 设置相关参数。
         return self.led[ctl_id].set_light(led_id, r, g, b)
 
 class Key4Btn():
     def __init__(self, port_id=None) -> None:
+        # 初始化对象状态。
         self.key4btn_1 = ButtonAll_1(port_id)
         self.key4btn_2 = Key4Btn_2(port_id)
         # self.key4btn = [ButtonAll_1(port_id), Key4Btn_2(port_id)]
 
     def read(self):
+        # 读取数据。
         funcs = [self.key4btn_1.get_btn, self.key4btn_2.get_btn]
         return funcs[ctl_id]()
     
     def get_key(self):
+        # 获取相关数据。
         funcs = [self.key4btn_1.clicked, self.key4btn_2.get_btn]
         return funcs[ctl_id]()
 
 class Motor4():
     def __init__(self) -> None:
+        # 初始化对象状态。
         self.motor4_1 = Motor4_1()
         self.motor4_2 = Motor4_2()
         # self.encoders_1 = encoder4_sim_ctl1
@@ -294,27 +345,33 @@ class Motor4():
         self.encoders_2.reset()
     
     def set_speed(self, speeds):
+        # 设置相关参数。
         funcs = [self.motor4_1.set_speed, self.motor4_2.set_speed]
         return funcs[ctl_id](speeds)
 
     def get_encoder(self):
+        # 获取相关数据。
         funcs = [self.motor4_1.get_encoders, self.encoders_2.get]
         return funcs[ctl_id]()
     
     def reset(self):
+        # 复位相关状态。
         funcs = [self.motor4_1.reset, self.encoders_2.reset]
         return funcs[ctl_id]()
 
 class EncoderMotor():
     def __init__(self, port_id) -> None:
+        # 初始化对象状态。
         self.encoder_1 = NoneDev()
         self.encoder_2 = EncoderMotor_2(port_id)
     
     def get_encoder(self):
+        # 获取相关数据。
         funcs = [self.encoder_1.read, self.encoder_2.get]
         return funcs[ctl_id]()
     
     def reset(self):
+        # 复位相关状态。
         funcs = [self.encoder_1.reset, self.encoder_2.reset]
         return funcs[ctl_id]()
     
@@ -322,6 +379,7 @@ class Motor():
     # 编码器一圈12栅格编码值48 , 减速比(28/11)^4=41.98183184208729，输出一圈2015.12792842019
     motor_resolutions = {"motor_280": 48*(28/11)**4, "motor_280_0": 48*46}
     def __init__(self, port_id, reverse=1, type="motor_280") -> None:
+        # 初始化对象状态。
         self.motor_1 = Motor_1(port=port_id)
         self.motor_2 = Motor_2(port_id,reverse=reverse)
         self.encoder_2 = EncoderMotor_2(port_id, reverse=reverse)
@@ -337,6 +395,7 @@ class Motor():
         self.virtual2rad = 1 / self.rad2virtual
 
     def set_sp(self, speed):
+        # 设置相关参数。
         funcs = [self.motor_1.rotate, self.motor_2.set_speed]
         # print(speed)
         speed = limit_val(speed, -100, 100)
@@ -345,16 +404,20 @@ class Motor():
     
     def set_angular(self, angular):
         # print()
+        # 设置相关参数。
         return self.set_sp(self.rad2virtual * angular)
     
     def get_encoder(self):
+        # 获取相关数据。
         funcs = [self.motor_1.encoder, self.encoder_2.get_encoder]
         return funcs[ctl_id]()
     
     def get_rad(self):
+        # 获取相关数据。
         return self.get_encoder()*self.encoder2rad
 
     def reset(self):
+        # 复位相关状态。
         funcs = [self.motor_1.reset, self.motor_2.reset]
         if ctl_id == 1:
             self.encoder_2.reset()
@@ -363,13 +426,16 @@ class Motor():
 class MotorWrap():
     # 0.06 / 15 * 8
     def __init__(self, port_id, reverse=1, perimeter=0.06):
+        # 初始化对象状态。
         self.dis_resolution = perimeter / 2*math.pi
         self.motor = Motor(port_id, reverse)
 
     def set_vel(self, vel):
+        # 设置相关参数。
         self.motor.set_speed(vel)
     
     def get_dis(self):
+        # 获取相关数据。
         return self.motor.get_encoder()*self.dis_resolution
 
 class Motors():
@@ -378,6 +444,7 @@ class Motors():
 
     def __init__(self, port_list=None, reverse=False, type="motor_280") -> None:
         # print(type)
+        # 初始化对象状态。
         encoder_resolution = self.motor_resolutions[type]
         encoder2sp = 100
         # 弧度到编码器的比例
@@ -391,106 +458,129 @@ class Motors():
         self.motors_2 = Motors_2(port_list, reverse)
     
     def set_speed(self, speeds):
+        # 设置相关参数。
         funcs = [self.motors_1.set_speed, self.motors_2.set_speed]
         return funcs[ctl_id](speeds)
     
     def set_angular(self, angular):
         # print(self.encoder_resolution)
+        # 设置相关参数。
         sp_virtual = np.array(angular) * self.rad2virtual
         sp_virtual = np.clip(sp_virtual, -100, 100).astype(np.int8)
         # print(sp_linear)
         return self.set_speed(sp_virtual)
 
     def get_encoder(self):
+        # 获取相关数据。
         funcs = [self.motors_1.get_encoders, self.motors_2.get_encoder]
         return funcs[ctl_id]()
     
     # 获取弧度值
     def get_rad(self):
+        # 获取相关数据。
         encoder_last = np.array(self.get_encoder())
         # print(encoder_last)
         return encoder_last * self.encoder2rad
     
     def reset(self):
+        # 复位相关状态。
         funcs = [self.motors_1.reset, self.motors_2.reset_encoder]
         return funcs[ctl_id]()
 
 class WheelWrap():
     def __init__(self, port_list=None,raduis=0.03, motor_type="motor_280", reverse=False) -> None:
+        # 初始化对象状态。
         self.motors = Motors(port_list, reverse, motor_type)
         self.raduis = raduis
         self.linear2rad = 1 / self.raduis
     
     def set_linear(self, vel_linear):
         # 线速度转角速度
+        # 设置相关参数。
         angular = np.array(vel_linear) * self.linear2rad
         return self.motors.set_angular(angular)
     
     def set_angular(self, angular):
+        # 设置相关参数。
         return self.motors.set_angular(angular)
     
     def get_rad(self):
+        # 获取相关数据。
         return self.motors.get_rad()
 
     def get_linear(self):
+        # 获取相关数据。
         d_linear = self.motors.get_rad() * self.raduis
         return d_linear
     
     def reset(self):
+        # 复位相关状态。
         return self.motors.reset()
     
 class ServoPwm():
     def __init__(self, port_id=None, mode=180) -> None:
+        # 初始化对象状态。
         self.mode = mode
         self.servo_1 = ServoPwm_1(port_id)
         self.servo_2 = ServoPwm_2(port_id)
 
     def set_angle(self, angle, speed=100):
+        # 设置相关参数。
         funcs = [self.servo_1.set_angle, self.servo_2.set_angle]
         angle = int(angle / self.mode * 180 + 90)
         return funcs[ctl_id](angle, speed)
 
 class ServoBus():
     def __init__(self,port_id=None) -> None:
+        # 初始化对象状态。
         self.servo_bus_1 = ServoBus_1(port_id)
         self.servo_bus_2 = ServoBus_2(port_id)
         logger.info(f"总线电机初始化完成，ID:{port_id}")
 
     def set_angle(self, angle, speed=100):
+        # 设置相关参数。
         funcs = [self.servo_bus_1.set_angle, self.servo_bus_2.set_angle]
         return funcs[ctl_id](angle, speed)
 
     def set_speed(self, speed):
+        # 设置相关参数。
         funcs = [self.servo_bus_1.set_speed, self.servo_bus_2.set_speed]
         return funcs[ctl_id](speed)
 
 class PoutD():
     def __init__(self, port):
+        # 初始化对象状态。
         self.pout_1 = PortOut_1(port)
         self.pout_2 = PoutD_2(port)
     def set(self, val):
+        # 设置相关参数。
         func = [self.pout_1.out, self.pout_2.set]
         return func[ctl_id](val)
 
 class ScreenShow():
     def __init__(self) -> None:
+        # 初始化对象状态。
         self.screen_1 = NoneDev()
         self.screen_2 = ScreenShow_2()
         self.screen = [NoneDev(), ScreenShow_2()]
     
     def show(self, args):
+        # 显示相关画面。
         return self.screen[ctl_id].show(args)
     
 class Battry():
     def __init__(self) -> None:
+        # 初始化对象状态。
         self.battry = [NoneDev(), Battry_2()]
     
     def read(self):
+        # 读取数据。
         return self.battry[ctl_id].read()
     
 class PositionPID(object):
     """位置式PID算法实现"""
     def __init__(self, target, cur_val, dt, max, min, p, i, d) -> None:
+        # 初始化对象状态。
         self.dt = dt  # 循环时间间隔
         self._max = max  # 最大输出限制，规避过冲
         self._min = min  # 最小输出限制
@@ -507,6 +597,7 @@ class PositionPID(object):
         """
         计算t时刻PID输出值cur_val
         """
+        # 计算相关结果。
         error = self.target - self.cur_val  # 计算当前误差
         # 比例项
         p_out = self.k_p * error
@@ -531,6 +622,7 @@ class PositionPID(object):
         return self.cur_val
 
     def fit_and_plot(self, count=200):
+        # 执行该方法的核心功能。
         import matplotlib.pyplot as plt
         """
         使用PID拟合setPoint
@@ -558,6 +650,7 @@ class PositionPID(object):
 
 class MotorWrap():
     def __init__(self, id=1, reverse=1, type="motor_280",perimeter=0.06*math.pi) -> None:
+        # 初始化对象状态。
         self.motor = Motor(id, reverse, type)
         self.motor.reset()
         # self.pid = PID(0.18, 0.01, 0.0018, setpoint=0.0, output_limits=[-100, 100])
@@ -567,25 +660,31 @@ class MotorWrap():
     
     def set_linear(self, vel_linear):
         # 线速度转角速度
+        # 设置相关参数。
         angular = vel_linear * self.dis2rad
         # print(angular)
         return self.motor.set_angular(angular)
     
     def set_angular(self, angular):
+        # 设置相关参数。
         return self.motor.set_angular(angular)
     
     def get_rad(self):
+        # 获取相关数据。
         return self.motor.get_rad()
 
     def get_dis(self):
         # print(self.motor.get_rad())
+        # 获取相关数据。
         return self.motor.get_rad() * self.rad2dis
     
     def reset(self):
+        # 复位相关状态。
         return self.motor.reset()
 
 class StepperWrap():
     def __init__(self, id, reverse=1, perimeter=0.008) -> None:
+        # 初始化对象状态。
         self.reverse = reverse
         self.stepper = Stepper_2(id)
         
@@ -600,9 +699,11 @@ class StepperWrap():
         self.dis2rad = 1/self.rad2dis
     
     def get_rad(self):
+        # 获取相关数据。
         return self.stepper.get_step() * self.stepper2rad * self.reverse
 
     def set_rad(self, rad, time=0.5):
+        # 设置相关参数。
         pid = PID(5,0,0)
         pid.setpoint = rad
         if time < 0.1:
@@ -624,15 +725,19 @@ class StepperWrap():
 
     def set_angular(self, angular):
         # print(angular*self.rad2pwm)
+        # 设置相关参数。
         return self.stepper.set(int(angular * self.rad2pwm * self.reverse))
 
     def set_velocity(self, velocity):
+        # 设置相关参数。
         return self.set_angular(velocity* self.dis2rad)
     
     def get_dis(self):
+        # 获取相关数据。
         return self.get_rad() * self.rad2dis
 
     def reset(self):
+        # 复位相关状态。
         return self.stepper.reset()
 
 def stepper_test():

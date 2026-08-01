@@ -28,6 +28,7 @@ class Streamer:
     _instances = {}  # 记录已启动的实例，避免端口冲突
 
     def __init__(self, port=5000, fps=30, quality=80):
+        # 初始化对象状态。
         self.port = port
         self.fps = fps
         self.quality = quality
@@ -54,6 +55,7 @@ class Streamer:
 
     def _setup_routes(self):
         """设置 Flask 路由"""
+        # 设置相关参数。
         @self.app.route('/')
         def index():
             # 现代化界面设计 + 右上角固定按键反馈面板
@@ -351,6 +353,7 @@ class Streamer:
 
     def _generate_frames(self, cam_id):
         """生成器：根据 cam_id 输出对应摄像头的 JPEG 帧"""
+        # 执行该方法的核心功能。
         last_frame_time = 0
         while self.running:
             current_time = time.time()
@@ -380,12 +383,14 @@ class Streamer:
             time.sleep(0.01)
 
     def _run_server(self):
+        # 执行主流程。
         from werkzeug.serving import make_server
         self._server = make_server('0.0.0.0', self.port, self.app, threaded=True)
         self._server.serve_forever()
 
     def start(self):
         """启动流媒体服务"""
+        # 启动相关流程。
         if self.port in Streamer._instances:
             print(f"⚠️  端口 {self.port} 已被占用，先停止旧服务...")
             Streamer._instances[self.port].stop()
@@ -403,11 +408,13 @@ class Streamer:
         self.show_local_info()
         
     def show_local_info(self):
+        # 显示相关画面。
         ip = self._get_local_ip()
         print(f"\n📡 双路流媒体服务已启动-打开链接访问:\n\t http://{ip}:{self.port}/ \n")
 
     def stop(self):
         """停止流媒体服务"""
+        # 停止相关流程。
         if not self.running:
             return
         self.running = False
@@ -429,6 +436,7 @@ class Streamer:
 
     def update_frame(self, image, cam_id="cam1"):
         """更新指定摄像头的视频帧"""
+        # 更新内部状态。
         if image is None:
             return
         with self.frame_lock:
@@ -436,6 +444,7 @@ class Streamer:
 
     def clear_frame(self, cam_id=None):
         """清空指定摄像头或所有帧"""
+        # 清理内部数据。
         with self.frame_lock:
             if cam_id:
                 if cam_id in self.frames:
@@ -445,6 +454,7 @@ class Streamer:
 
     def get_key(self, clear=True):
         """获取最后一次按下的键值"""
+        # 获取相关数据。
         with self.key_lock:
             key = self.last_key
             if clear:
@@ -452,6 +462,7 @@ class Streamer:
             return key
 
     def _get_local_ip(self):
+        # 获取相关数据。
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -462,10 +473,12 @@ class Streamer:
             return "127.0.0.1"
 
     def __enter__(self):
+        # 进入上下文管理。
         self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # 退出上下文管理。
         self.stop()
 
 
@@ -490,10 +503,13 @@ if __name__ == '__main__':
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         class DummyCamera:
             def __init__(self, img):
+                # 初始化对象状态。
                 self.img = img
             def read(self):
+                # 读取数据。
                 return self.img
             def close(self):
+                # 关闭并释放资源。
                 pass
 
         cap1 = DummyCamera(test_img1)
