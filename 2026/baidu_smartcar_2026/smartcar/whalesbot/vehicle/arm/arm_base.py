@@ -51,6 +51,7 @@ AXIS_SPEED_REFRESH_MAX_INTERVAL = 0.55 # 超过该值立即终止，禁止贴近
 COOPERATIVE_RESET_IDLE_SLEEP = 0.005
 ARM_SERVO_COMMAND_RETRIES = 3
 ARM_SERVO_COMMAND_RETRY_DELAY = 0.5
+ARM_RESET_SERVO_SETTLE_DELAY = 1.5 # 复位时 arm ACK 后的机械稳定等待
 
 
 def get_path_relative(*args):
@@ -1465,6 +1466,14 @@ class ArmController:
             f"angle={self.angle} hand_angle={self.hand_angle}",
             flush=True,
         )
+
+        # MC602 的匹配响应只表示本次 arm 指令已被应答，不代表舵机已经
+        # 机械到位。固定等待 1.5 s 后再启动 X/Y，避免翻转过程与两轴复位
+        # 重叠，恢复旧流程中重复发送曾隐含提供的稳定时间。
+        logger.info(
+            f"机械臂复位姿态等待稳定 delay={ARM_RESET_SERVO_SETTLE_DELAY:.1f}s"
+        )
+        time.sleep(ARM_RESET_SERVO_SETTLE_DELAY)
 
         self._reset_xy_cooperative(rehome_x=rehome_x)
         print(

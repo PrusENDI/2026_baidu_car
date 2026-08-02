@@ -114,6 +114,18 @@ class DevCmdInterface:
     def set_port(self, port_id):
         # 设置相关参数。
         self.port_id = port_id
+
+    def _identity_field_count(self, mode=None, port_id=None):
+        """返回本次请求实际包含的响应身份字段数量。"""
+        # dev_id 始终存在；操作码和端口只有在设备或本次调用明确提供时
+        # 才属于身份字段。不能直接固定比较前三字节，因为部分无端口设备
+        # 会把第二字节开始的位置用于业务参数。
+        count = 1
+        if mode is not None or self.mode is not None:
+            count += 1
+        if port_id is not None or self.port_id is not None:
+            count += 1
+        return count
     
     def get_bytes(self, *args, mode=None, port_id=None):
         # 根据参数补充所有参数
@@ -150,22 +162,56 @@ class DevCmdInterface:
         data = data + args_list
         return self.data_struct.pack_data(data)
     
-    def get_result(self, bytes_all, index=0):
+    def get_result(self, bytes_all, index=0, identity_field_count=None):
         # 获取相关数据。
-        data = self.data_struct.unpack_data(bytes_all, index)[self.arg_reg:]
+        # 单设备事务显式传入本次请求的身份字段数量，避免依赖对象上可能被
+        # 其他调用改写的 arg_reg；批量接口暂时保留原有 arg_reg 行为。
+        result_offset = (
+            self.arg_reg
+            if identity_field_count is None
+            else identity_field_count
+        )
+        data = self.data_struct.unpack_data(bytes_all, index)[result_offset:]
         # 如果只有一个结果
         if len(data) == 1:
             data = data[0]
         return data
     
-    def send_get(self, bytes_tmp:bytes):
+    def send_get(self, bytes_tmp:bytes, identity_field_count):
         # 每条命令只允许返回本次通讯的新响应。旧实现会在本次超时时返回
         # last_data，运动控制可能把陈旧的步数/编码器值误判为当前位置。
         self.last_data = None
         ret = self.ser.get_anwser(bytes_tmp, self.time_out)
         if ret is None:
             return None
-        result = self.get_result(ret)
+
+        # MC602 单设备响应按同一数据结构回传。长度不一致时禁止继续解析，
+        # 否则截断帧或其他设备的等长/异长迟到响应可能被当成本次 ACK。
+        if len(ret) != len(bytes_tmp):
+            logger.warning(
+                "MC602 响应长度不匹配 "
+                f"expected_len={len(bytes_tmp)}, actual_len={len(ret)}, "
+                f"expected={bytes_tmp.hex(' ')}, actual={ret.hex(' ')}"
+            )
+            return None
+
+        # 比较本次请求实际存在的 dev_id、操作码和端口字段。只有身份完全
+        # 匹配的响应才允许进入业务数据解析并更新 last_data。
+        expected_identity = bytes_tmp[:identity_field_count]
+        actual_identity = ret[:identity_field_count]
+        if actual_identity != expected_identity:
+            logger.warning(
+                "MC602 响应身份不匹配 "
+                f"expected={expected_identity.hex(' ')}, "
+                f"actual={actual_identity.hex(' ')}, "
+                f"response={ret.hex(' ')}"
+            )
+            return None
+
+        result = self.get_result(
+            ret,
+            identity_field_count=identity_field_count,
+        )
         if result == []:
             return None
         self.last_data = result
@@ -173,35 +219,52 @@ class DevCmdInterface:
     
     def act_mode(self, *args, mode=None, port_id=None):
         # 执行该方法的核心功能。
+        identity_field_count = self._identity_field_count(
+            mode=mode,
+            port_id=port_id,
+        )
         data_bytes = self.get_bytes(*args, mode=mode, port_id=port_id)
-        return self.send_get(data_bytes)
+        return self.send_get(data_bytes, identity_field_count)
     
     def reset(self, *args, port_id=None):
         # 复位相关状态。
+        identity_field_count = self._identity_field_count(
+            mode=3,
+            port_id=port_id,
+        )
         data_bytes = self.get_bytes(*args, mode=3, port_id=port_id)
-        return self.send_get(data_bytes)
+        return self.send_get(data_bytes, identity_field_count)
     
     # 设置操作
     def set(self, *args, port_id=None):
         # print(args)
         # 设置相关参数。
+        identity_field_count = self._identity_field_count(
+            mode=2,
+            port_id=port_id,
+        )
         data_bytes = self.get_bytes(*args, mode=2, port_id=port_id)
         # print(data_bytes.hex(" "))
-        return self.send_get(data_bytes)
+        return self.send_get(data_bytes, identity_field_count)
     
     # 获取操作
     def get(self, *args, port_id=None):
         # 获取相关数据。
+        identity_field_count = self._identity_field_count(
+            mode=1,
+            port_id=port_id,
+        )
         data_bytes = self.get_bytes(*args, mode=1, port_id=port_id)
         # print(data_bytes)
-        return self.send_get(data_bytes)
+        return self.send_get(data_bytes, identity_field_count)
     
     # 没有操作符号时
     def no_act(self, port_id=None):
         # 执行该方法的核心功能。
+        identity_field_count = self._identity_field_count(port_id=port_id)
         data_bytes = self.get_bytes(port_id=port_id)
         # print(data_bytes)
-        return self.send_get(data_bytes)
+        return self.send_get(data_bytes, identity_field_count)
     
     def act_default(self, *args, port_id=None):
         # 执行该方法的核心功能。
