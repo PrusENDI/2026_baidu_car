@@ -447,7 +447,9 @@ class MyCar(MecanumDriver):
         self.servo_1 = ServoPwm(1, 180)
         self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
         self.blue_pad = BluetoothPad()
-        self.shoot = PoutD(4)
+        # MC602 物理 PWM D4 对应内部数字输出 P10。
+        self.shoot = PoutD(10)
+        self.shoot.set(0)
 
     def set_storage(self, state=False):
         """
