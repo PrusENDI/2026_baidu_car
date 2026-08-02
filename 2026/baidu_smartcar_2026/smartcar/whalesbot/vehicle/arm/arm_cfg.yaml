@@ -38,7 +38,7 @@ horiz_cfg:
   # 本地越界检查继续生效；仍请求 0.30 m 的任务会返回失败，调用方应据此停止后续动作。
   - 0.255
   homing:
-    limit_port: 1
+    limit_port: 3
     active: above
     threshold: 2000
     stable_samples: 5

@@ -1755,29 +1755,84 @@ ORDER_DELIVERY_TIMING = {
 }
 
 
+# 订单获取任务中的文字识别、蔬菜搜索和蔬菜抓取姿态集中配置。
+# get_order() 和 find_goods() 只引用这里的参数；现场重新标定时可以按动作阶段
+# 修改对应字段，不需要在识别、重试和两次抓取流程中逐处查找硬编码数值。
+GET_ORDER_POSES = {
+    # 从任务起点进入订单识别区域时使用的车辆巡线距离。
+    "task_entry": {
+        "debug_distance": 0.60,  # debug=True 时进入订单区的短距离，单位为米。
+        "run_distance": 1.50,    # 正式运行时从任务起点进入订单区的距离，单位为米。
+    },
+    # 推开订单机构并识别随机订单文字时使用的机械臂和车辆位置。
+    "random_order_label": {
+        "push_rod_y": 0.025,        # 推动订单推杆时，机械臂 Y 轴保持的绝对高度。
+        "push_car_offset": [0.065, 0, 0],  # 推动推杆前车辆沿 X 方向前移 6.5 cm。
+        "push_x": 0.17,             # 接触推杆前，机械臂 X 轴先伸到的绝对位置。
+        "return_x": 0.05,           # 推杆动作完成后，机械臂 X 轴回收到的绝对位置。
+        "return_timeout": 4.0,       # X 轴从推杆位置回收时允许的最长动作时间，单位为秒。
+        "camera_car_offset": [-0.06, 0, 0],  # 拍摄随机订单文字前车辆后退 6 cm。
+    },
+    # 识别固定订单文字前使用的机械臂完整姿态。
+    "fixed_order_label": {
+        "arm": "RIGHT",  # 固定订单标签位于车辆右侧，识别前机械臂转向 RIGHT。
+        "hand": "MID",   # 固定订单文字识别时使用的 hand 中间姿态。
+        "x": 0.16,        # 固定订单文字进入相机视野时的 X 轴绝对位置。
+        "y": 0.20,        # 固定订单文字识别前机械臂抬升到的 Y 轴绝对高度。
+    },
+    # 完成两张订单文字识别后，进入蔬菜区域并开始视觉搜索时使用的位置。
+    "goods_area": {
+        "approach_distance": 0.20,  # 从订单识别区巡线进入蔬菜拿取区的距离。
+        "search_x": 0.25,           # 每次搜索蔬菜前，机械臂 X 轴伸出的绝对位置。
+        "search_y": 0.20,           # 每次搜索蔬菜前，机械臂 Y 轴保持的绝对高度。
+    },
+    # find_goods() 首次识别失败后依次执行的蔬菜视觉搜索位置。
+    "goods_search": {
+        "delta_y": -0.50,             # 蔬菜目标视觉对齐时使用的纵向图像偏移。
+        "retry_x": 0.15,              # 第一次失败后回收到该 X 位置并再次识别。
+        "retry_car_offset": [0.15, 0, 0],  # 第二次失败后车辆前移 15 cm 再次识别。
+        "final_retry_x": 0.25,         # 第三次失败后伸到该 X 位置进行最后一次识别。
+    },
+    # 视觉找到蔬菜后，开启吸附并将蔬菜移出拿取区时使用的位置。
+    "goods_pickup": {
+        "left_offset": 0.02,  # 对齐蔬菜后，X 轴从实时位置向左回缩的抓取补偿距离。
+        "lower_y": 0.05,      # 吸附蔬菜后先下降到的 Y 轴绝对高度。
+        "lift_y": 0.20,       # 离开拿取位置并准备放入车载置物架时的 Y 轴高度。
+        "second_flip_x": 0.24,  # 第二件蔬菜转向 LEFT 置物架前的 X 轴安全位置。
+    },
+}
+
+
 # 寻找货物的程序
-def find_goods(label, dy=-0.5):
+def find_goods(label, dy=GET_ORDER_POSES["goods_search"]["delta_y"]):
+    goods_search_pose = GET_ORDER_POSES["goods_search"]
     cls_id, det_label = my_car.move_to_detection_target(label=label, delta_y=dy)
     if det_label is not None:
         return det_label
 
-    my_car.arm.move_x_position(0.20)
+    my_car.arm.move_x_position(goods_search_pose["retry_x"])
     cls_id, det_label = my_car.move_to_detection_target(label=label, delta_y=dy)
     if det_label is not None:
         return det_label
 
-    my_car.move_for([0.15, 0, 0])
+    my_car.move_for(goods_search_pose["retry_car_offset"])
     cls_id, det_label = my_car.move_to_detection_target(label=label, delta_y=dy)
     if det_label is not None:
         return det_label
 
-    my_car.arm.move_x_position(0.25)  # 原距离为 0.30 m；适配当前 0.255 m 全局水平上限。
+    my_car.arm.move_x_position(goods_search_pose["final_retry_x"])
     cls_id, det_label = my_car.move_to_detection_target(label=label, delta_y=dy)
     if det_label is not None:
         return det_label
 
 
 def get_order(debug=True):
+    task_entry_pose = GET_ORDER_POSES["task_entry"]
+    random_order_label_pose = GET_ORDER_POSES["random_order_label"]
+    fixed_order_label_pose = GET_ORDER_POSES["fixed_order_label"]
+    goods_area_pose = GET_ORDER_POSES["goods_area"]
+    goods_pickup_pose = GET_ORDER_POSES["goods_pickup"]
+
     # 标签对应关系
     goods_dict = {
         "青椒": "h_qing_jiao",
@@ -1792,26 +1847,29 @@ def get_order(debug=True):
     }
 
     order_list = []  # 千帆多模态模型直接返回的结构化订单
-    # 推动订单推杆时的竖直绝对高度，现场可按机构位置调整。
-    push_rod_y = 0.025
-    # 每次货物视觉对齐完成后、抓取前，机械臂向左回缩的可调距离。
-    goods_pickup_left_offset = 0.02
 
     # 本次启动已经建立 X 机械零点；这里只重置 Y，并让 X 返回 1.5 cm。
     my_car.arm.reset_position(rehome_x=False)
-    task_distance = 0.60 if debug else 1.5
+    task_distance = (
+        task_entry_pose["debug_distance"]
+        if debug
+        else task_entry_pose["run_distance"]
+    )
     my_car.lane_dis_offset(speed=0.3, dis_hold=task_distance)
     # 对齐订单
     cls_id, label = my_car.move_to_detection_target(delta_y=None)
-    # 抬到可调推杆高度并保持，直到后续固定标签阶段主动升到 0.20 m。
-    my_car.arm.move_y_position(push_rod_y)
+    # 抬到配置的推杆高度并保持，直到后续固定标签阶段切换到识别高度。
+    my_car.arm.move_y_position(random_order_label_pose["push_rod_y"])
     # 推动推杆
-    my_car.move_for([0.065, 0, 0])
-    my_car.arm.move_x_position(0.17)
-    my_car.arm.move_x_position(0.1, out_time=4.0)
+    my_car.move_for(random_order_label_pose["push_car_offset"])
+    my_car.arm.move_x_position(random_order_label_pose["push_x"])
+    my_car.arm.move_x_position(
+        random_order_label_pose["return_x"],
+        out_time=random_order_label_pose["return_timeout"],
+    )
     time.sleep(0.5)
     # 识别随机标签
-    my_car.move_for([-0.06, 0, 0])
+    my_car.move_for(random_order_label_pose["camera_car_offset"])
     cls_id, label = my_car.move_to_detection_target(delta_y=None)
     time.sleep(0.5)
     order_list.append(
@@ -1819,10 +1877,10 @@ def get_order(debug=True):
     )
     my_car.beep()
     # 识别固定标签
-    my_car.arm.move_y_position(0.2)
-    my_car.arm.move_x_position(0.21)
-    my_car.arm.set_hand_angle("MID")
-    my_car.arm.set_arm_angle("RIGHT")
+    my_car.arm.move_y_position(fixed_order_label_pose["y"])
+    my_car.arm.move_x_position(fixed_order_label_pose["x"])
+    my_car.arm.set_hand_angle(fixed_order_label_pose["hand"])
+    my_car.arm.set_arm_angle(fixed_order_label_pose["arm"])
     time.sleep(0.5)
     cls_id, label = my_car.move_to_detection_target()
     time.sleep(1)
@@ -1837,14 +1895,17 @@ def get_order(debug=True):
     order_list.sort(key=lambda x: x["address"])
     print(order_list)
 
-    my_car.lane_dis_offset(speed=0.3, dis_hold=0.2)
+    my_car.lane_dis_offset(
+        speed=0.3,
+        dis_hold=goods_area_pose["approach_distance"],
+    )
     my_car.arm.set_hand_angle(angle="DOWN")
 
     loc = my_car.get_odometry(True)
 
     my_car.set_storage(True)  # 抬起存储架
-    my_car.arm.move_y_position(0.2)
-    my_car.arm.move_x_position(0.25)  # 原距离为 0.30 m；适配当前 0.255 m 全局水平上限。
+    my_car.arm.move_y_position(goods_area_pose["search_y"])
+    my_car.arm.move_x_position(goods_area_pose["search_x"])
     cls_id, label = my_car.move_to_detection_target(delta_y=None)
     first_order_index = 1
     first_storage_slot = ORDER_STORAGE_SLOTS[first_order_index]
@@ -1856,26 +1917,27 @@ def get_order(debug=True):
         )
     print(f"正在拿取第一个货物：{goods_now}")
     time.sleep(0.5)
-    # 第一件抓取：arm=RIGHT，Y=0.20 m；视觉识别成功后，X 从当前实际位置
-    # 向左回缩 goods_pickup_left_offset（默认 0.01 m），再开启吸附。
+    # 第一件抓取时机械臂保持 RIGHT；视觉识别成功后，X 从当前实际位置
+    # 向左回缩 goods_pickup.left_offset，再开启吸附。
     pickup_x_before_offset = my_car.arm.x_get_position()
-    pickup_x_target = pickup_x_before_offset - goods_pickup_left_offset
+    pickup_x_target = pickup_x_before_offset - goods_pickup_pose["left_offset"]
     if not my_car.arm.move_x_position(pickup_x_target):
         raise RuntimeError(
             "订单第一件货物抓取前向左微调失败: "
             f"before={pickup_x_before_offset:.6f}, "
-            f"offset={goods_pickup_left_offset:.3f}, "
+            f"offset={goods_pickup_pose['left_offset']:.3f}, "
             f"target={pickup_x_target:.6f}"
         )
     my_car.arm.grasp(True)
-    # 第一件抓取后先降到 Y=0.05 m，再抬回 Y=0.20 m 进入右侧仓位放置流程。
-    my_car.arm.move_y_position(0.05)
+    # 第一件抓取后按 goods_pickup.lower_y 和 lift_y 完成下降、抬升，
+    # 再进入右侧车载置物架放置流程。
+    my_car.arm.move_y_position(goods_pickup_pose["lower_y"])
     time.sleep(0.5)
-    my_car.arm.move_y_position(0.2)
+    my_car.arm.move_y_position(goods_pickup_pose["lift_y"])
     if not my_car.arm.move_x_position(first_storage_slot["x"]):
         raise RuntimeError("订单第一件货物右侧放置水平轴未能到达目标位置，禁止下降释放")
-    # 第一件右侧放置：arm=RIGHT，先到 X=0.00 m，再降到 Y=0.09 m，
-    # 将 hand 转到 -10° 后释放；释放完成后恢复抓取初始姿态 DOWN。
+    # 第一件右侧放置的 X/Y 由 ORDER_STORAGE_SLOTS 对应仓位决定；
+    # 到位后将 hand 转到 -10° 并释放，再恢复抓取初始姿态 DOWN。
     my_car.arm.move_y_position(first_storage_slot["place_y"])
     my_car.arm.set_hand_angle(-10)
     time.sleep(0.5)
@@ -1884,8 +1946,8 @@ def get_order(debug=True):
     time.sleep(0.5)
     # 拿第二个货物
     my_car.move_to_position(loc)
-    my_car.arm.move_y_position(0.2)
-    my_car.arm.move_x_position(0.25)  # 原距离为 0.30 m；适配当前 0.255 m 全局水平上限。
+    my_car.arm.move_y_position(goods_area_pose["search_y"])
+    my_car.arm.move_x_position(goods_area_pose["search_x"])
     cls_id, label = my_car.move_to_detection_target(delta_y=None)
     second_order_index = 0
     second_storage_slot = ORDER_STORAGE_SLOTS[second_order_index]
@@ -1897,32 +1959,36 @@ def get_order(debug=True):
         )
     print(f"正在拿取第二个货物：{goods_now}")
     time.sleep(0.5)
-    # 第二件抓取：arm=RIGHT，Y=0.20 m；视觉识别成功后，X 从当前实际位置
-    # 向左回缩 goods_pickup_left_offset（默认 0.01 m），再开启吸附。
+    # 第二件抓取时机械臂保持 RIGHT；视觉识别成功后，X 从当前实际位置
+    # 向左回缩 goods_pickup.left_offset，再开启吸附。
     pickup_x_before_offset = my_car.arm.x_get_position()
-    pickup_x_target = pickup_x_before_offset - goods_pickup_left_offset
+    pickup_x_target = pickup_x_before_offset - goods_pickup_pose["left_offset"]
     if not my_car.arm.move_x_position(pickup_x_target):
         raise RuntimeError(
             "订单第二件货物抓取前向左微调失败: "
             f"before={pickup_x_before_offset:.6f}, "
-            f"offset={goods_pickup_left_offset:.3f}, "
+            f"offset={goods_pickup_pose['left_offset']:.3f}, "
             f"target={pickup_x_target:.6f}"
         )
     my_car.arm.grasp(True)
-    # 第二件抓取后先降到 Y=0.05 m，再抬回 Y=0.20 m，为安全切换到 LEFT 留出高度。
-    my_car.arm.move_y_position(0.05)
+    # 第二件抓取后按 goods_pickup.lower_y 和 lift_y 完成下降、抬升，
+    # 为安全切换到 LEFT 留出高度。
+    my_car.arm.move_y_position(goods_pickup_pose["lower_y"])
     time.sleep(0.5)
-    my_car.arm.move_y_position(0.2)
+    my_car.arm.move_y_position(goods_pickup_pose["lift_y"])
     # 固定标签阶段机械臂保持在 RIGHT；放入左侧置物架前先将
-    # 水平轴伸到 X=0.25 m，再翻转到 LEFT，避免翻转轨迹碰到置物架。
-    if not my_car.arm.move_x_position(0.24):
-        raise RuntimeError("订单第二件货物左侧翻转前水平轴未能到达 0.25 m，禁止旋转到 LEFT")
+    # 水平轴伸到 goods_pickup.second_flip_x，再翻转到 LEFT，避免翻转轨迹碰到置物架。
+    if not my_car.arm.move_x_position(goods_pickup_pose["second_flip_x"]):
+        raise RuntimeError(
+            "订单第二件货物左侧翻转前水平轴未能到达安全位置，"
+            f"target={goods_pickup_pose['second_flip_x']:.3f}，禁止旋转到 LEFT"
+        )
     my_car.arm.set_arm_pose(arm=second_storage_slot["arm"])
     if not my_car.arm.move_x_position(second_storage_slot["x"]):
         raise RuntimeError("订单第二件货物左侧放置水平轴未能到达 0.20 m，禁止下降释放")
-    # 第二件左侧放置：在 RIGHT 侧伸到 X=0.25 m 后切到 LEFT，再回到
-    # X=0.20 m，下降到 Y=0.14 m，将 hand 转到 -18° 后释放；
-    # 释放完成后恢复抓取初始姿态 DOWN。
+    # 第二件左侧放置按 goods_pickup.second_flip_x 完成翻转前避障，
+    # 再使用 ORDER_STORAGE_SLOTS 对应仓位的 X/Y 位置；到位后将 hand
+    # 转到 -18° 并释放，最后恢复抓取初始姿态 DOWN。
     my_car.arm.move_y_position(second_storage_slot["place_y"])
     my_car.arm.set_hand_angle(-18)
     time.sleep(0.5)
