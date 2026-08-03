@@ -12,6 +12,7 @@ import numpy as np
 import yaml
 import os
 import sys
+import tempfile
 from typing import Union
 
 # 添加上本地目录
@@ -92,8 +93,12 @@ class ArmController:
         # 初始化对象状态。
         self.yaml_path = get_path_relative("arm_cfg.yaml")
 
-        with open(self.yaml_path, 'r') as f:
+        with open(self.yaml_path, 'r', encoding='utf-8') as f:
             self.config = yaml.load(f, Loader=yaml.FullLoader)
+        if not isinstance(self.config, dict):
+            raise RuntimeError(
+                f"机械臂配置为空或格式无效: {self.yaml_path}"
+            )
 
         
         '''机械臂的长度'''
@@ -409,7 +414,7 @@ class ArmController:
             motor: 电机配置
             pid: PID参数
             threshold: 位置阈值
-            homing: X 轴微动开关归零配置
+            homing: X 轴归零配置
         """
         # 定义水平移动电机,PID参数
         self.motor_x = MotorWrap(**motor)
@@ -425,6 +430,7 @@ class ArmController:
         self.x_stop_flag = CountRecord(10)
         self.x_pid_flag = CountRecord(5)
 
+        use_limit_switch = homing.get("use_limit_switch", True)
         limit_port = homing.get("limit_port")
         active = homing.get("active")
         stable_samples = homing.get("stable_samples")
@@ -436,6 +442,8 @@ class ArmController:
         except (TypeError, ValueError) as exc:
             raise ValueError("X 轴归零数值配置无效") from exc
 
+        if not isinstance(use_limit_switch, bool):
+            raise ValueError("X 轴归零 use_limit_switch 必须是布尔值")
         if (
             isinstance(limit_port, bool)
             or not isinstance(limit_port, int)
@@ -468,6 +476,7 @@ class ArmController:
         ):
             raise ValueError("X 轴安全回收位置必须位于有效行程内并离开机械零点")
 
+        self.x_use_limit_switch = use_limit_switch
         self.x_limit_port = limit_port
         self.x_limit_active = active
         self.x_limit_threshold = trigger_threshold
@@ -744,7 +753,7 @@ class ArmController:
 
     def reset_x(self, out_time=None, speed_limit=None) -> bool:
         """
-        低速移向机械回收端，仅在微动开关稳定触发后建立水平零点。
+        低速移向机械回收端，根据配置使用微动开关或编码器停滞建立零点。
 
         只有该寻零函数可以修改 x_pose_start。
 
@@ -792,21 +801,22 @@ class ArmController:
             self.x_pid.reset()
             end_time = time.monotonic() + homing_timeout
 
-            # 启动时必须先连续确认开关处于松开低电平；此阶段不发送运动命令。
-            for sample_index in range(self.x_limit_stable_samples):
-                if time.monotonic() > end_time:
-                    logger.error("X 轴归零启动采样超时")
-                    return False
-                raw = self._read_x_limit_fresh()
-                if self._x_limit_is_triggered(raw):
-                    logger.error(
-                        f"X 轴归零启动未稳定松开 port=AI{self.x_limit_port}, "
-                        f"raw={raw:.1f}, sample={sample_index + 1}/"
-                        f"{self.x_limit_stable_samples}"
-                    )
-                    return False
-                if sample_index + 1 < self.x_limit_stable_samples:
-                    time.sleep(0.02)
+            if self.x_use_limit_switch:
+                # 微动开关模式下，运动前必须先确认开关稳定松开。
+                for sample_index in range(self.x_limit_stable_samples):
+                    if time.monotonic() > end_time:
+                        logger.error("X 轴归零启动采样超时")
+                        return False
+                    raw = self._read_x_limit_fresh()
+                    if self._x_limit_is_triggered(raw):
+                        logger.error(
+                            f"X 轴归零启动未稳定松开 port=AI{self.x_limit_port}, "
+                            f"raw={raw:.1f}, sample={sample_index + 1}/"
+                            f"{self.x_limit_stable_samples}"
+                        )
+                        return False
+                    if sample_index + 1 < self.x_limit_stable_samples:
+                        time.sleep(0.02)
 
             self.x_speed(-homing_speed)
             motion_started = time.monotonic()
@@ -831,18 +841,20 @@ class ArmController:
                     )
                     return False
 
-                ai_read_started = time.monotonic()
-                raw = self._read_x_limit_fresh()
-                last_ai_read_ms = (
-                    time.monotonic() - ai_read_started
-                ) * 1000.0
-                if self._x_limit_is_triggered(raw):
-                    confirm_reason = "limit_triggered_while_moving"
-                    confirm_initial_raw = raw
-                    break
+                raw = None
+                if self.x_use_limit_switch:
+                    ai_read_started = time.monotonic()
+                    raw = self._read_x_limit_fresh()
+                    last_ai_read_ms = (
+                        time.monotonic() - ai_read_started
+                    ) * 1000.0
+                    if self._x_limit_is_triggered(raw):
+                        confirm_reason = "limit_triggered_while_moving"
+                        confirm_initial_raw = raw
+                        break
 
-                # MC602 速度命令需要周期刷新；仅在开关仍松开时继续发送负向
-                # 速度，避免下位机看门狗停止输出后被误判为编码器停滞。
+                # MC602 速度命令需要周期刷新。微动开关模式仅在开关松开时
+                # 执行到这里；堵转模式则持续刷新负向速度直到编码器停滞。
                 self.x_speed(-homing_speed)
                 refresh_completed = time.monotonic()
                 last_refresh_gap = refresh_completed - last_speed_refresh
@@ -875,15 +887,11 @@ class ArmController:
                     last_encoder_read_ms = (
                         time.monotonic() - encoder_read_started
                     ) * 1000.0
-                    # 编码器本次无新响应时不能把旧缓存当作“停滞”。
-                    # 进入统一静止确认，不能用一次 AI1 低电平直接判失败。
-                    confirm_reason = (
-                        f"encoder_read_error:{type(exc).__name__}:{exc}:"
-                        f"refresh_gap={last_refresh_gap:.3f}s:"
-                        f"encoder_read={last_encoder_read_ms:.1f}ms"
+                    logger.error(
+                        f"X 轴归零编码器读取失败 type={type(exc).__name__}, "
+                        f"error={exc}, encoder_read={last_encoder_read_ms:.1f}ms"
                     )
-                    confirm_initial_raw = raw
-                    break
+                    return False
                 encoder_read_completed = time.monotonic()
                 last_encoder_read_ms = (
                     encoder_read_completed - encoder_read_started
@@ -900,8 +908,6 @@ class ArmController:
                     encoder_read_completed - last_encoder_motion
                     >= X_HOMING_STALL_TIMEOUT
                 ):
-                    # 停滞判断只发生在非零速度运动阶段。机械触发后编码器
-                    # 停止可能是预期机械触发，必须进入统一静止确认。
                     confirm_reason = (
                         f"encoder_stall:actual={self.x_pose_now:.6f}:"
                         f"stall_time={encoder_read_completed - last_encoder_motion:.3f}s:"
@@ -913,11 +919,20 @@ class ArmController:
                     confirm_initial_raw = raw
                     break
 
-            confirmed, raw, triggered_samples = self._confirm_x_limit_stopped(
-                confirm_reason, confirm_initial_raw, end_time
-            )
-            if not confirmed:
-                return False
+            if self.x_use_limit_switch:
+                confirmed, raw, triggered_samples = self._confirm_x_limit_stopped(
+                    confirm_reason, confirm_initial_raw, end_time
+                )
+                if not confirmed:
+                    return False
+            else:
+                if not confirm_reason.startswith("encoder_stall:"):
+                    logger.error(f"X 轴堵转归零原因无效 reason={confirm_reason}")
+                    return False
+                if not self._stop_x_confirmed(reason="reset_x:encoder_stall"):
+                    return False
+                raw = None
+                triggered_samples = 0
 
             # 机械零点必须使用停止后的新鲜编码器帧，不能复用运动阶段缓存。
             self.x_pose_start += self._read_x_encoder_fresh()
@@ -925,11 +940,17 @@ class ArmController:
             self.x_pose_last = 0
             self.x_distance_change = 0
             self.x_zero_valid = True
-            logger.info(
-                f"X 轴机械归零完成 port=AI{self.x_limit_port}, "
-                f"raw={raw:.1f}, stable_samples={triggered_samples}, "
-                f"max_refresh_gap={max_refresh_gap:.3f}s, x=0"
-            )
+            if self.x_use_limit_switch:
+                logger.info(
+                    f"X 轴微动开关归零完成 port=AI{self.x_limit_port}, "
+                    f"raw={raw:.1f}, stable_samples={triggered_samples}, "
+                    f"max_refresh_gap={max_refresh_gap:.3f}s, x=0"
+                )
+            else:
+                logger.warning(
+                    f"X 轴堵转归零完成 reason={confirm_reason}, "
+                    f"max_refresh_gap={max_refresh_gap:.3f}s, x=0"
+                )
             return True
         except Exception as exc:
             logger.error(
@@ -944,7 +965,7 @@ class ArmController:
             self.x_pid.reset()
 
     def retract_x_safe(self, out_time=6.0) -> bool:
-        """返回 1.5 cm 安全位置，并确认 X 轴微动开关稳定释放。"""
+        """返回 1.5 cm 安全位置；微动开关启用时额外确认其稳定释放。"""
         try:
             self.x_speed(0)
             if not self.x_zero_valid:
@@ -964,6 +985,13 @@ class ArmController:
                     f"X 轴未能到达安全回收位置 target={self.x_safe_position}"
                 )
                 return False
+
+            if not self.x_use_limit_switch:
+                logger.info(
+                    f"X 轴安全回收完成 target={self.x_safe_position}, "
+                    "微动开关检查已禁用"
+                )
+                return True
 
             last_raw = None
             for sample_index in range(self.x_limit_stable_samples):
@@ -1057,8 +1085,27 @@ class ArmController:
             "pose_vert": self.y_pose_now,
             "side": self.side
         }
-        with open(self.yaml_path, 'w') as stream:
-            yaml.dump(self.config, stream, sort_keys=False)
+        # 先完整写入同目录临时文件，再原子替换正式配置。直接用 'w' 覆盖时，
+        # 进程若在 yaml.dump() 完成前退出，会把 arm_cfg.yaml 留成空文件。
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                dir=os.path.dirname(self.yaml_path),
+                prefix=os.path.basename(self.yaml_path) + '.',
+                suffix='.tmp',
+                delete=False,
+            ) as stream:
+                temp_path = stream.name
+                yaml.dump(self.config, stream, sort_keys=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, self.yaml_path)
+            temp_path = None
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.remove(temp_path)
 
     def y_speed(self, velocity):
         """
@@ -1165,18 +1212,20 @@ class ArmController:
                 self.x_pid.reset()
                 x_deadline = time.monotonic() + self.x_homing_timeout
 
-                # 两轴均未启动时完成 X 开关松开确认，之后才进入协作循环。
-                for sample_index in range(self.x_limit_stable_samples):
-                    if time.monotonic() > x_deadline:
-                        raise RuntimeError("X 轴归零启动采样超时")
-                    x_last_raw = self._read_x_limit_fresh()
-                    if self._x_limit_is_triggered(x_last_raw):
-                        raise RuntimeError(
-                            f"X 轴归零启动未稳定松开 raw={x_last_raw:.1f}, "
-                            f"sample={sample_index + 1}/{self.x_limit_stable_samples}"
-                        )
-                    if sample_index + 1 < self.x_limit_stable_samples:
-                        time.sleep(0.02)
+                if self.x_use_limit_switch:
+                    # 微动开关模式下，两轴启动前先确认 X 开关稳定松开。
+                    for sample_index in range(self.x_limit_stable_samples):
+                        if time.monotonic() > x_deadline:
+                            raise RuntimeError("X 轴归零启动采样超时")
+                        x_last_raw = self._read_x_limit_fresh()
+                        if self._x_limit_is_triggered(x_last_raw):
+                            raise RuntimeError(
+                                f"X 轴归零启动未稳定松开 raw={x_last_raw:.1f}, "
+                                f"sample={sample_index + 1}/"
+                                f"{self.x_limit_stable_samples}"
+                            )
+                        if sample_index + 1 < self.x_limit_stable_samples:
+                            time.sleep(0.02)
 
                 if self.x_speed(-self.x_homing_speed) is None:
                     raise RuntimeError("MC602 未确认 X 轴归零速度命令")
@@ -1196,8 +1245,11 @@ class ArmController:
                             f"X 轴联合归零超时 actual={self.x_pose_now:.6f}, "
                             f"max_refresh_gap={x_max_refresh_gap:.3f}s"
                         )
-                    x_last_raw = self._read_x_limit_fresh()
-                    if self._x_limit_is_triggered(x_last_raw):
+                    x_limit_triggered = False
+                    if self.x_use_limit_switch:
+                        x_last_raw = self._read_x_limit_fresh()
+                        x_limit_triggered = self._x_limit_is_triggered(x_last_raw)
+                    if x_limit_triggered:
                         if not self._stop_x_confirmed(
                             reason="cooperative_reset:x_limit"
                         ):
@@ -1243,9 +1295,30 @@ class ArmController:
                                 encoder_now - x_last_encoder_motion
                                 >= X_HOMING_STALL_TIMEOUT
                             ):
-                                raise RuntimeError(
-                                    f"X 轴联合归零编码器停滞 "
-                                    f"actual={self.x_pose_now:.6f}"
+                                if self.x_use_limit_switch:
+                                    raise RuntimeError(
+                                        f"X 轴联合归零编码器停滞 "
+                                        f"actual={self.x_pose_now:.6f}"
+                                    )
+                                if not self._stop_x_confirmed(
+                                    reason="cooperative_reset:x_encoder_stall"
+                                ):
+                                    raise RuntimeError(
+                                        "X 轴堵转后无法确认零速"
+                                    )
+                                self.x_pose_start += self._read_x_encoder_fresh()
+                                self.x_pose_now = 0
+                                self.x_pose_last = 0
+                                self.x_distance_change = 0
+                                self.x_zero_valid = True
+                                # 原有堵转归零在机械端点建立零点后直接结束。
+                                # 归零后回退 1.5 cm 是微动开关方案新增的释放
+                                # 动作，堵转模式不应继续进入该状态。
+                                x_state = "done"
+                                logger.warning(
+                                    f"X 轴联合堵转归零完成 "
+                                    f"stall_time={encoder_now - x_last_encoder_motion:.3f}s, "
+                                    f"max_refresh_gap={x_max_refresh_gap:.3f}s"
                                 )
 
                 elif x_state == "confirm_limit":
@@ -1332,11 +1405,20 @@ class ArmController:
                             reason="cooperative_reset:x_retracted"
                         ):
                             raise RuntimeError("X 轴安全回收到位后无法确认零速")
-                        x_state = "confirm_release"
-                        x_release_samples = 0
-                        release_now = time.monotonic()
-                        x_release_deadline = release_now + 1.0
-                        x_next_release_sample = release_now
+                        if self.x_use_limit_switch:
+                            x_state = "confirm_release"
+                            x_release_samples = 0
+                            release_now = time.monotonic()
+                            x_release_deadline = release_now + 1.0
+                            x_next_release_sample = release_now
+                        else:
+                            x_state = "done"
+                            logger.info(
+                                f"X 轴联合安全回收完成 "
+                                f"target={self.x_safe_position}, "
+                                f"max_refresh_gap={x_max_refresh_gap:.3f}s, "
+                                "微动开关检查已禁用"
+                            )
                     elif x_stall_samples >= 10:
                         raise RuntimeError(
                             f"X 轴联合安全回收停滞 actual={self.x_pose_now:.6f}"
@@ -1443,7 +1525,8 @@ class ArmController:
         重置机械臂位置。
 
         Args:
-            rehome_x: True 时机械归零后回到 1.5 cm；False 时复用当前可信零点，
+            rehome_x: True 时重新建立机械零点；微动开关模式随后回到 1.5 cm，
+                堵转模式在端点建立零点后直接结束。False 时复用当前可信零点，
                 只执行安全回收。
         """
         print(
@@ -1481,7 +1564,8 @@ class ArmController:
             f"y={self.y_get_position():.6f}",
             flush=True,
         )
-        # X/Y 已分别完成安全回收和下限位机械归零；不能再经 setter 重复下发运动。
+        # X 已按当前模式完成机械归零（微动模式额外回退 1.5 cm），Y 已完成
+        # 下限位机械归零；不能再经 setter 重复下发运动。
         self.x_get_position()
         self.save_config()
         print(
@@ -1530,28 +1614,42 @@ class ArmController:
             assert resolved_angle in ("LEFT", "MID", "RIGHT"), "Direction should be LEFT, MID, or RIGHT"
             resolved_angle = self.hand_angle_list[resolved_angle]
 
+        response_received = False
+        last_response = None
         for attempt in range(1, ARM_SERVO_COMMAND_RETRIES + 1):
             result = self.arm_servo.set_angle(resolved_angle, speed)
             if result is not None:
-                # 只有本次命令收到新响应后，才更新软件记录的朝向和角度。
-                if target_side is not None:
-                    self.side = target_side
-                self._arm_angle_last = resolved_angle
+                response_received = True
+                last_response = result
                 logger.info(
                     f"机械臂翻转指令已获新响应 requested={requested_angle}, "
                     f"resolved={resolved_angle}, speed={speed}, "
                     f"attempt={attempt}/{ARM_SERVO_COMMAND_RETRIES}, "
                     f"response={result!r}"
                 )
-                return True
-
-            logger.warning(
-                f"机械臂翻转指令无新响应 requested={requested_angle}, "
-                f"resolved={resolved_angle}, speed={speed}, "
-                f"attempt={attempt}/{ARM_SERVO_COMMAND_RETRIES}"
-            )
+            else:
+                logger.warning(
+                    f"机械臂翻转指令无新响应 requested={requested_angle}, "
+                    f"resolved={resolved_angle}, speed={speed}, "
+                    f"attempt={attempt}/{ARM_SERVO_COMMAND_RETRIES}"
+                )
             if attempt < ARM_SERVO_COMMAND_RETRIES:
                 time.sleep(ARM_SERVO_COMMAND_RETRY_DELAY)
+
+        if response_received:
+            # MC602 回包只确认控制板接收了指令，不是舵机实际角度反馈。
+            # 因此即使首条已有回包，也必须恢复旧流程的三次重复发送；
+            # 全部发送完成后才更新软件记录的朝向和角度。
+            if target_side is not None:
+                self.side = target_side
+            self._arm_angle_last = resolved_angle
+            logger.info(
+                f"机械臂翻转重复发送完成 requested={requested_angle}, "
+                f"resolved={resolved_angle}, speed={speed}, "
+                f"attempts={ARM_SERVO_COMMAND_RETRIES}, "
+                f"last_response={last_response!r}"
+            )
+            return True
 
         logger.error(
             f"机械臂翻转指令连续无新响应 requested={requested_angle}, "
@@ -1629,6 +1727,15 @@ class ArmController:
             self.y_threshold[1]
         )
 
+        # 每个联合位置动作都使用新鲜反馈和全新的连续到位计数，不能沿用
+        # 归零或上一动作留下的位置与 CountRecord 状态。
+        if x is not None:
+            self.x_pose_now = self.x_get_position()
+        if y is not None:
+            self.y_pose_now = self.y_get_position()
+        self.x_pid_flag = CountRecord(5)
+        self.y_pid_flag = CountRecord(5)
+
         # 获取结束时间和对应速度
         time_start = time.monotonic()
         if time_run is not None:
@@ -1647,7 +1754,7 @@ class ArmController:
                 speed_y = speed[1]
             else:
                 logger.error("Invalid speed argument")
-                return
+                return False
             x_time = abs(
                 x_pos - self.x_pose_now
             ) / speed_x
@@ -1657,9 +1764,12 @@ class ArmController:
             time_run = max(x_time, y_time)
         else:
             logger.error("Either time_run or speed must be provided")
-            return
-        # 超时时间
-        time_end = time_start + time_run
+            return False
+        # 理论运动时间只用于计算速度，不能直接作为完成判定的硬截止时间。
+        # 两轴共享 MC602 串行通讯，且到位需要连续多帧确认，因此至少保留
+        # 与普通 Y 轴动作一致的 8 秒总预算。
+        motion_timeout = max(float(time_run) + 3.0, Y_MOTION_TIMEOUT)
+        time_end = time_start + motion_timeout
 
         # 定义结束标志和到达位置标记量
         if y is None:
@@ -1707,24 +1817,25 @@ class ArmController:
             # 获取剩余时间
             time_remain = time_end - time.monotonic()
             # 超时处理
-            if time_remain < -3:
-                logger.warning("Timeout")
+            if time_remain <= 0:
+                logger.warning(
+                    f"机械臂联合位置超时 target_x={x_pos:.6f}, "
+                    f"actual_x={self.x_pose_now:.6f}, x_done={x_flag}, "
+                    f"target_y={y_pos:.6f}, actual_y={self.y_pose_now:.6f}, "
+                    f"y_done={y_flag}, timeout={motion_timeout:.3f}s"
+                )
                 # 超时停止
                 self.x_speed(0)
                 self.y_speed(0)
-                break
+                self.save_config(pose_enable=False)
+                return False
             if not y_flag:
                 if self.y_pid_moveto(y_pos):
                     self.y_speed(0)
                     y_flag = True
-
-                # 重置初始化位置
-                if self.y_reset_check():
-                    target_was_downward = self.y_pid.setpoint <= self.y_pose_now
-                    self._stop_and_rebase_y_limit(reason="goto_position")
-                    if target_was_downward:
-                        y_flag = True
-                    self.save_config()
+                # 下限位只允许阻止继续向下运动。y_pid_moveto() 已在发送
+                # 负速度前完成限位检查；向上离开下限位时不能再次停车，
+                # 否则会每轮重复发送零速并一直无法释放开关。
 
             if not x_flag:
                 if self.x_pid_moveto(x_pos):
@@ -1735,6 +1846,7 @@ class ArmController:
         # logger.debug(
         #     f"机械臂移动完成，当前位置状态: x: {self.x_pose_now:.4f}, y: {self.y_pose_now:.4f}, hand: {self.side}。 "
         # )
+        return True
     def set_arm_pose(self,x=None,y=None,arm = None,hand = None):
         '''
         设置机械臂的位位姿
@@ -1746,14 +1858,23 @@ class ArmController:
             hand: 手部角度，可以是字符串（"UP", "MID", "DOWN"）或数字
         
         '''
-        # 设置相关参数。
-        self.goto_position(x, y)
+        # 只有调用方提供 X/Y 时才执行直线轴动作；arm/hand-only 调用无需
+        # 进入空的 goto_position() 循环或重复保存配置。
+        if x is not None or y is not None:
+            if not self.goto_position(x, y):
+                logger.error(
+                    f"机械臂直线轴姿态未到位，禁止继续翻转 "
+                    f"x={x}, y={y}, arm={arm}, hand={hand}"
+                )
+                return False
         # time.sleep(0.2)
         if arm is not None:
-            self.set_arm_angle(arm)
+            if not self.set_arm_angle(arm):
+                return False
             time.sleep(1)
         if hand is not None:
             self.set_hand_angle(hand)
+        return True
 
     # ==================== Orin 2026-07-17 便捷属性接口 ====================
     # 修改前 worktree 没有以下毫米/角度属性，只能直接调用 move_* 和 set_* 方法。

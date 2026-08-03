@@ -34,7 +34,8 @@ def main():
     # crop_harvesting()                             # 作物收集
     # sort_and_store()                              # 作物储存
     # order_list = get_order()                      # 订单获取
-    order_delivery(order_list)                    # 订单配送
+    # order_delivery(order_list)                    # 完整流程：配送真实识别订单
+    order_delivery()                               # 独立调试：配送函数内置订单
 
 
 if __name__ == "__main__":
