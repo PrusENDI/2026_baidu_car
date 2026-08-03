@@ -306,23 +306,85 @@ def auto_seeding(debug=False):
         my_car.move_to_position([0.0, 0.0, 0.0])
 
 
-def target_shooting_detection(debug=False) -> list:
+# 动物识别阶段的机械臂姿态和车辆位置集中配置。现场标定时只需修改这里，
+# 无需进入 target_shooting_detection() 查找散落的距离和坐标。
+TARGET_SHOOTING_DETECTION_POSES = {
+    # 进入动物识别区域前使用的侧摄像头搜索姿态。
+    "initial_search": {
+        "arm": "LEFT",  # 动物标签位于车辆左侧。
+        "hand": "UP",   # 抬起末端，使侧摄像头朝向动物标签。
+        "x": 0.05,       # X 轴搜索位置，单位为米。
+        "y": 0.05,       # Y 轴搜索高度，单位为米。
+    },
+    # 从任务起点进入动物识别区域的巡线参数。
+    "task_entry": {
+        "speed": 0.30,
+        "debug_distance": 0.40,
+        "run_distance": 1.45,
+    },
+    # 进入区域后将车辆航向归正；第三项在运行时替换为当前航向的反向值。
+    "heading_correction": {
+        "offset_xy": [0.0, 0.0],
+    },
+    # 四个动物标签之间的固定巡线距离。第 0 个动物位于任务入口位置，
+    # 入口巡线结束后直接识别；只有后续动物之间才移动 step_distance。
+    "animal_scan": {
+        "count": 4,
+        "speed": 0.30,
+        "step_distance": 0.15,
+    },
+    # 动物标签识别只调整车辆横向位置，不驱动机械臂 X 轴跟随 dy。
+    "alignment": {
+        "delta_y": None,
+    },
+    # 分离式调试结束后返回的局部里程计位置。
+    "debug_return": {
+        "position": [0.0, 0.0, 0.0],
+    },
+}
+
+
+def target_shooting_detection(debug=True) -> list:
 
     # None 表示未获得可信识别结果，不能默认当作有害动物执行射击。
-    animal_list = [None, None, None, None]
-    my_car.arm.set_arm_pose(x=0.05, y=0.05, arm="LEFT", hand="UP")
-    task_distance = 0.40 if debug else 1.45
-    my_car.lane_dis_offset(speed=0.3, dis_hold=task_distance)
+    scan_pose = TARGET_SHOOTING_DETECTION_POSES["initial_search"]
+    task_entry = TARGET_SHOOTING_DETECTION_POSES["task_entry"]
+    heading_correction = TARGET_SHOOTING_DETECTION_POSES["heading_correction"]
+    animal_scan = TARGET_SHOOTING_DETECTION_POSES["animal_scan"]
+    alignment = TARGET_SHOOTING_DETECTION_POSES["alignment"]
+    debug_return = TARGET_SHOOTING_DETECTION_POSES["debug_return"]
+
+    animal_list = [None] * animal_scan["count"]
+    my_car.arm.set_arm_pose(**scan_pose)
+    task_distance = (
+        task_entry["debug_distance"]
+        if debug
+        else task_entry["run_distance"]
+    )
+    my_car.lane_dis_offset(
+        speed=task_entry["speed"],
+        dis_hold=task_distance,
+    )
 
     _x, _y, _z = my_car.get_odometry(True)
     my_car.get_distance(True)
-    my_car.move_for([0, 0, 0 - _z])
+    my_car.move_for([
+        heading_correction["offset_xy"][0],
+        heading_correction["offset_xy"][1],
+        -_z,
+    ])
     time.sleep(3)
 
-    for i in range(4):
-        my_car.lane_dis_offset(speed=0.3, dis_hold=0.15)
+    for i in range(animal_scan["count"]):
+        if i > 0:
+            my_car.lane_dis_offset(
+                speed=animal_scan["speed"],
+                dis_hold=animal_scan["step_distance"],
+            )
         time.sleep(0.5)
-        cls_id, label = my_car.move_to_detection_target(delta_y=None)
+        cls_id, label = my_car.move_to_detection_target(
+            delta_y=alignment["delta_y"]
+        )
         if label == "animal":
             res, analysis = my_car.animal_image_analysis()
             if res is not None:
@@ -335,7 +397,7 @@ def target_shooting_detection(debug=False) -> list:
     my_car.get_odometry(True)
     my_car.get_distance(True)
     if debug:
-        my_car.move_to_position([0.0, 0.0, 0.0])
+        my_car.move_to_position(debug_return["position"])
     return animal_list
 
 
@@ -788,17 +850,79 @@ def water_tower_task(debug=True):
         print_water_telemetry("after_debug_return_origin")
 
 
+# 动物射击阶段的机械臂姿态、车辆位置和视觉对齐参数集中配置。
+TARGET_SHOOTING_POSES = {
+    # 先设置机械臂方向和末端姿态，保持原有动作顺序。
+    "initial_orientation": {
+        "arm": "LEFT",
+        "hand": "UP",
+    },
+    # 方向稳定后再移动 X/Y 轴到射击搜索位置。
+    "initial_linear": {
+        "x": 0.24,
+        "y": 0.02,
+    },
+    # 从射击任务起点直接巡线到物理第 0 靶附近。修改前先巡线到
+    # debug=0.70/run=3.00 m，再后退 0.20 m；实车表明该位置接近第 1 靶，
+    # 因此再扣除一个 0.16 m 靶距，将补偿合并到入口巡线距离中。
+    "task_entry": {
+        "speed": 0.30,
+        "debug_distance": 0.34,
+        "run_distance": 2.64,
+    },
+    # 动物靶位之间的固定间距。
+    "targets": {
+        "count": 4,
+        "step_distance": 0.16,
+        "course_distance": 0.48,
+        "lane_speed": 0.30,
+    },
+    # 侧摄像头对齐射击目标时使用的水平图像偏置。
+    "alignment": {
+        "delta_x": 0.28,
+        "delta_y": None,
+        "sort_y": 0.0,
+        # 归一化图像横向关联范围；0.20 小于半个 0.16 m 靶距在
+        # 0.33 m 视场中的约 0.24。前进时靶框 dx 由小变大，因此该值
+        # 只作为越过校准点后的容差，不限制尚在左侧等待校准的当前靶。
+        "max_delta_x_error": 0.20,
+        "target_x_direction": "increasing",
+    },
+    # 分离式调试结束后返回的局部里程计位置。
+    "debug_return": {
+        "position": [0.0, 0.0, 0.0],
+    },
+}
 
 
-def target_shooting(animal_list=None, debug=False):  # noqa: E741
+def target_shooting(
+    animal_list=[0, 1, 0, 1],
+    debug=True,
+    shooting_delta_x=None,
+):  # noqa: E741
+
+    initial_orientation = TARGET_SHOOTING_POSES["initial_orientation"]
+    initial_linear = TARGET_SHOOTING_POSES["initial_linear"]
+    task_entry = TARGET_SHOOTING_POSES["task_entry"]
+    targets = TARGET_SHOOTING_POSES["targets"]
+    alignment = TARGET_SHOOTING_POSES["alignment"]
+    debug_return = TARGET_SHOOTING_POSES["debug_return"]
+    target_delta_x = (
+        alignment["delta_x"]
+        if shooting_delta_x is None
+        else float(shooting_delta_x)
+    )
+    if not -1.0 <= target_delta_x <= 1.0:
+        raise ValueError(
+            "射击图像横向目标必须位于归一化范围 [-1.0, 1.0]: "
+            f"shooting_delta_x={target_delta_x}"
+        )
 
     if animal_list is None:
-        animal_list = [None, None, None, None]
+        animal_list = [None] * targets["count"]
 
-    step = 0.16  # 每个目标间距
     relative_loc = []  # 记录相对运动距离
     last_index = -1  # 记录上一个打击点的索引，初始为-1
-    d_x = 0.2  # 对齐参数
 
     for idx, value in enumerate(animal_list):
         if (
@@ -818,40 +942,64 @@ def target_shooting(animal_list=None, debug=False):  # noqa: E741
         ):  # 只有可信的有害动物结果才进入射击列表
             if last_index == -1:
                 # 第一个打击点：相对距离 = 从起点走到这里
-                dist = idx * step
+                dist = idx * targets["step_distance"]
             else:
                 # 后续打击点：相对距离 = 两个点之间的间隔数 * 0.16
-                dist = (idx - last_index) * step
+                dist = (idx - last_index) * targets["step_distance"]
 
             relative_loc.append(dist)
             last_index = idx  # 更新上一个打击点位置
     print(relative_loc)
 
     # 射击任务
-    my_car.arm.set_arm_pose(arm="LEFT", hand="UP")
-    my_car.arm.set_arm_pose(x=0.3, y=0.02)
+    my_car.arm.set_arm_pose(**initial_orientation)
+    my_car.arm.set_arm_pose(**initial_linear)
 
-    task_distance = 0.70 if debug else 3.0
-    my_car.lane_dis_offset(speed=0.3, dis_hold=task_distance)
-    my_car.move_for([-0.2, 0, 0])
-    # 对齐第一个目标
-    my_car.move_to_detection_target(delta_x=d_x, delta_y=None, sort_pos=(d_x, 0))
+    task_distance = (
+        task_entry["debug_distance"]
+        if debug
+        else task_entry["run_distance"]
+    )
+    my_car.lane_dis_offset(
+        speed=task_entry["speed"],
+        dis_hold=task_distance,
+    )
 
     for dis in relative_loc:
-        my_car.lane_dis_offset(speed=0.3, dis_hold=dis)
+        # 第 0 个靶就在入口位置，不执行 dis_hold=0 的巡线，避免底盘因
+        # lane_dis() 的严格大于结束条件而先向前窜动一个控制周期。
+        if dis > 0:
+            my_car.lane_dis_offset(
+                speed=targets["lane_speed"],
+                dis_hold=dis,
+            )
         cls_id, label = my_car.move_to_detection_target(
-            delta_x=d_x, delta_y=None, sort_pos=(d_x, 0)
+            delta_x=target_delta_x,
+            delta_y=alignment["delta_y"],
+            sort_pos=(target_delta_x, alignment["sort_y"]),
+            label="animal",
+            max_delta_x_error=alignment["max_delta_x_error"],
+            target_x_direction=alignment["target_x_direction"],
+            require_alignment=True,
+            debug_trace=True,
         )
+        if cls_id is None or label != "animal":
+            raise RuntimeError(
+                "射击靶位视觉关联失败，禁止向相邻靶或未知目标射击: "
+                f"target_delta_x={target_delta_x:.3f}, "
+                f"max_delta_x_error={alignment['max_delta_x_error']:.3f}"
+            )
         time.sleep(5)
         my_car.beep()
         my_car.shooting()
         time.sleep(5)
 
     my_car.lane_dis_offset(
-        speed=0.3, dis_hold=0.48 - sum(relative_loc)
+        speed=targets["lane_speed"],
+        dis_hold=targets["course_distance"] - sum(relative_loc),
     )  # 距离补偿到最后一个目标
     if debug:
-        my_car.move_to_position([0.0, 0.0, 0.0])
+        my_car.move_to_position(debug_return["position"])
 
 
 def crop_harvesting(debug=True):
@@ -1985,7 +2133,10 @@ def get_order(debug=True):
         )
     my_car.arm.set_arm_pose(arm=second_storage_slot["arm"])
     if not my_car.arm.move_x_position(second_storage_slot["x"]):
-        raise RuntimeError("订单第二件货物左侧放置水平轴未能到达 0.20 m，禁止下降释放")
+        raise RuntimeError(
+            "订单第二件货物左侧放置水平轴未能到达目标位置，"
+            f"target={second_storage_slot['x']:.3f}，禁止下降释放"
+        )
     # 第二件左侧放置按 goods_pickup.second_flip_x 完成翻转前避障，
     # 再使用 ORDER_STORAGE_SLOTS 对应仓位的 X/Y 位置；到位后将 hand
     # 转到 -18° 并释放，最后恢复抓取初始姿态 DOWN。

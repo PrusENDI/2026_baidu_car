@@ -1622,6 +1622,10 @@ class MyCar(MecanumDriver):
         sort_pos=(0, 0),
         num=0,
         arm_x_bounds=None,
+        max_delta_x_error=None,
+        target_x_direction=None,
+        require_alignment=False,
+        debug_trace=False,
     ):
         """
         前往目标位置
@@ -1632,6 +1636,8 @@ class MyCar(MecanumDriver):
             包含目标检测信息的列表，格式为 [cls_id, obj_id,label, score, x_c, y_c, w, h]
         """
         time_stop = time.time() + time_out
+        trace_interval = 0.25
+        next_trace_time = 0.0
         x_count = CountRecord(3)
         y_count = CountRecord(3)
 
@@ -1652,11 +1658,32 @@ class MyCar(MecanumDriver):
         calibrated_delta_x = self._camera_calibrated_delta_x(
             delta_x, self.side_camera_center_offset_x_m
         )
+        if max_delta_x_error is not None:
+            max_delta_x_error = float(max_delta_x_error)
+            if max_delta_x_error <= 0:
+                raise ValueError(
+                    "检测目标横向关联范围必须大于 0: "
+                    f"max_delta_x_error={max_delta_x_error}"
+                )
+        if target_x_direction not in (None, "increasing", "decreasing"):
+            raise ValueError(
+                "检测目标横向接近方向必须是 increasing、decreasing 或 None: "
+                f"target_x_direction={target_x_direction!r}"
+            )
         logger.info(
             f"视觉对齐 dx 校准 task={delta_x:.6f}, "
             f"camera_offset_m={self.side_camera_center_offset_x_m:.6f}, "
             f"effective={calibrated_delta_x:.6f}"
         )
+        if debug_trace:
+            print(
+                "[TARGET_ALIGNMENT_BEGIN] "
+                f"target_dx={calibrated_delta_x:.3f} "
+                f"task_dx={delta_x:.3f} label={label} "
+                f"direction={target_x_direction} "
+                f"overshoot_tolerance={max_delta_x_error}",
+                flush=True,
+            )
         pid_x = PID(kp_x, ki_x)
         pid_x.setpoint = calibrated_delta_x
         while True:
@@ -1669,9 +1696,42 @@ class MyCar(MecanumDriver):
 
             if label is not None:
                 dets = [item for item in dets if item[2] == label]
+            raw_candidate_dx = [round(item[4], 3) for item in dets]
+            if max_delta_x_error is not None:
+                if target_x_direction == "increasing":
+                    # 射击任务前进时，当前靶从图像左侧向目标 dx 接近。
+                    # 只排除已经越过目标太多的旧靶；不能对尚未接近目标的
+                    # 当前靶设置左边界，否则它会被过滤并使车辆保持零速。
+                    dets = [
+                        item
+                        for item in dets
+                        if item[4] <= calibrated_delta_x + max_delta_x_error
+                    ]
+                    # 四个 animal 同时出现时不再按校准点距离反复重排。
+                    # dx 最大的是沿前进方向最先到达的当前靶，后续靶依次
+                    # 位于更小的 dx，可保持物理顺序不反转。
+                    dets.sort(key=lambda item: item[4], reverse=True)
+                elif target_x_direction == "decreasing":
+                    dets = [
+                        item
+                        for item in dets
+                        if item[4] >= calibrated_delta_x - max_delta_x_error
+                    ]
+                    dets.sort(key=lambda item: item[4])
+                else:
+                    dets = [
+                        item
+                        for item in dets
+                        if abs(item[4] - calibrated_delta_x)
+                        <= max_delta_x_error
+                    ]
 
+            selected_det = None
+            flag_x = False
+            flag_y = delta_y is None
             if len(dets) > num:
                 det = dets[num]
+                selected_det = det
                 dx, dy = det[4:6]
                 # print(f"dx:{dx} dy:{dy}")
                 out_x = -pid_x(dx)  # type: ignore
@@ -1721,11 +1781,42 @@ class MyCar(MecanumDriver):
                         f"camera_offset_m={self.side_camera_center_offset_x_m:.6f}, "
                         f"dy={dy:.6f}/{delta_y if delta_y is not None else 'None'}"
                     )
+                    if debug_trace:
+                        print(
+                            "[TARGET_ALIGNMENT_DONE] "
+                            f"selected_dx={dx:.3f} "
+                            f"target_dx={calibrated_delta_x:.3f} "
+                            f"error={dx - calibrated_delta_x:+.3f} "
+                            f"cls_id={det[0]} label={det[2]}",
+                            flush=True,
+                        )
                     # Orin 2026-07-21 现场副本也已恢复达标后立即返回。
                     return det[0], det[2]
             else:
                 x_count(False)
                 y_count(False)
+                out_x = 0
+                out_y = 0
+            trace_now = time.monotonic()
+            if debug_trace and trace_now >= next_trace_time:
+                selected_dx = (
+                    f"{selected_det[4]:.3f}" if selected_det is not None else "None"
+                )
+                selected_error = (
+                    f"{selected_det[4] - calibrated_delta_x:+.3f}"
+                    if selected_det is not None
+                    else "None"
+                )
+                print(
+                    "[TARGET_ALIGNMENT] "
+                    f"raw_dx={raw_candidate_dx} "
+                    f"ordered_dx={[round(item[4], 3) for item in dets]} "
+                    f"selected_dx={selected_dx} target_dx={calibrated_delta_x:.3f} "
+                    f"error={selected_error} out_x={out_x:+.3f} "
+                    f"x_reached={flag_x} direction={target_x_direction}",
+                    flush=True,
+                )
+                next_trace_time = trace_now + trace_interval
             self.set_velocity(out_x, 0, 0)
             self.arm.x_speed(out_y)
             time.sleep(0.05)
@@ -1735,6 +1826,17 @@ class MyCar(MecanumDriver):
                 self.arm.x_speed(0)
                 logger.error("对齐目标超时")
                 # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
+
+                if require_alignment:
+                    if debug_trace:
+                        print(
+                            "[TARGET_ALIGNMENT_TIMEOUT] "
+                            f"raw_dx={raw_candidate_dx} "
+                            f"ordered_dx={[round(item[4], 3) for item in dets]} "
+                            f"target_dx={calibrated_delta_x:.3f}",
+                            flush=True,
+                        )
+                    return (None, None)
 
                 try:
                     return det[0], det[2]

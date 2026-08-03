@@ -38,6 +38,9 @@ horiz_cfg:
   # 本地越界检查继续生效；仍请求 0.30 m 的任务会返回失败，调用方应据此停止后续动作。
   - 0.255
   homing:
+    # 临时跳过 X 轴微动开关，使用编码器持续停滞判定机械回收端。
+    # 微动开关恢复后改回 true，即可重新启用触发、消抖和释放确认。
+    use_limit_switch: false
     limit_port: 3
     active: above
     threshold: 2000
