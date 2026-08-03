@@ -1805,23 +1805,33 @@ GET_ORDER_POSES = {
 
 # 寻找货物的程序
 def find_goods(label, dy=GET_ORDER_POSES["goods_search"]["delta_y"]):
+    # 订单、姓名等仍由 task_det 识别；只有蔬菜搜索使用 8_2 专用模型。
+    # 四次搜索均显式传入同一检测器，避免重试阶段退回旧任务模型。
     goods_search_pose = GET_ORDER_POSES["goods_search"]
-    cls_id, det_label = my_car.move_to_detection_target(label=label, delta_y=dy)
+    cls_id, det_label = my_car.move_to_detection_target(
+        label=label, delta_y=dy, detector=my_car.goods_det
+    )
     if det_label is not None:
         return det_label
 
     my_car.arm.move_x_position(goods_search_pose["retry_x"])
-    cls_id, det_label = my_car.move_to_detection_target(label=label, delta_y=dy)
+    cls_id, det_label = my_car.move_to_detection_target(
+        label=label, delta_y=dy, detector=my_car.goods_det
+    )
     if det_label is not None:
         return det_label
 
     my_car.move_for(goods_search_pose["retry_car_offset"])
-    cls_id, det_label = my_car.move_to_detection_target(label=label, delta_y=dy)
+    cls_id, det_label = my_car.move_to_detection_target(
+        label=label, delta_y=dy, detector=my_car.goods_det
+    )
     if det_label is not None:
         return det_label
 
     my_car.arm.move_x_position(goods_search_pose["final_retry_x"])
-    cls_id, det_label = my_car.move_to_detection_target(label=label, delta_y=dy)
+    cls_id, det_label = my_car.move_to_detection_target(
+        label=label, delta_y=dy, detector=my_car.goods_det
+    )
     if det_label is not None:
         return det_label
 

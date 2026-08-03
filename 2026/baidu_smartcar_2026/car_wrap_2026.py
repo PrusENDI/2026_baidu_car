@@ -505,7 +505,7 @@ class MyCar(MecanumDriver):
         """
         初始化Paddle推理
 
-        初始化车道保持、前置方向识别、任务识别和OCR识别的推理接口。
+        初始化车道保持、任务识别、蔬菜识别和OCR识别的推理接口。
         """
         # 前置巡线
         self.crusie = ClintInterface("lane")
@@ -513,6 +513,8 @@ class MyCar(MecanumDriver):
         # self.front_det = ClintInterface('front')
         # 任务识别
         self.task_det = ClintInterface("task")
+        # 蔬菜识别使用独立模型，避免覆盖 task2026 后丢失 order/name 等任务类别。
+        self.goods_det = ClintInterface("goods")
         # ocr识别
         self.ocr_rec = ClintInterface("ocr")
         # 识别为None
@@ -1496,10 +1498,13 @@ class MyCar(MecanumDriver):
         return img_show
 
     def get_detection_results(
-        self, sort_pos=(0, 0), limit_x=1, limit_y=1
+        self, sort_pos=(0, 0), limit_x=1, limit_y=1, detector=None
     ) -> List[list]:
         """
-        获取检测结果,使用任务的目标检测对侧边摄像头图像进行检测，返回检测结果。
+        获取侧边摄像头检测结果。
+
+        detector 默认使用 task_det，以保持所有旧调用行为不变；蔬菜搜索可显式
+        传入 goods_det，使用独立的 8_2 模型。
 
         返回:
             list: - 检测结果列表，每个元素包含 [cls_id, det_id, label, score, x_c, y_c, w, h]
@@ -1507,7 +1512,8 @@ class MyCar(MecanumDriver):
         # 获取相关数据。
         self.side_image = self.cap_side.read()
         image = self.side_image.copy()
-        det_task = self.task_det(image)
+        detector = self.task_det if detector is None else detector
+        det_task = detector(image)
         det_task = [det for det in det_task if abs(det[4]) <= limit_x]
         det_task = [det for det in det_task if abs(det[5]) <= limit_y]
 
@@ -1622,6 +1628,7 @@ class MyCar(MecanumDriver):
         sort_pos=(0, 0),
         num=0,
         arm_x_bounds=None,
+        detector=None,
     ):
         """
         前往目标位置
@@ -1629,6 +1636,7 @@ class MyCar(MecanumDriver):
         参数:
             cls_id : 指定检测目标的 cls_id，默认None为距离中心最近的目标
             time_out: 设置超时时间
+            detector: 可选检测客户端；默认使用 task_det，蔬菜搜索传入 goods_det
             包含目标检测信息的列表，格式为 [cls_id, obj_id,label, score, x_c, y_c, w, h]
         """
         time_stop = time.time() + time_out
@@ -1665,7 +1673,8 @@ class MyCar(MecanumDriver):
                 self.arm.x_speed(0)
                 return -1, "None"
 
-            dets = self.get_detection_results(sort_pos=sort_pos)
+            # 检测器选择贯穿整个对齐循环，重试帧不会意外切回 task_det。
+            dets = self.get_detection_results(sort_pos=sort_pos, detector=detector)
 
             if label is not None:
                 dets = [item for item in dets if item[2] == label]

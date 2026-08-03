@@ -145,6 +145,14 @@ infer_cfg:
     img_size: [416, 416]
     run_mode: paddle
 
+  # get_order() 蔬菜搜索专用模型；与 task 分离，保留 order/name 等旧类别。
+  - name: goods
+    infer_type: YoloeInfer
+    model_dir: goods_8_2
+    port: 5005
+    img_size: [640, 640]
+    run_mode: paddle
+
   - name: front
     infer_type: YoloeInfer
     model_dir: front_model2

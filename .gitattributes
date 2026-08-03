@@ -1,0 +1,2 @@
+2026/baidu_smartcar_2026/smartcar/paddlebaidu/models/goods_8_2/model.pdmodel filter=lfs diff=lfs merge=lfs -text
+2026/baidu_smartcar_2026/smartcar/paddlebaidu/models/goods_8_2/model.pdiparams filter=lfs diff=lfs merge=lfs -text
