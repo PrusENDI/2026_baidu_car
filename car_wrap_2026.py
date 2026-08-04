@@ -383,6 +383,9 @@ class MyCar(MecanumDriver):
         self.display = ScreenShow()
 
         self.streamer = Streamer()
+        # 射击任务可临时启用固定物理靶号显示。整个配置作为一个对象替换，
+        # 避免取帧时读到“编号已更新但方向尚未更新”的中间状态。
+        self._shooting_target_display = None
         self.arm = ArmController()
 
         # 获取自己文件所在的目录路径
@@ -1441,7 +1444,60 @@ class MyCar(MecanumDriver):
         # 获取相关数据。
         return self.action_bot.get_res_json(text)
 
-    def draw_detection_results(self, img, dets_ret):
+    def set_shooting_target_display(self, target_indices, order_direction):
+        """让侧摄像头按车辆行进方向显示固定的射击靶位编号。"""
+        if order_direction not in ("ascending", "descending"):
+            raise ValueError(
+                "射击靶位显示顺序必须是 ascending 或 descending: "
+                f"order_direction={order_direction!r}"
+            )
+        target_indices = tuple(int(index) for index in target_indices)
+        if len(set(target_indices)) != len(target_indices):
+            raise ValueError(
+                f"射击靶位显示编号不能重复: target_indices={target_indices}"
+            )
+        self._shooting_target_display = {
+            "target_indices": target_indices,
+            "order_direction": order_direction,
+        }
+        print(
+            "[TARGET_DISPLAY] event=UPDATED "
+            f"target_indices={list(target_indices)} "
+            f"order_direction={order_direction}",
+            flush=True,
+        )
+
+    def clear_shooting_target_display(self):
+        """恢复侧摄像头原有的逐帧临时检测序号。"""
+        if self._shooting_target_display is not None:
+            print("[TARGET_DISPLAY] event=CLEARED", flush=True)
+        self._shooting_target_display = None
+
+    def _shooting_detection_display_ids(self, dets_ret):
+        """生成与检测框一一对应的固定靶号；无法安全关联时返回 T?。"""
+        display_state = self._shooting_target_display
+        if display_state is None:
+            return None
+
+        animal_positions = [
+            index for index, det in enumerate(dets_ret) if det[2] == "animal"
+        ]
+        display_ids = [None] * len(dets_ret)
+        target_indices = display_state["target_indices"]
+        if len(animal_positions) != len(target_indices):
+            for position in animal_positions:
+                display_ids[position] = "T?"
+            return display_ids
+
+        animal_positions.sort(
+            key=lambda position: dets_ret[position][4],
+            reverse=display_state["order_direction"] == "descending",
+        )
+        for position, target_index in zip(animal_positions, target_indices):
+            display_ids[position] = f"T{target_index}"
+        return display_ids
+
+    def draw_detection_results(self, img, dets_ret, display_ids=None):
         """
         将检测结果绘制在图像上
 
@@ -1482,7 +1538,12 @@ class MyCar(MecanumDriver):
             cv2.rectangle(img_show, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
             # 绘制标签
-            label_text = f"{index}-{det_label}:{det_score:.2f}"
+            display_id = (
+                display_ids[index]
+                if display_ids is not None and display_ids[index] is not None
+                else str(index)
+            )
+            label_text = f"{display_id}-{det_label}:{det_score:.2f}"
             cv2.putText(
                 img_show,
                 label_text,
@@ -1514,7 +1575,8 @@ class MyCar(MecanumDriver):
         det_task.sort(
             key=lambda x: (x[4] - sort_pos[0]) ** 2 + (x[5] - sort_pos[1]) ** 2
         )  # 按照距离由近及远排序
-        image = self.draw_detection_results(image, det_task)
+        display_ids = self._shooting_detection_display_ids(det_task)
+        image = self.draw_detection_results(image, det_task, display_ids)
         self.streamer.update_frame(image, "cam2")
         # print(det_task)
         return det_task
@@ -1627,6 +1689,7 @@ class MyCar(MecanumDriver):
         require_alignment=False,
         debug_trace=False,
         fixed_order_num=None,
+        fixed_order_direction=None,
         expected_detection_count=None,
         max_selected_dx_jump=None,
         target_index=None,
@@ -1649,6 +1712,7 @@ class MyCar(MecanumDriver):
             "reason": "alignment_started",
             "target_index": target_index,
             "fixed_order_num": fixed_order_num,
+            "fixed_order_direction": fixed_order_direction,
             "expected_detection_count": expected_detection_count,
         }
 
@@ -1688,8 +1752,11 @@ class MyCar(MecanumDriver):
                     "固定靶位候选序号不能小于 0: "
                     f"fixed_order_num={fixed_order_num}"
                 )
-            if target_x_direction is None:
-                raise ValueError("固定靶位选择必须提供 target_x_direction")
+            if fixed_order_direction not in ("ascending", "descending"):
+                raise ValueError(
+                    "固定靶位物理顺序必须是 ascending 或 descending: "
+                    f"fixed_order_direction={fixed_order_direction!r}"
+                )
         if expected_detection_count is not None:
             expected_detection_count = int(expected_detection_count)
             if expected_detection_count <= 0:
@@ -1715,6 +1782,7 @@ class MyCar(MecanumDriver):
                 f"target_dx={calibrated_delta_x:.3f} "
                 f"task_dx={delta_x:.3f} label={label} "
                 f"target_index={target_index} fixed_order_num={fixed_order_num} "
+                f"fixed_order_direction={fixed_order_direction} "
                 f"expected_count={expected_detection_count} "
                 f"direction={target_x_direction} "
                 f"overshoot_tolerance={max_delta_x_error}",
@@ -1746,10 +1814,10 @@ class MyCar(MecanumDriver):
             if fixed_order_num is not None:
                 # 固定靶位模式不再删除靠边候选后滚动重编号。所有仍站立靶
                 # 始终按车辆行进方向保持同一顺序，再按会话保存的 rank 取靶。
-                if target_x_direction == "increasing":
-                    dets.sort(key=lambda item: item[4], reverse=True)
-                else:
-                    dets.sort(key=lambda item: item[4])
+                dets.sort(
+                    key=lambda item: item[4],
+                    reverse=fixed_order_direction == "descending",
+                )
                 selection_num = fixed_order_num
                 if (
                     expected_detection_count is not None
@@ -1886,6 +1954,7 @@ class MyCar(MecanumDriver):
                         "reason": "aligned",
                         "target_index": target_index,
                         "fixed_order_num": fixed_order_num,
+                        "fixed_order_direction": fixed_order_direction,
                         "selected_dx": dx,
                         "target_dx": calibrated_delta_x,
                     }
@@ -1913,6 +1982,7 @@ class MyCar(MecanumDriver):
                     f"error={selected_error} out_x={out_x:+.3f} "
                     f"x_reached={flag_x} direction={target_x_direction} "
                     f"target_index={target_index} fixed_order_num={fixed_order_num} "
+                    f"fixed_order_direction={fixed_order_direction} "
                     f"expected_count={expected_detection_count} "
                     f"rejection={selection_rejection}",
                     flush=True,
@@ -1945,6 +2015,7 @@ class MyCar(MecanumDriver):
                         "reason": timeout_reason,
                         "target_index": target_index,
                         "fixed_order_num": fixed_order_num,
+                        "fixed_order_direction": fixed_order_direction,
                         "expected_detection_count": expected_detection_count,
                         "selection_rejection": last_selection_rejection,
                         "raw_dx": raw_candidate_dx,

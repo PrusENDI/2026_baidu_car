@@ -859,7 +859,7 @@ TARGET_SHOOTING_POSES = {
     },
     # 方向稳定后再移动 X/Y 轴到射击搜索位置。
     "initial_linear": {
-        "x": 0.02,
+        "x": 0.20,
         "y": 0.02,
     },
     # 从射击任务起点直接巡线到物理第 0 靶附近。修改前先巡线到
@@ -879,7 +879,7 @@ TARGET_SHOOTING_POSES = {
     },
     # 侧摄像头对齐射击目标时使用的水平图像偏置。
     "alignment": {
-        "delta_x": 0.28,
+        "delta_x": 0.36,
         "delta_y": None,
         "sort_y": 0.0,
         # 归一化图像横向关联范围；0.20 小于半个 0.16 m 靶距在
@@ -887,6 +887,9 @@ TARGET_SHOOTING_POSES = {
         # 只作为越过校准点后的容差，不限制尚在左侧等待校准的当前靶。
         "max_delta_x_error": 0.20,
         "target_x_direction": "increasing",
+        # 物理靶位 0->3 在侧摄像头画面中按 dx 从小到大排列。
+        # 该顺序独立于车辆对齐时目标 dx 的变化方向，禁止混用。
+        "target_order_direction": "ascending",
         # 射击任务固定靶位关联：首次四靶连续三帧稳定后锁定 0-3，
         # 对齐期间拒绝把单帧漏检后的相邻靶补成当前靶。
         "calibration_stable_frames": 3,
@@ -913,10 +916,12 @@ TARGET_SHOOTING_POSES = {
 
 
 def target_shooting(
-    animal_list=[0, 1, 0, 1],
+    animal_list=[0, 0, 0, 0],
     debug=True,
     shooting_delta_x=None,
 ):  # noqa: E741
+    # 防止上一次中途结束的射击任务把固定靶号显示状态带入本次校准。
+    my_car.clear_shooting_target_display()
 
     initial_orientation = TARGET_SHOOTING_POSES["initial_orientation"]
     initial_linear = TARGET_SHOOTING_POSES["initial_linear"]
@@ -981,7 +986,7 @@ def target_shooting(
         ]
         detections.sort(
             key=lambda item: item[4],
-            reverse=alignment["target_x_direction"] == "increasing",
+            reverse=alignment["target_order_direction"] == "descending",
         )
         return detections
 
@@ -1192,6 +1197,12 @@ def target_shooting(
     shots_by_target = {index: 0 for index in range(target_count)}
     traveled_plan_distance = 0.0
 
+    if target_slots is not None and shot_plan:
+        my_car.set_shooting_target_display(
+            standing_indices,
+            alignment["target_order_direction"],
+        )
+
     if target_slots is None:
         for item in shot_plan:
             failure = {
@@ -1256,6 +1267,9 @@ def target_shooting(
                         require_alignment=True,
                         debug_trace=True,
                         fixed_order_num=fixed_rank,
+                        fixed_order_direction=alignment[
+                            "target_order_direction"
+                        ],
                         expected_detection_count=len(standing_indices),
                         max_selected_dx_jump=alignment["selected_max_dx_jump"],
                         target_index=target_index,
@@ -1329,6 +1343,10 @@ def target_shooting(
                 )
                 if verification == "knocked_down":
                     standing_indices.remove(target_index)
+                    my_car.set_shooting_target_display(
+                        standing_indices,
+                        alignment["target_order_direction"],
+                    )
                     target_slots[target_index]["status"] = "shot"
                     successful_indices.append(target_index)
                     target_succeeded = True
@@ -1407,6 +1425,7 @@ def target_shooting(
             "shots_by_target": shots_by_target,
         },
     )
+    my_car.clear_shooting_target_display()
     if debug:
         my_car.move_to_position(debug_return["position"])
 
