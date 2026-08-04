@@ -859,7 +859,7 @@ TARGET_SHOOTING_POSES = {
     },
     # 方向稳定后再移动 X/Y 轴到射击搜索位置。
     "initial_linear": {
-        "x": 0.24,
+        "x": 0.02,
         "y": 0.02,
     },
     # 从射击任务起点直接巡线到物理第 0 靶附近。修改前先巡线到
@@ -887,6 +887,23 @@ TARGET_SHOOTING_POSES = {
         # 只作为越过校准点后的容差，不限制尚在左侧等待校准的当前靶。
         "max_delta_x_error": 0.20,
         "target_x_direction": "increasing",
+        # 射击任务固定靶位关联：首次四靶连续三帧稳定后锁定 0-3，
+        # 对齐期间拒绝把单帧漏检后的相邻靶补成当前靶。
+        "calibration_stable_frames": 3,
+        "calibration_timeout": 15.0,
+        "calibration_frame_interval": 0.10,
+        "calibration_max_dx_shift": 0.12,
+        "selected_max_dx_jump": 0.12,
+        "alignment_attempts": 3,
+        "alignment_timeout": 10.0,
+    },
+    "shot_confirmation": {
+        "max_shots_per_target": 4,
+        "post_shot_settle_seconds": 5.0,
+        "confirm_frames": 3,
+        "verification_timeout": 10.0,
+        "verification_frame_interval": 0.10,
+        "stationary_dx_tolerance": 0.15,
     },
     # 分离式调试结束后返回的局部里程计位置。
     "debug_return": {
@@ -906,6 +923,7 @@ def target_shooting(
     task_entry = TARGET_SHOOTING_POSES["task_entry"]
     targets = TARGET_SHOOTING_POSES["targets"]
     alignment = TARGET_SHOOTING_POSES["alignment"]
+    shot_confirmation = TARGET_SHOOTING_POSES["shot_confirmation"]
     debug_return = TARGET_SHOOTING_POSES["debug_return"]
     target_delta_x = (
         alignment["delta_x"]
@@ -918,38 +936,240 @@ def target_shooting(
             f"shooting_delta_x={target_delta_x}"
         )
 
+    target_count = targets["count"]
     if animal_list is None:
-        animal_list = [None] * targets["count"]
+        animal_list = [None] * target_count
+    animal_results = list(animal_list[:target_count])
+    animal_results.extend([None] * (target_count - len(animal_results)))
+    shooting_started_at = time.monotonic()
 
-    relative_loc = []  # 记录相对运动距离
-    last_index = -1  # 记录上一个打击点的索引，初始为-1
+    def shooting_event(
+        event,
+        target_index=None,
+        attempt=None,
+        stage=None,
+        reason=None,
+        ordered_dx=None,
+        mapping=None,
+        extra=None,
+    ):
+        fields = [
+            f"event={event}",
+            f"elapsed={time.monotonic() - shooting_started_at:.2f}",
+        ]
+        if stage is not None:
+            fields.append(f"stage={stage}")
+        if target_index is not None:
+            fields.append(f"target_index={target_index}")
+        if attempt is not None:
+            fields.append(f"attempt={attempt}")
+        if reason is not None:
+            fields.append(f"reason={reason}")
+        if ordered_dx is not None:
+            fields.append(f"ordered_dx={ordered_dx}")
+        if mapping is not None:
+            fields.append(f"mapping={mapping}")
+        if extra is not None:
+            fields.append(f"extra={extra}")
+        print(f"[TARGET_SHOOTING] {' '.join(fields)}", flush=True)
 
-    for idx, value in enumerate(animal_list):
+    def ordered_animal_detections():
+        detections = [
+            item
+            for item in my_car.get_detection_results()
+            if item[2] == "animal"
+        ]
+        detections.sort(
+            key=lambda item: item[4],
+            reverse=alignment["target_x_direction"] == "increasing",
+        )
+        return detections
+
+    def detection_dx(detections):
+        return [round(item[4], 3) for item in detections]
+
+    def calibrate_target_slots():
+        stable_samples = []
+        deadline = time.monotonic() + alignment["calibration_timeout"]
+        last_rejection = None
+        shooting_event(
+            "CALIBRATION_BEGIN",
+            stage="calibration",
+            extra={
+                "required_count": target_count,
+                "stable_frames": alignment["calibration_stable_frames"],
+            },
+        )
+        while time.monotonic() < deadline:
+            detections = ordered_animal_detections()
+            current_dx = [item[4] for item in detections]
+            rejection = None
+            if len(detections) != target_count:
+                rejection = (
+                    f"candidate_count_mismatch:{len(detections)}/{target_count}"
+                )
+                stable_samples = []
+            elif stable_samples and any(
+                abs(now - previous) > alignment["calibration_max_dx_shift"]
+                for now, previous in zip(current_dx, stable_samples[-1])
+            ):
+                rejection = "unstable_target_order_or_position"
+                stable_samples = [current_dx]
+            else:
+                stable_samples.append(current_dx)
+
+            if rejection is not None and rejection != last_rejection:
+                shooting_event(
+                    "CALIBRATION_FRAME_REJECTED",
+                    stage="calibration",
+                    reason=rejection,
+                    ordered_dx=detection_dx(detections),
+                )
+            last_rejection = rejection
+            if len(stable_samples) >= alignment["calibration_stable_frames"]:
+                locked_dx = [
+                    round(
+                        sum(sample[index] for sample in stable_samples)
+                        / len(stable_samples),
+                        3,
+                    )
+                    for index in range(target_count)
+                ]
+                slots = [
+                    {
+                        "index": index,
+                        "animal_result": animal_results[index],
+                        "initial_dx": locked_dx[index],
+                        "status": "standing",
+                    }
+                    for index in range(target_count)
+                ]
+                shooting_event(
+                    "CALIBRATION_LOCKED",
+                    stage="calibration",
+                    ordered_dx=locked_dx,
+                    mapping={index: index for index in range(target_count)},
+                )
+                return slots
+            time.sleep(alignment["calibration_frame_interval"])
+
+        shooting_event(
+            "CALIBRATION_FAILED",
+            stage="calibration",
+            reason="calibration_timeout",
+            extra={"timeout": alignment["calibration_timeout"]},
+        )
+        return None
+
+    def wait_for_standing_snapshot(standing_indices):
+        deadline = time.monotonic() + alignment["alignment_timeout"]
+        expected_count = len(standing_indices)
+        last_count = None
+        while time.monotonic() < deadline:
+            detections = ordered_animal_detections()
+            if len(detections) == expected_count:
+                return detections
+            if len(detections) != last_count:
+                shooting_event(
+                    "ASSOCIATION_WAIT",
+                    stage="pre_shot_snapshot",
+                    reason="candidate_count_mismatch",
+                    ordered_dx=detection_dx(detections),
+                    extra={
+                        "actual_count": len(detections),
+                        "expected_count": expected_count,
+                    },
+                )
+                last_count = len(detections)
+            time.sleep(alignment["calibration_frame_interval"])
+        return None
+
+    def frame_matches_slots(detections, slot_indices, before_map):
+        if len(detections) != len(slot_indices):
+            return False
+        tolerance = shot_confirmation["stationary_dx_tolerance"]
+        return all(
+            abs(detection[4] - before_map[index][4]) <= tolerance
+            for index, detection in zip(slot_indices, detections)
+        )
+
+    def verify_knockdown(target_index, standing_indices, before_detections):
+        before_map = dict(zip(standing_indices, before_detections))
+        remaining_indices = [
+            index for index in standing_indices if index != target_index
+        ]
+        absent_count = 0
+        present_count = 0
+        deadline = time.monotonic() + shot_confirmation["verification_timeout"]
+        last_state = None
+        while time.monotonic() < deadline:
+            detections = ordered_animal_detections()
+            if frame_matches_slots(detections, remaining_indices, before_map):
+                state = "selected_target_absent"
+                absent_count += 1
+                present_count = 0
+            elif frame_matches_slots(detections, standing_indices, before_map):
+                state = "selected_target_present"
+                present_count += 1
+                absent_count = 0
+            else:
+                state = "verification_ambiguous"
+                absent_count = 0
+                present_count = 0
+
+            if state != last_state:
+                shooting_event(
+                    "KNOCKDOWN_CHECK",
+                    target_index=target_index,
+                    stage="verification",
+                    reason=state,
+                    ordered_dx=detection_dx(detections),
+                    extra={
+                        "standing_indices": list(standing_indices),
+                        "remaining_indices": remaining_indices,
+                    },
+                )
+                last_state = state
+            if absent_count >= shot_confirmation["confirm_frames"]:
+                return "knocked_down"
+            if present_count >= shot_confirmation["confirm_frames"]:
+                return "still_standing"
+            time.sleep(shot_confirmation["verification_frame_interval"])
+        return "verification_ambiguous"
+
+    shot_plan = []
+    last_index = -1
+    skipped_indices = []
+
+    for idx, value in enumerate(animal_results):
         if (
             isinstance(value, bool)
             or not isinstance(value, int)
             or value not in (0, 1)
         ):
-            print(
-                "[TARGET_SHOOTING_SKIP] "
-                f"index={idx} reason=invalid_or_unknown_result "
-                f"value_type={type(value).__name__}",
-                flush=True,
+            skipped_indices.append(idx)
+            shooting_event(
+                "TARGET_SKIPPED",
+                target_index=idx,
+                stage="plan",
+                reason="invalid_or_unknown_result",
+                extra={"value_type": type(value).__name__},
             )
             continue
-        if (
-            value == 0
-        ):  # 只有可信的有害动物结果才进入射击列表
+        if value == 0:  # 只有可信的有害动物结果才进入射击列表
             if last_index == -1:
-                # 第一个打击点：相对距离 = 从起点走到这里
                 dist = idx * targets["step_distance"]
             else:
-                # 后续打击点：相对距离 = 两个点之间的间隔数 * 0.16
                 dist = (idx - last_index) * targets["step_distance"]
-
-            relative_loc.append(dist)
-            last_index = idx  # 更新上一个打击点位置
-    print(relative_loc)
+            shot_plan.append({"target_index": idx, "move_distance": dist})
+            last_index = idx
+        else:
+            skipped_indices.append(idx)
+    shooting_event(
+        "PLAN_READY",
+        stage="plan",
+        extra={"shot_plan": shot_plan, "animal_results": animal_results},
+    )
 
     # 射击任务
     my_car.arm.set_arm_pose(**initial_orientation)
@@ -965,39 +1185,228 @@ def target_shooting(
         dis_hold=task_distance,
     )
 
-    for dis in relative_loc:
-        # 第 0 个靶就在入口位置，不执行 dis_hold=0 的巡线，避免底盘因
-        # lane_dis() 的严格大于结束条件而先向前窜动一个控制周期。
-        if dis > 0:
-            my_car.lane_dis_offset(
-                speed=targets["lane_speed"],
-                dis_hold=dis,
-            )
-        cls_id, label = my_car.move_to_detection_target(
-            delta_x=target_delta_x,
-            delta_y=alignment["delta_y"],
-            sort_pos=(target_delta_x, alignment["sort_y"]),
-            label="animal",
-            max_delta_x_error=alignment["max_delta_x_error"],
-            target_x_direction=alignment["target_x_direction"],
-            require_alignment=True,
-            debug_trace=True,
-        )
-        if cls_id is None or label != "animal":
-            raise RuntimeError(
-                "射击靶位视觉关联失败，禁止向相邻靶或未知目标射击: "
-                f"target_delta_x={target_delta_x:.3f}, "
-                f"max_delta_x_error={alignment['max_delta_x_error']:.3f}"
-            )
-        time.sleep(5)
-        my_car.beep()
-        my_car.shooting()
-        time.sleep(5)
+    target_slots = calibrate_target_slots() if shot_plan else []
+    standing_indices = list(range(target_count))
+    successful_indices = []
+    failed_targets = []
+    shots_by_target = {index: 0 for index in range(target_count)}
+    traveled_plan_distance = 0.0
 
-    my_car.lane_dis_offset(
-        speed=targets["lane_speed"],
-        dis_hold=targets["course_distance"] - sum(relative_loc),
-    )  # 距离补偿到最后一个目标
+    if target_slots is None:
+        for item in shot_plan:
+            failure = {
+                "target_index": item["target_index"],
+                "reason": "calibration_timeout",
+                "shots": 0,
+            }
+            failed_targets.append(failure)
+            shooting_event(
+                "TARGET_FAILED",
+                target_index=item["target_index"],
+                stage="calibration",
+                reason="calibration_timeout",
+            )
+    else:
+        for plan_item in shot_plan:
+            target_index = plan_item["target_index"]
+            dis = plan_item["move_distance"]
+            if dis > 0:
+                my_car.lane_dis_offset(
+                    speed=targets["lane_speed"],
+                    dis_hold=dis,
+                )
+            traveled_plan_distance += dis
+            shooting_event(
+                "TARGET_BEGIN",
+                target_index=target_index,
+                stage="target",
+                mapping={
+                    "standing": list(standing_indices),
+                    "fixed_rank": standing_indices.index(target_index),
+                },
+            )
+
+            target_succeeded = False
+            target_failure_reason = None
+            while shots_by_target[target_index] < shot_confirmation["max_shots_per_target"]:
+                before_detections = None
+                alignment_failure = None
+                fixed_rank = standing_indices.index(target_index)
+                for alignment_attempt in range(
+                    1, alignment["alignment_attempts"] + 1
+                ):
+                    shooting_event(
+                        "ALIGNMENT_BEGIN",
+                        target_index=target_index,
+                        attempt=alignment_attempt,
+                        stage="alignment",
+                        mapping={
+                            "standing": list(standing_indices),
+                            "fixed_rank": fixed_rank,
+                        },
+                    )
+                    cls_id, label = my_car.move_to_detection_target(
+                        delta_x=target_delta_x,
+                        delta_y=alignment["delta_y"],
+                        sort_pos=(target_delta_x, alignment["sort_y"]),
+                        label="animal",
+                        time_out=alignment["alignment_timeout"],
+                        max_delta_x_error=alignment["max_delta_x_error"],
+                        target_x_direction=alignment["target_x_direction"],
+                        require_alignment=True,
+                        debug_trace=True,
+                        fixed_order_num=fixed_rank,
+                        expected_detection_count=len(standing_indices),
+                        max_selected_dx_jump=alignment["selected_max_dx_jump"],
+                        target_index=target_index,
+                    )
+                    diagnosis = getattr(
+                        my_car,
+                        "last_detection_alignment_status",
+                        {"reason": "alignment_timeout"},
+                    )
+                    if cls_id is not None and label == "animal":
+                        before_detections = wait_for_standing_snapshot(
+                            standing_indices
+                        )
+                        if before_detections is not None:
+                            shooting_event(
+                                "ALIGNMENT_DONE",
+                                target_index=target_index,
+                                attempt=alignment_attempt,
+                                stage="alignment",
+                                ordered_dx=detection_dx(before_detections),
+                            )
+                            break
+                        alignment_failure = "association_timeout"
+                    else:
+                        alignment_failure = diagnosis.get(
+                            "reason", "alignment_timeout"
+                        )
+                    shooting_event(
+                        "ALIGNMENT_FAILED",
+                        target_index=target_index,
+                        attempt=alignment_attempt,
+                        stage="alignment",
+                        reason=alignment_failure,
+                        extra=diagnosis,
+                    )
+
+                if before_detections is None:
+                    target_failure_reason = (
+                        alignment_failure or "alignment_timeout"
+                    )
+                    break
+
+                shots_by_target[target_index] += 1
+                shot_attempt = shots_by_target[target_index]
+                shot_error = None
+                try:
+                    my_car.beep()
+                    my_car.shooting()
+                    shooting_event(
+                        "SHOT_FIRED",
+                        target_index=target_index,
+                        attempt=shot_attempt,
+                        stage="shooting",
+                    )
+                except Exception as exc:
+                    shot_error = f"{type(exc).__name__}:{exc}"
+                    shooting_event(
+                        "SHOT_COMMAND_ERROR",
+                        target_index=target_index,
+                        attempt=shot_attempt,
+                        stage="shooting",
+                        reason="shot_command_error",
+                        extra={"error": shot_error},
+                    )
+
+                time.sleep(shot_confirmation["post_shot_settle_seconds"])
+                verification = verify_knockdown(
+                    target_index,
+                    standing_indices,
+                    before_detections,
+                )
+                if verification == "knocked_down":
+                    standing_indices.remove(target_index)
+                    target_slots[target_index]["status"] = "shot"
+                    successful_indices.append(target_index)
+                    target_succeeded = True
+                    shooting_event(
+                        "KNOCKDOWN_CONFIRMED",
+                        target_index=target_index,
+                        attempt=shot_attempt,
+                        stage="verification",
+                        mapping={"standing": list(standing_indices)},
+                    )
+                    break
+                if verification == "verification_ambiguous":
+                    target_failure_reason = "verification_ambiguous"
+                    break
+
+                shooting_event(
+                    "KNOCKDOWN_NOT_CONFIRMED",
+                    target_index=target_index,
+                    attempt=shot_attempt,
+                    stage="verification",
+                    reason=(
+                        "shot_command_error"
+                        if shot_error is not None
+                        else "target_still_standing"
+                    ),
+                )
+
+            if not target_succeeded:
+                if target_failure_reason is None:
+                    target_failure_reason = "max_shots_exhausted"
+                    shooting_event(
+                        "SHOT_LIMIT_REACHED",
+                        target_index=target_index,
+                        attempt=shots_by_target[target_index],
+                        stage="shooting",
+                        reason=target_failure_reason,
+                    )
+                target_slots[target_index]["status"] = "failed"
+                failed_targets.append({
+                    "target_index": target_index,
+                    "reason": target_failure_reason,
+                    "shots": shots_by_target[target_index],
+                })
+                shooting_event(
+                    "TARGET_FAILED",
+                    target_index=target_index,
+                    attempt=shots_by_target[target_index],
+                    stage="target",
+                    reason=target_failure_reason,
+                )
+            else:
+                shooting_event(
+                    "TARGET_SUCCESS",
+                    target_index=target_index,
+                    attempt=shots_by_target[target_index],
+                    stage="target",
+                )
+
+    remaining_course_distance = max(
+        0.0,
+        targets["course_distance"] - traveled_plan_distance,
+    )
+    if remaining_course_distance > 0:
+        my_car.lane_dis_offset(
+            speed=targets["lane_speed"],
+            dis_hold=remaining_course_distance,
+        )
+    shooting_event(
+        "TASK_SUMMARY",
+        stage="summary",
+        extra={
+            "planned": [item["target_index"] for item in shot_plan],
+            "success": successful_indices,
+            "failed": failed_targets,
+            "skipped": skipped_indices,
+            "shots_by_target": shots_by_target,
+        },
+    )
     if debug:
         my_car.move_to_position(debug_return["position"])
 

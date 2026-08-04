@@ -1626,6 +1626,10 @@ class MyCar(MecanumDriver):
         target_x_direction=None,
         require_alignment=False,
         debug_trace=False,
+        fixed_order_num=None,
+        expected_detection_count=None,
+        max_selected_dx_jump=None,
+        target_index=None,
     ):
         """
         前往目标位置
@@ -1640,6 +1644,13 @@ class MyCar(MecanumDriver):
         next_trace_time = 0.0
         x_count = CountRecord(3)
         y_count = CountRecord(3)
+        self.last_detection_alignment_status = {
+            "ok": False,
+            "reason": "alignment_started",
+            "target_index": target_index,
+            "fixed_order_num": fixed_order_num,
+            "expected_detection_count": expected_detection_count,
+        }
 
         # pid_x.output_limits((-0.7, 0.7))
 
@@ -1670,6 +1681,29 @@ class MyCar(MecanumDriver):
                 "检测目标横向接近方向必须是 increasing、decreasing 或 None: "
                 f"target_x_direction={target_x_direction!r}"
             )
+        if fixed_order_num is not None:
+            fixed_order_num = int(fixed_order_num)
+            if fixed_order_num < 0:
+                raise ValueError(
+                    "固定靶位候选序号不能小于 0: "
+                    f"fixed_order_num={fixed_order_num}"
+                )
+            if target_x_direction is None:
+                raise ValueError("固定靶位选择必须提供 target_x_direction")
+        if expected_detection_count is not None:
+            expected_detection_count = int(expected_detection_count)
+            if expected_detection_count <= 0:
+                raise ValueError(
+                    "固定靶位预期检测数量必须大于 0: "
+                    f"expected_detection_count={expected_detection_count}"
+                )
+        if max_selected_dx_jump is not None:
+            max_selected_dx_jump = float(max_selected_dx_jump)
+            if max_selected_dx_jump <= 0:
+                raise ValueError(
+                    "固定靶位相邻帧跳变阈值必须大于 0: "
+                    f"max_selected_dx_jump={max_selected_dx_jump}"
+                )
         logger.info(
             f"视觉对齐 dx 校准 task={delta_x:.6f}, "
             f"camera_offset_m={self.side_camera_center_offset_x_m:.6f}, "
@@ -1680,16 +1714,26 @@ class MyCar(MecanumDriver):
                 "[TARGET_ALIGNMENT_BEGIN] "
                 f"target_dx={calibrated_delta_x:.3f} "
                 f"task_dx={delta_x:.3f} label={label} "
+                f"target_index={target_index} fixed_order_num={fixed_order_num} "
+                f"expected_count={expected_detection_count} "
                 f"direction={target_x_direction} "
                 f"overshoot_tolerance={max_delta_x_error}",
                 flush=True,
             )
         pid_x = PID(kp_x, ki_x)
         pid_x.setpoint = calibrated_delta_x
+        last_selected_dx = None
+        last_selection_rejection = None
+        ever_selected = False
         while True:
             if self._stop_flag:
                 self.set_velocity(0, 0, 0)
                 self.arm.x_speed(0)
+                self.last_detection_alignment_status = {
+                    "ok": False,
+                    "reason": "stop_requested",
+                    "target_index": target_index,
+                }
                 return -1, "None"
 
             dets = self.get_detection_results(sort_pos=sort_pos)
@@ -1697,7 +1741,66 @@ class MyCar(MecanumDriver):
             if label is not None:
                 dets = [item for item in dets if item[2] == label]
             raw_candidate_dx = [round(item[4], 3) for item in dets]
-            if max_delta_x_error is not None:
+            selection_rejection = None
+            selection_num = num
+            if fixed_order_num is not None:
+                # 固定靶位模式不再删除靠边候选后滚动重编号。所有仍站立靶
+                # 始终按车辆行进方向保持同一顺序，再按会话保存的 rank 取靶。
+                if target_x_direction == "increasing":
+                    dets.sort(key=lambda item: item[4], reverse=True)
+                else:
+                    dets.sort(key=lambda item: item[4])
+                selection_num = fixed_order_num
+                if (
+                    expected_detection_count is not None
+                    and len(dets) != expected_detection_count
+                ):
+                    selection_rejection = (
+                        "candidate_count_mismatch:"
+                        f"actual={len(dets)},expected={expected_detection_count}"
+                    )
+                elif len(dets) <= selection_num:
+                    selection_rejection = (
+                        "fixed_order_rank_missing:"
+                        f"rank={selection_num},actual={len(dets)}"
+                    )
+                else:
+                    fixed_det = dets[selection_num]
+                    fixed_dx = fixed_det[4]
+                    if (
+                        max_delta_x_error is not None
+                        and target_x_direction == "increasing"
+                        and fixed_dx > calibrated_delta_x + max_delta_x_error
+                    ):
+                        selection_rejection = (
+                            "selected_target_overshot:"
+                            f"dx={fixed_dx:.3f}"
+                        )
+                    elif (
+                        max_delta_x_error is not None
+                        and target_x_direction == "decreasing"
+                        and fixed_dx < calibrated_delta_x - max_delta_x_error
+                    ):
+                        selection_rejection = (
+                            "selected_target_overshot:"
+                            f"dx={fixed_dx:.3f}"
+                        )
+                    elif (
+                        last_selected_dx is not None
+                        and max_selected_dx_jump is not None
+                        and abs(fixed_dx - last_selected_dx)
+                        > max_selected_dx_jump
+                    ):
+                        selection_rejection = (
+                            "selected_target_dx_jump:"
+                            f"previous={last_selected_dx:.3f},current={fixed_dx:.3f}"
+                        )
+                    else:
+                        last_selected_dx = fixed_dx
+                if selection_rejection is not None:
+                    last_selection_rejection = selection_rejection
+                    dets = []
+            elif max_delta_x_error is not None:
                 if target_x_direction == "increasing":
                     # 射击任务前进时，当前靶从图像左侧向目标 dx 接近。
                     # 只排除已经越过目标太多的旧靶；不能对尚未接近目标的
@@ -1729,9 +1832,10 @@ class MyCar(MecanumDriver):
             selected_det = None
             flag_x = False
             flag_y = delta_y is None
-            if len(dets) > num:
-                det = dets[num]
+            if len(dets) > selection_num:
+                det = dets[selection_num]
                 selected_det = det
+                ever_selected = True
                 dx, dy = det[4:6]
                 # print(f"dx:{dx} dy:{dy}")
                 out_x = -pid_x(dx)  # type: ignore
@@ -1787,10 +1891,19 @@ class MyCar(MecanumDriver):
                             f"selected_dx={dx:.3f} "
                             f"target_dx={calibrated_delta_x:.3f} "
                             f"error={dx - calibrated_delta_x:+.3f} "
+                            f"target_index={target_index} "
                             f"cls_id={det[0]} label={det[2]}",
                             flush=True,
                         )
                     # Orin 2026-07-21 现场副本也已恢复达标后立即返回。
+                    self.last_detection_alignment_status = {
+                        "ok": True,
+                        "reason": "aligned",
+                        "target_index": target_index,
+                        "fixed_order_num": fixed_order_num,
+                        "selected_dx": dx,
+                        "target_dx": calibrated_delta_x,
+                    }
                     return det[0], det[2]
             else:
                 x_count(False)
@@ -1813,7 +1926,10 @@ class MyCar(MecanumDriver):
                     f"ordered_dx={[round(item[4], 3) for item in dets]} "
                     f"selected_dx={selected_dx} target_dx={calibrated_delta_x:.3f} "
                     f"error={selected_error} out_x={out_x:+.3f} "
-                    f"x_reached={flag_x} direction={target_x_direction}",
+                    f"x_reached={flag_x} direction={target_x_direction} "
+                    f"target_index={target_index} fixed_order_num={fixed_order_num} "
+                    f"expected_count={expected_detection_count} "
+                    f"rejection={selection_rejection}",
                     flush=True,
                 )
                 next_trace_time = trace_now + trace_interval
@@ -1828,12 +1944,34 @@ class MyCar(MecanumDriver):
                 # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
 
                 if require_alignment:
+                    if (
+                        last_selection_rejection is not None
+                        and last_selection_rejection.startswith(
+                            "selected_target_dx_jump"
+                        )
+                    ):
+                        timeout_reason = "association_ambiguous"
+                    elif ever_selected:
+                        timeout_reason = "alignment_timeout"
+                    else:
+                        timeout_reason = "association_timeout"
+                    self.last_detection_alignment_status = {
+                        "ok": False,
+                        "reason": timeout_reason,
+                        "target_index": target_index,
+                        "fixed_order_num": fixed_order_num,
+                        "expected_detection_count": expected_detection_count,
+                        "selection_rejection": last_selection_rejection,
+                        "raw_dx": raw_candidate_dx,
+                    }
                     if debug_trace:
                         print(
                             "[TARGET_ALIGNMENT_TIMEOUT] "
                             f"raw_dx={raw_candidate_dx} "
                             f"ordered_dx={[round(item[4], 3) for item in dets]} "
-                            f"target_dx={calibrated_delta_x:.3f}",
+                            f"target_dx={calibrated_delta_x:.3f} "
+                            f"target_index={target_index} "
+                            f"rejection={last_selection_rejection}",
                             flush=True,
                         )
                     return (None, None)
