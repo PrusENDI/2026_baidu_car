@@ -1767,25 +1767,10 @@ class MyCar(MecanumDriver):
                 else:
                     fixed_det = dets[selection_num]
                     fixed_dx = fixed_det[4]
+                    # 固定 rank 已经提供了目标身份，不能再沿用滚动选靶模式的
+                    # 单侧 overshoot 过滤。目标即使位于校准点另一侧，也应让
+                    # PID 双向修正到 target dx，而不是停车等待到超时。
                     if (
-                        max_delta_x_error is not None
-                        and target_x_direction == "increasing"
-                        and fixed_dx > calibrated_delta_x + max_delta_x_error
-                    ):
-                        selection_rejection = (
-                            "selected_target_overshot:"
-                            f"dx={fixed_dx:.3f}"
-                        )
-                    elif (
-                        max_delta_x_error is not None
-                        and target_x_direction == "decreasing"
-                        and fixed_dx < calibrated_delta_x - max_delta_x_error
-                    ):
-                        selection_rejection = (
-                            "selected_target_overshot:"
-                            f"dx={fixed_dx:.3f}"
-                        )
-                    elif (
                         last_selected_dx is not None
                         and max_selected_dx_jump is not None
                         and abs(fixed_dx - last_selected_dx)
