@@ -344,7 +344,7 @@ TARGET_SHOOTING_DETECTION_POSES = {
 }
 
 
-def target_shooting_detection(debug=True) -> list:
+def target_shooting_detection(debug=False) -> list:
 
     # None 表示未获得可信识别结果，不能默认当作有害动物执行射击。
     scan_pose = TARGET_SHOOTING_DETECTION_POSES["initial_search"]
@@ -409,7 +409,7 @@ def target_shooting_detection(debug=True) -> list:
     return target_order_animal_list
 
 
-def water_tower_task(debug=True):
+def water_tower_task(debug=False):
     """
     水塔灌溉任务。
 
@@ -926,8 +926,8 @@ TARGET_SHOOTING_POSES = {
 
 
 def target_shooting(
-    animal_list=[0, 0, 0, 0],
-    debug=True,
+    animal_list=[1, 1, 1, 0],
+    debug=False,
     shooting_delta_x=None,
 ):  # noqa: E741
     # 防止上一次中途结束的射击任务把固定靶号显示状态带入本次校准。

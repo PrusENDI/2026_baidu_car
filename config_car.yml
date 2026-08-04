@@ -130,6 +130,23 @@ location_pid:
 #
 # ============================================================
 
+# 推理后端模式：
+#   worktree     - 使用本工作树 infer_cfg，并在需要时自动启动本地后端。
+#   external_7_17 - 只连接已由用户启动的 7_17 后端；OCR 改为本进程本地推理。
+# 环境变量 SMARTCAR_INFER_BACKEND 可临时覆盖 mode，无需改动此文件。
+infer_backend:
+  mode: worktree
+  external_7_17:
+    connect_timeout: 15.0
+    request_timeout: 15.0
+    services:
+      - name: lane
+        port: 5001
+        img_size: [128, 128]
+      - name: task
+        port: 5002
+        img_size: Null
+
 infer_cfg:
   - name: lane
     infer_type: LaneInfer
