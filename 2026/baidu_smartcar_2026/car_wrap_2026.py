@@ -516,8 +516,15 @@ class MyCar(MecanumDriver):
         # self.front_det = ClintInterface('front')
         # 任务识别
         self.task_det = ClintInterface("task")
-        # ocr识别
-        self.ocr_rec = ClintInterface("ocr")
+        # 7_17 后端只提供 lane/task/goods，没有 OCR 服务；外部兼容模式
+        # 使用与 7_17 代码相同的本地 OCR，工作树模式仍使用 5004 后端。
+        if self.task_det.backend_mode == "external_7_17":
+            from smartcar.paddlebaidu import OCRReco
+
+            self.ocr_rec = OCRReco()
+            logger.info("外部 7_17 后端模式：OCR 使用本进程本地模型")
+        else:
+            self.ocr_rec = ClintInterface("ocr")
         # 识别为None
         self.last_det = None
 
@@ -1674,6 +1681,27 @@ class MyCar(MecanumDriver):
         """把侧摄像头物理中心偏移换算并叠加到任务 dx 目标。"""
         return task_delta_x - side_center_offset_x_m / view_width_m
 
+    @staticmethod
+    def _detection_y_control_with_chassis_handoff(
+        out_y,
+        arm_x_position,
+        arm_x_bounds=None,
+    ):
+        """机械臂到达水平边界时，将继续越界的视觉修正交给底盘横移。"""
+        # 调用方可以为具体任务提供更保守的机械臂行程；没有专用配置时，
+        # 使用 7_17 现场版本的默认安全范围 0.01～0.24 m。
+        x_min, x_max = (
+            (0.01, 0.24) if arm_x_bounds is None else arm_x_bounds
+        )
+
+        # 只接管继续向边界外运动的控制量。若控制方向指向安全区内部，
+        # 仍由机械臂执行，避免底盘产生不必要的横向位移。
+        lower_bound_blocked = arm_x_position <= x_min and out_y < 0
+        upper_bound_blocked = arm_x_position >= x_max and out_y > 0
+        if lower_bound_blocked or upper_bound_blocked:
+            return 0.0, -out_y
+        return out_y, 0.0
+
     def move_to_detection_target(
         self,
         delta_x=0.0,
@@ -1720,6 +1748,7 @@ class MyCar(MecanumDriver):
 
         out_x = 0
         out_y = 0
+        out_chassis_y = 0
         # print(f"手柄方向：{self.arm.side}")
         if self.arm.side == "RIGHT":
             kp_y = -0.2
@@ -1894,18 +1923,18 @@ class MyCar(MecanumDriver):
                 out_x = -pid_x(dx)  # type: ignore
                 if delta_y is None:
                     out_y = 0
+                    out_chassis_y = 0
                 else:
                     out_y = kp_y * (dy - delta_y)
-
-                # 仅当调用方显式提供 arm_x_bounds 时限制机械臂水平修正；
-                # 默认 None 保持所有其他任务的原始视觉控制行为不变。
-                if arm_x_bounds is not None:
-                    x_min, x_max = arm_x_bounds
-                    x_now = self.arm.x_get_position()
-                    if x_now <= x_min and out_y < 0:
-                        out_y = 0
-                    elif x_now >= x_max and out_y > 0:
-                        out_y = 0
+                    # 机械臂 X 轴仍有安全行程时继续由机械臂修正；到达边界且
+                    # 控制量要求继续越界时，按照 7_17 逻辑由底盘横移接管。
+                    out_y, out_chassis_y = (
+                        self._detection_y_control_with_chassis_handoff(
+                            out_y,
+                            self.arm.x_get_position(),
+                            arm_x_bounds,
+                        )
+                    )
 
                 # 修改前直接判断 abs(dx)/abs(dy)，隐含目标永远是 0；
                 # 第一轮播种使用 delta_x=-0.1、delta_y=-0.05，已经达到
@@ -1926,6 +1955,7 @@ class MyCar(MecanumDriver):
                     out_x = 0
                 if flag_y:
                     out_y = 0
+                    out_chassis_y = 0
                 if flag_x and flag_y:
                     # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
                     self.set_velocity(0, 0, 0)
@@ -1964,6 +1994,7 @@ class MyCar(MecanumDriver):
                 y_count(False)
                 out_x = 0
                 out_y = 0
+                out_chassis_y = 0
             trace_now = time.monotonic()
             if debug_trace and trace_now >= next_trace_time:
                 selected_dx = (
@@ -1988,7 +2019,7 @@ class MyCar(MecanumDriver):
                     flush=True,
                 )
                 next_trace_time = trace_now + trace_interval
-            self.set_velocity(out_x, 0, 0)
+            self.set_velocity(out_x, out_chassis_y, 0)
             self.arm.x_speed(out_y)
             time.sleep(0.05)
 
