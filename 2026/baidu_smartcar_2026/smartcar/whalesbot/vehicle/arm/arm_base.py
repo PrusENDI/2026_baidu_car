@@ -1867,13 +1867,12 @@ class ArmController:
                     f"x={x}, y={y}, arm={arm}, hand={hand}"
                 )
                 return False
-        # time.sleep(0.2)
+        if hand is not None:
+            self.set_hand_angle(hand)
+            time.sleep(1)
         if arm is not None:
             if not self.set_arm_angle(arm):
                 return False
-            time.sleep(1)
-        if hand is not None:
-            self.set_hand_angle(hand)
         return True
 
     # ==================== Orin 2026-07-17 便捷属性接口 ====================
