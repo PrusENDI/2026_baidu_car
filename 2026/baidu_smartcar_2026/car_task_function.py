@@ -398,7 +398,15 @@ def target_shooting_detection(debug=True) -> list:
     my_car.get_distance(True)
     if debug:
         my_car.move_to_position(debug_return["position"])
-    return animal_list
+    # 车辆扫描记录方向与射击靶位 0->3 的固定顺序相反；在任务边界统一
+    # 反转一次，避免射击阶段再猜测识别结果属于哪个物理靶位。
+    target_order_animal_list = list(reversed(animal_list))
+    print(
+        "[TARGET_SHOOTING_DETECTION] event=ORDER_MAPPED "
+        f"scan_order={animal_list} target_order={target_order_animal_list}",
+        flush=True,
+    )
+    return target_order_animal_list
 
 
 def water_tower_task(debug=True):
@@ -859,7 +867,7 @@ TARGET_SHOOTING_POSES = {
     },
     # 方向稳定后再移动 X/Y 轴到射击搜索位置。
     "initial_linear": {
-        "x": 0.20,
+        "x": 0.24,
         "y": 0.02,
     },
     # 从射击任务起点直接巡线到物理第 0 靶附近。修改前先巡线到
@@ -887,9 +895,11 @@ TARGET_SHOOTING_POSES = {
         # 只作为越过校准点后的容差，不限制尚在左侧等待校准的当前靶。
         "max_delta_x_error": 0.20,
         "target_x_direction": "increasing",
-        # 物理靶位 0->3 在侧摄像头画面中按 dx 从小到大排列。
+        # 射击靶位恢复原有编号：物理靶位 0->3 在侧摄像头画面中
+        # 按 dx 从大到小排列。识别扫描结果在 target_shooting_detection()
+        # 返回前反转，以匹配这里的固定射击顺序。
         # 该顺序独立于车辆对齐时目标 dx 的变化方向，禁止混用。
-        "target_order_direction": "ascending",
+        "target_order_direction": "descending",
         # 射击任务固定靶位关联：首次四靶连续三帧稳定后锁定 0-3，
         # 对齐期间拒绝把单帧漏检后的相邻靶补成当前靶。
         "calibration_stable_frames": 3,
