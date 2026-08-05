@@ -10,20 +10,26 @@ SERVICE_PORTS = (5001, 5002, 5005)
 
 
 def probe_service(port, timeout_ms=1000):
-    context = zmq.Context()
-    socket = context.socket(zmq.REQ)
-    socket.setsockopt(zmq.LINGER, 0)
-    socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-    socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    socket.connect(f"tcp://127.0.0.1:{port}")
+    if timeout_ms <= 0:
+        raise ValueError("timeout_ms must be positive")
+    context = None
+    socket = None
     try:
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        socket.connect(f"tcp://127.0.0.1:{port}")
         socket.send(b"ATATA")
         return json.loads(socket.recv().decode("utf-8")) is True
     except (zmq.ZMQError, UnicodeDecodeError, json.JSONDecodeError):
         return False
     finally:
-        socket.close(0)
-        context.term()
+        if socket is not None:
+            socket.close(0)
+        if context is not None:
+            context.term()
 
 
 def all_services_ready(probe=probe_service, timeout_ms=1000):

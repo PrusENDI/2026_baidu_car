@@ -1,10 +1,10 @@
 [Unit]
 Description=Baidu Smart Car key-start supervisor
-After=multi-user.target
 
 [Service]
 Type=simple
 User=jetson
+Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/home/jetson/workspaces/baidu_smart_2026_7_17
 ExecStart=/bin/bash /home/jetson/workspaces/baidu_smart_2026_7_17/scripts/start_with_key.sh
 Restart=always

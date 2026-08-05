@@ -38,6 +38,16 @@ backend_watchdog() {
     done
 }
 
+wait_for_backend_ready() {
+    while true; do
+        if "${PYTHON_BIN}" "${PROBE_PATH}" --wait; then
+            return 0
+        fi
+        log "inference readiness probe failed; retrying"
+        sleep "${RESTART_DELAY}"
+    done
+}
+
 cleanup() {
     trap - INT TERM EXIT
     if [[ -n "${MAIN_PID}" ]]; then
@@ -50,13 +60,23 @@ cleanup() {
     fi
 }
 
+handle_term() {
+    exit 143
+}
+
+handle_int() {
+    exit 130
+}
+
 exec 9>"${LOCK_PATH}"
 if ! flock -n 9; then
     log "another key-start supervisor is already running"
     exit 1
 fi
 
-trap cleanup INT TERM EXIT
+trap cleanup EXIT
+trap handle_term TERM
+trap handle_int INT
 cd "${PROJECT_ROOT}"
 
 backend_watchdog &
@@ -65,7 +85,7 @@ WATCHDOG_PID=$!
 while true; do
     log "waiting for inference backend readiness"
     "${PYTHON_BIN}" "${KEY_WAITER_PATH}" --show-loading || true
-    "${PYTHON_BIN}" "${PROBE_PATH}" --wait
+    wait_for_backend_ready
 
     log "waiting for MC602 port 5 key value 12"
     "${PYTHON_BIN}" "${KEY_WAITER_PATH}"
@@ -77,7 +97,7 @@ while true; do
     fi
 
     log "start event received; rechecking inference backend"
-    "${PYTHON_BIN}" "${PROBE_PATH}" --wait
+    wait_for_backend_ready
 
     log "starting full task program"
     "${PYTHON_BIN}" "${MAIN_PATH}" &

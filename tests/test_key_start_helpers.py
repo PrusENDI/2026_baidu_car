@@ -33,6 +33,24 @@ class RecordingDisplay:
 
 
 class KeyStartHelpersTest(unittest.TestCase):
+    def test_supervisor_fails_closed_and_exits_on_signals(self):
+        script = (ROOT / "scripts" / "start_with_key.sh").read_text(encoding="utf-8")
+
+        self.assertIn("wait_for_backend_ready()", script)
+        self.assertGreaterEqual(script.count("wait_for_backend_ready"), 3)
+        self.assertIn("trap cleanup EXIT", script)
+        self.assertIn("trap handle_term TERM", script)
+        self.assertIn("trap handle_int INT", script)
+
+    def test_systemd_unit_has_no_target_ordering_cycle(self):
+        unit = (
+            ROOT / "systemd" / "baidu-smart-key-start.service"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("After=multi-user.target", unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+        self.assertIn("Environment=PYTHONUNBUFFERED=1", unit)
+
     def test_listener_adds_project_root_to_import_path(self):
         module = load_script("wait_for_start_key.py")
         search_path = []
