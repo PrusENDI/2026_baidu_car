@@ -1,0 +1,18 @@
+[Unit]
+Description=Baidu Smart Car key-start supervisor
+After=multi-user.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/workspaces/baidu_smart_2026_7_17
+ExecStart=/bin/bash /home/jetson/workspaces/baidu_smart_2026_7_17/scripts/start_with_key.sh
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
