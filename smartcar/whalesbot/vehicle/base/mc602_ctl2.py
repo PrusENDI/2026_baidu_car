@@ -543,8 +543,9 @@ class ServoBus_2(DevCmdInterface):
         self.set_time_out(1)
     
     def set_angle(self, angle, speed=100):
-        # 设置相关参数。
-        self.act_mode(1, speed, angle, mode=2)
+        # 只接受本次舵机命令对应的新响应，避免沿用上一条命令的缓存结果。
+        self.last_data = None
+        return self.act_mode(1, speed, angle, mode=2)
 
     def set_speed(self, speed):
         # 设置相关参数。

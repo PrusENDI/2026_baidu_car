@@ -35,6 +35,8 @@ from ..base.controller_wrap import AnalogInput2
 
 POSITION_ERROR_THRESHOLD = 1e-3 # 位置误差阈值
 STOP_CHECK_THRESHOLD = 1e-4 # 停止检查阈值
+ARM_SERVO_COMMAND_RETRIES = 3
+ARM_SERVO_COMMAND_RETRY_DELAY = 0.5
 
 
 def get_path_relative(*args):
@@ -627,14 +629,53 @@ class ArmController:
             angle: 目标角度，可以是字符串（"LEFT", "MID", "RIGHT"）或数字
             speed: 速度
         """
-        # 设置相关参数。
-        _angle = angle
-        if isinstance(_angle, str):
-            self.side = _angle
-            assert _angle in ("LEFT", "MID", "RIGHT"), "Direction should be LEFT, MID, or RIGHT"
-            _angle = self.hand_angle_list[_angle]
-        self._arm_angle_last = _angle
-        self.arm_servo.set_angle(_angle, speed)
+        requested_angle = angle
+        target_side = angle if isinstance(angle, str) else None
+        resolved_angle = angle
+        if isinstance(resolved_angle, str):
+            assert resolved_angle in ("LEFT", "MID", "RIGHT"), "Direction should be LEFT, MID, or RIGHT"
+            resolved_angle = self.hand_angle_list[resolved_angle]
+
+        response_received = False
+        last_response = None
+        for attempt in range(1, ARM_SERVO_COMMAND_RETRIES + 1):
+            result = self.arm_servo.set_angle(resolved_angle, speed)
+            if result is not None:
+                response_received = True
+                last_response = result
+                logger.info(
+                    f"机械臂翻转指令已获新响应 requested={requested_angle}, "
+                    f"resolved={resolved_angle}, speed={speed}, "
+                    f"attempt={attempt}/{ARM_SERVO_COMMAND_RETRIES}, "
+                    f"response={result!r}"
+                )
+            else:
+                logger.warning(
+                    f"机械臂翻转指令无新响应 requested={requested_angle}, "
+                    f"resolved={resolved_angle}, speed={speed}, "
+                    f"attempt={attempt}/{ARM_SERVO_COMMAND_RETRIES}"
+                )
+            if attempt < ARM_SERVO_COMMAND_RETRIES:
+                time.sleep(ARM_SERVO_COMMAND_RETRY_DELAY)
+
+        if response_received:
+            if target_side is not None:
+                self.side = target_side
+            self._arm_angle_last = resolved_angle
+            logger.info(
+                f"机械臂翻转重复发送完成 requested={requested_angle}, "
+                f"resolved={resolved_angle}, speed={speed}, "
+                f"attempts={ARM_SERVO_COMMAND_RETRIES}, "
+                f"last_response={last_response!r}"
+            )
+            return True
+
+        logger.error(
+            f"机械臂翻转指令连续无新响应 requested={requested_angle}, "
+            f"resolved={resolved_angle}, speed={speed}, "
+            f"attempts={ARM_SERVO_COMMAND_RETRIES}"
+        )
+        return False
 
     def set_hand_angle(self, angle: Union[str, int] = "UP", speed=80):
         """

@@ -355,6 +355,9 @@ class MyCar(MecanumDriver):
         self.display = ScreenShow()
 
         self.streamer = Streamer()
+        # 射击任务可临时启用固定物理靶号显示。整个配置作为一个对象替换，
+        # 避免取帧时读到“编号已更新但方向尚未更新”的中间状态。
+        self._shooting_target_display = None
         self.arm = ArmController()
 
         # 获取自己文件所在的目录路径
@@ -362,6 +365,9 @@ class MyCar(MecanumDriver):
         self.yaml_path = os.path.join(self.path_dir, "config_car.yml")
         # 获取配置
         cfg = get_yaml(self.yaml_path)
+        self.side_camera_center_offset_x_m = float(
+            cfg.get("camera_calibration", {}).get("side_center_offset_x_m", 0.0)
+        )
         # 根据配置设置sensor
         self.sensor_init(cfg)
 
@@ -416,7 +422,7 @@ class MyCar(MecanumDriver):
         self.servo_1 = ServoPwm(1, 180)
         self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
         self.blue_pad = BluetoothPad()
-        self.shoot = PoutD(4)
+        self.shoot = PoutD(10)
 
     def set_storage(self, state=False):
         """
@@ -1281,7 +1287,9 @@ class MyCar(MecanumDriver):
                         else:
                             text_out = text
 
-    def get_ocr(self, label=None, time_out=3.0, full_frame=False):
+    def get_ocr(
+        self, label=None, time_out=3.0, full_frame=False, rotation_angle=0
+    ):
         """
         进行OCR识别
 
@@ -1305,10 +1313,8 @@ class MyCar(MecanumDriver):
             if time.time() > time_stop:
                 return None
 
-            img = getattr(self, "side_image", None)
-            if img is None or img.size == 0:
-                time.sleep(0.05)
-                continue
+            dets = self.get_detection_results(rotation_angle=rotation_angle)
+            img = self.side_image
             if full_frame:
                 try:
                     text = self.ocr_rec(img.copy())
@@ -1328,7 +1334,6 @@ class MyCar(MecanumDriver):
                     text_out = text
                 continue
 
-            dets = self.get_detection_results()
             if len(dets) > 0:
                 for det in dets:
                     det_cls_id, det_id, det_label, det_score, det_bbox = (
@@ -1434,7 +1439,60 @@ class MyCar(MecanumDriver):
         # 获取相关数据。
         return self.action_bot.get_res_json(text)
 
-    def draw_detection_results(self, img, dets_ret):
+    def set_shooting_target_display(self, target_indices, order_direction):
+        """让侧摄像头按车辆行进方向显示固定的射击靶位编号。"""
+        if order_direction not in ("ascending", "descending"):
+            raise ValueError(
+                "射击靶位显示顺序必须是 ascending 或 descending: "
+                f"order_direction={order_direction!r}"
+            )
+        target_indices = tuple(int(index) for index in target_indices)
+        if len(set(target_indices)) != len(target_indices):
+            raise ValueError(
+                f"射击靶位显示编号不能重复: target_indices={target_indices}"
+            )
+        self._shooting_target_display = {
+            "target_indices": target_indices,
+            "order_direction": order_direction,
+        }
+        print(
+            "[TARGET_DISPLAY] event=UPDATED "
+            f"target_indices={list(target_indices)} "
+            f"order_direction={order_direction}",
+            flush=True,
+        )
+
+    def clear_shooting_target_display(self):
+        """恢复侧摄像头原有的逐帧临时检测序号。"""
+        if self._shooting_target_display is not None:
+            print("[TARGET_DISPLAY] event=CLEARED", flush=True)
+        self._shooting_target_display = None
+
+    def _shooting_detection_display_ids(self, dets_ret):
+        """生成与检测框一一对应的固定靶号；无法安全关联时返回 T?。"""
+        display_state = self._shooting_target_display
+        if display_state is None:
+            return None
+
+        animal_positions = [
+            index for index, det in enumerate(dets_ret) if det[2] == "animal"
+        ]
+        display_ids = [None] * len(dets_ret)
+        target_indices = display_state["target_indices"]
+        if len(animal_positions) != len(target_indices):
+            for position in animal_positions:
+                display_ids[position] = "T?"
+            return display_ids
+
+        animal_positions.sort(
+            key=lambda position: dets_ret[position][4],
+            reverse=display_state["order_direction"] == "descending",
+        )
+        for position, target_index in zip(animal_positions, target_indices):
+            display_ids[position] = f"T{target_index}"
+        return display_ids
+
+    def draw_detection_results(self, img, dets_ret, display_ids=None):
         """
         将检测结果绘制在图像上
 
@@ -1475,7 +1533,12 @@ class MyCar(MecanumDriver):
             cv2.rectangle(img_show, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
             # 绘制标签
-            label_text = f"{index}-{det_label}:{det_score:.2f}"
+            display_id = (
+                display_ids[index]
+                if display_ids is not None and display_ids[index] is not None
+                else str(index)
+            )
+            label_text = f"{display_id}-{det_label}:{det_score:.2f}"
             cv2.putText(
                 img_show,
                 label_text,
@@ -1489,7 +1552,12 @@ class MyCar(MecanumDriver):
         return img_show
 
     def get_detection_results(
-        self, sort_pos=(0, 0), limit_x=1, limit_y=1, detector=None
+        self,
+        sort_pos=(0, 0),
+        limit_x=1,
+        limit_y=1,
+        detector=None,
+        rotation_angle=0,
     ) -> List[list]:
         """
         获取检测结果,使用任务的目标检测对侧边摄像头图像进行检测，返回检测结果。
@@ -1498,7 +1566,14 @@ class MyCar(MecanumDriver):
             list: - 检测结果列表，每个元素包含 [cls_id, det_id, label, score, x_c, y_c, w, h]
         """
         # 获取相关数据。
-        self.side_image = self.cap_side.read()
+        image = self.cap_side.read()
+        if rotation_angle != 0:
+            height, width = image.shape[:2]
+            rotation_matrix = cv2.getRotationMatrix2D(
+                (width / 2, height / 2), rotation_angle, 1.0
+            )
+            image = cv2.warpAffine(image, rotation_matrix, (width, height))
+        self.side_image = image
         image = self.side_image.copy()
         infer = self.task_det if detector is None else detector
         det_task = infer(image)
@@ -1508,7 +1583,8 @@ class MyCar(MecanumDriver):
         det_task.sort(
             key=lambda x: (x[4] - sort_pos[0]) ** 2 + (x[5] - sort_pos[1]) ** 2
         )  # 按照距离由近及远排序
-        image = self.draw_detection_results(image, det_task)
+        display_ids = self._shooting_detection_display_ids(det_task)
+        image = self.draw_detection_results(image, det_task, display_ids)
         self.streamer.update_frame(image, "cam2")
         # print(det_task)
         return det_task
@@ -1591,6 +1667,34 @@ class MyCar(MecanumDriver):
 
         return loc_x, loc_y
 
+    @staticmethod
+    def _alignment_axis_reached(value, target, tolerance):
+        """判断视觉偏移是否达到指定目标，而不是默认要求偏移为零。"""
+        return abs(value - target) < tolerance
+
+    @staticmethod
+    def _camera_calibrated_delta_x(
+        task_delta_x, side_center_offset_x_m, view_width_m=0.33
+    ):
+        """把侧摄像头物理中心偏移换算并叠加到任务 dx 目标。"""
+        return task_delta_x - side_center_offset_x_m / view_width_m
+
+    @staticmethod
+    def _detection_y_control_with_chassis_handoff(
+        out_y,
+        arm_x_position,
+        arm_x_bounds=None,
+    ):
+        """机械臂到达水平边界时，将继续越界的视觉修正交给底盘横移。"""
+        x_min, x_max = (
+            (0.01, 0.24) if arm_x_bounds is None else arm_x_bounds
+        )
+        lower_bound_blocked = arm_x_position <= x_min and out_y < 0
+        upper_bound_blocked = arm_x_position >= x_max and out_y > 0
+        if lower_bound_blocked or upper_bound_blocked:
+            return 0.0, -out_y
+        return out_y, 0.0
+
     def move_to_detection_target(
         self,
         delta_x=0.0,
@@ -1600,6 +1704,17 @@ class MyCar(MecanumDriver):
         sort_pos=(0, 0),
         num=0,
         detector=None,
+        rotation_angle=0,
+        arm_x_bounds=None,
+        max_delta_x_error=None,
+        target_x_direction=None,
+        require_alignment=False,
+        debug_trace=False,
+        fixed_order_num=None,
+        fixed_order_direction=None,
+        expected_detection_count=None,
+        max_selected_dx_jump=None,
+        target_index=None,
     ):
         """
         前往目标位置
@@ -1609,81 +1724,263 @@ class MyCar(MecanumDriver):
             time_out: 设置超时时间
             包含目标检测信息的列表，格式为 [cls_id, obj_id,label, score, x_c, y_c, w, h]
         """
-        # 控制运动到目标状态。
         time_stop = time.time() + time_out
-        x_count = CountRecord(10)
-        y_count = CountRecord(10)
-
-        # pid_x.output_limits((-0.7, 0.7))
+        trace_interval = 0.25
+        next_trace_time = 0.0
+        advanced_alignment = any((
+            arm_x_bounds is not None,
+            max_delta_x_error is not None,
+            target_x_direction is not None,
+            require_alignment,
+            debug_trace,
+            fixed_order_num is not None,
+            fixed_order_direction is not None,
+            expected_detection_count is not None,
+            max_selected_dx_jump is not None,
+            target_index is not None,
+        ))
+        stable_frame_count = 3 if advanced_alignment else 10
+        x_count = CountRecord(stable_frame_count)
+        y_count = CountRecord(stable_frame_count)
+        self.last_detection_alignment_status = {
+            "ok": False,
+            "reason": "alignment_started",
+            "target_index": target_index,
+            "fixed_order_num": fixed_order_num,
+            "fixed_order_direction": fixed_order_direction,
+            "expected_detection_count": expected_detection_count,
+        }
 
         out_x = 0
         out_y = 0
         out_chassis_y = 0
-
-        # print(f"手柄方向：{self.arm.side}")
         if self.arm.side == "RIGHT":
-            kp_y = -0.15
-            kp_x = -0.20
-            ki_x = -0.02
+            kp_y = -0.2 if advanced_alignment else -0.15
+            kp_x = -0.25 if advanced_alignment else -0.20
+            ki_x = -0.05 if advanced_alignment else -0.02
         else:
-            kp_y = 0.15
-            kp_x = 0.20
-            ki_x = 0.02
+            kp_y = 0.2 if advanced_alignment else 0.15
+            kp_x = 0.25 if advanced_alignment else 0.20
+            ki_x = 0.05 if advanced_alignment else 0.02
 
+        calibrated_delta_x = (
+            None
+            if delta_x is None
+            else self._camera_calibrated_delta_x(
+                delta_x,
+                self.side_camera_center_offset_x_m if advanced_alignment else 0.0,
+            )
+        )
+        if max_delta_x_error is not None:
+            max_delta_x_error = float(max_delta_x_error)
+            if max_delta_x_error <= 0:
+                raise ValueError(
+                    "检测目标横向关联范围必须大于 0: "
+                    f"max_delta_x_error={max_delta_x_error}"
+                )
+        if target_x_direction not in (None, "increasing", "decreasing"):
+            raise ValueError(
+                "检测目标横向接近方向必须是 increasing、decreasing 或 None: "
+                f"target_x_direction={target_x_direction!r}"
+            )
+        if fixed_order_num is not None:
+            fixed_order_num = int(fixed_order_num)
+            if fixed_order_num < 0:
+                raise ValueError(f"固定靶位候选序号不能小于 0: fixed_order_num={fixed_order_num}")
+            if fixed_order_direction not in ("ascending", "descending"):
+                raise ValueError(
+                    "固定靶位物理顺序必须是 ascending 或 descending: "
+                    f"fixed_order_direction={fixed_order_direction!r}"
+                )
+        if expected_detection_count is not None:
+            expected_detection_count = int(expected_detection_count)
+            if expected_detection_count <= 0:
+                raise ValueError(
+                    "固定靶位预期检测数量必须大于 0: "
+                    f"expected_detection_count={expected_detection_count}"
+                )
+        if max_selected_dx_jump is not None:
+            max_selected_dx_jump = float(max_selected_dx_jump)
+            if max_selected_dx_jump <= 0:
+                raise ValueError(
+                    "固定靶位相邻帧跳变阈值必须大于 0: "
+                    f"max_selected_dx_jump={max_selected_dx_jump}"
+                )
+        if calibrated_delta_x is not None:
+            logger.info(
+                f"视觉对齐 dx 校准 task={delta_x:.6f}, "
+                f"camera_offset_m={self.side_camera_center_offset_x_m:.6f}, "
+                f"effective={calibrated_delta_x:.6f}"
+            )
+        if debug_trace:
+            print(
+                "[TARGET_ALIGNMENT_BEGIN] "
+                f"target_dx={calibrated_delta_x} task_dx={delta_x} label={label} "
+                f"target_index={target_index} fixed_order_num={fixed_order_num} "
+                f"fixed_order_direction={fixed_order_direction} "
+                f"expected_count={expected_detection_count} direction={target_x_direction} "
+                f"overshoot_tolerance={max_delta_x_error}",
+                flush=True,
+            )
         pid_x = PID(kp_x, ki_x)
-        if delta_x is not None:
-            pid_x.setpoint = delta_x
+        if calibrated_delta_x is not None:
+            pid_x.setpoint = calibrated_delta_x
+        last_selected_dx = None
+        last_selection_rejection = None
+        ever_selected = False
+        raw_candidate_dx = []
+        dets = []
         while True:
             if self._stop_flag:
                 self.set_velocity(0, 0, 0)
                 self.arm.x_speed(0)
+                self.last_detection_alignment_status = {
+                    "ok": False, "reason": "stop_requested", "target_index": target_index
+                }
                 return -1, "None"
 
-            dets = self.get_detection_results(sort_pos=sort_pos, detector=detector)
-
+            dets = self.get_detection_results(
+                sort_pos=sort_pos,
+                detector=detector,
+                rotation_angle=rotation_angle,
+            )
             if label is not None:
                 dets = [item for item in dets if item[2] == label]
+            raw_candidate_dx = [round(item[4], 3) for item in dets]
+            selection_rejection = None
+            selection_num = num
 
-            if len(dets) > num:
-                det = dets[num]
-                dx, dy = det[4:6]
-                # print(f"dx:{dx} dy:{dy}")
-                if delta_x is None:
-                    out_x = 0
+            if fixed_order_num is not None:
+                dets.sort(
+                    key=lambda item: item[4],
+                    reverse=fixed_order_direction == "descending",
+                )
+                selection_num = fixed_order_num
+                if expected_detection_count is not None and len(dets) != expected_detection_count:
+                    selection_rejection = (
+                        f"candidate_count_mismatch:actual={len(dets)},"
+                        f"expected={expected_detection_count}"
+                    )
+                elif len(dets) <= selection_num:
+                    selection_rejection = (
+                        f"fixed_order_rank_missing:rank={selection_num},actual={len(dets)}"
+                    )
                 else:
-                    out_x = -pid_x(dx)  # type: ignore
-                out_chassis_y = 0
+                    fixed_dx = dets[selection_num][4]
+                    if (
+                        last_selected_dx is not None
+                        and max_selected_dx_jump is not None
+                        and abs(fixed_dx - last_selected_dx) > max_selected_dx_jump
+                    ):
+                        selection_rejection = (
+                            f"selected_target_dx_jump:previous={last_selected_dx:.3f},"
+                            f"current={fixed_dx:.3f}"
+                        )
+                    else:
+                        last_selected_dx = fixed_dx
+                if selection_rejection is not None:
+                    last_selection_rejection = selection_rejection
+                    dets = []
+            elif max_delta_x_error is not None and calibrated_delta_x is not None:
+                if target_x_direction == "increasing":
+                    dets = [
+                        item for item in dets
+                        if item[4] <= calibrated_delta_x + max_delta_x_error
+                    ]
+                    dets.sort(key=lambda item: item[4], reverse=True)
+                elif target_x_direction == "decreasing":
+                    dets = [
+                        item for item in dets
+                        if item[4] >= calibrated_delta_x - max_delta_x_error
+                    ]
+                    dets.sort(key=lambda item: item[4])
+                else:
+                    dets = [
+                        item for item in dets
+                        if abs(item[4] - calibrated_delta_x) <= max_delta_x_error
+                    ]
+
+            selected_det = None
+            flag_x = False
+            flag_y = delta_y is None
+            if len(dets) > selection_num:
+                det = dets[selection_num]
+                selected_det = det
+                ever_selected = True
+                dx, dy = det[4:6]
+                out_x = 0 if calibrated_delta_x is None else -pid_x(dx)
                 if delta_y is None:
                     out_y = 0
+                    out_chassis_y = 0
                 else:
                     out_y = kp_y * (dy - delta_y)
-                    if self.arm.x_get_position() <= 0.01 or self.arm.x_get_position() >= 0.24:
+                    arm_x_position = self.arm.x_get_position()
+                    if advanced_alignment:
+                        out_y, out_chassis_y = self._detection_y_control_with_chassis_handoff(
+                            out_y, arm_x_position, arm_x_bounds
+                        )
+                    elif arm_x_position <= 0.01 or arm_x_position >= 0.24:
                         out_chassis_y = -out_y
                         out_y = 0
+                    else:
+                        out_chassis_y = 0
 
-                if delta_x is None:
-                    flag_x = True
-                else:
-                    flag_x = x_count(abs(dx - delta_x) < 0.001)
-                if delta_y is None:
-                    flag_y = True
-                else:
-                    flag_y = y_count(abs(dy - delta_y) < 0.001)
-
+                x_tolerance = 0.04 if advanced_alignment else 0.001
+                y_tolerance = 0.02 if advanced_alignment else 0.001
+                flag_x = calibrated_delta_x is None or x_count(
+                    self._alignment_axis_reached(
+                        dx, calibrated_delta_x, x_tolerance
+                    )
+                )
+                flag_y = delta_y is None or y_count(
+                    self._alignment_axis_reached(dy, delta_y, y_tolerance)
+                )
                 if flag_x:
                     out_x = 0
                 if flag_y:
                     out_y = 0
+                    out_chassis_y = 0
                 if flag_x and flag_y:
-                    # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
                     self.set_velocity(0, 0, 0)
                     self.arm.x_speed(0)
-                    return det[0],det[2]
+                    self.last_detection_alignment_status = {
+                        "ok": True,
+                        "reason": "aligned",
+                        "target_index": target_index,
+                        "fixed_order_num": fixed_order_num,
+                        "fixed_order_direction": fixed_order_direction,
+                        "selected_dx": dx,
+                        "target_dx": calibrated_delta_x,
+                    }
+                    if debug_trace:
+                        print(
+                            "[TARGET_ALIGNMENT_DONE] "
+                            f"selected_dx={dx:.3f} target_dx={calibrated_delta_x} "
+                            f"target_index={target_index} cls_id={det[0]} label={det[2]}",
+                            flush=True,
+                        )
+                    return det[0], det[2]
             else:
                 x_count(False)
                 y_count(False)
                 out_x = 0
+                out_y = 0
                 out_chassis_y = 0
+
+            trace_now = time.monotonic()
+            if debug_trace and trace_now >= next_trace_time:
+                print(
+                    "[TARGET_ALIGNMENT] "
+                    f"raw_dx={raw_candidate_dx} "
+                    f"ordered_dx={[round(item[4], 3) for item in dets]} "
+                    f"selected_dx={selected_det[4] if selected_det is not None else None} "
+                    f"target_dx={calibrated_delta_x} out_x={out_x:+.3f} "
+                    f"x_reached={flag_x} target_index={target_index} "
+                    f"rejection={selection_rejection}",
+                    flush=True,
+                )
+                next_trace_time = trace_now + trace_interval
+
             self.set_velocity(out_x, out_chassis_y, 0)
             self.arm.x_speed(out_y)
             time.sleep(0.05)
@@ -1692,7 +1989,38 @@ class MyCar(MecanumDriver):
                 self.set_velocity(0, 0, 0)
                 self.arm.x_speed(0)
                 logger.error("对齐目标超时")
-                return (None, None)
+                if require_alignment:
+                    if (
+                        last_selection_rejection is not None
+                        and last_selection_rejection.startswith("selected_target_dx_jump")
+                    ):
+                        timeout_reason = "association_ambiguous"
+                    elif ever_selected:
+                        timeout_reason = "alignment_timeout"
+                    else:
+                        timeout_reason = "association_timeout"
+                    self.last_detection_alignment_status = {
+                        "ok": False,
+                        "reason": timeout_reason,
+                        "target_index": target_index,
+                        "fixed_order_num": fixed_order_num,
+                        "fixed_order_direction": fixed_order_direction,
+                        "expected_detection_count": expected_detection_count,
+                        "selection_rejection": last_selection_rejection,
+                        "raw_dx": raw_candidate_dx,
+                    }
+                    if debug_trace:
+                        print(
+                            "[TARGET_ALIGNMENT_TIMEOUT] "
+                            f"raw_dx={raw_candidate_dx} target_dx={calibrated_delta_x} "
+                            f"target_index={target_index} rejection={last_selection_rejection}",
+                            flush=True,
+                        )
+                    return (None, None)
+                try:
+                    return det[0], det[2]
+                except (IndexError, UnboundLocalError):
+                    return (None, None)
 
     def adjust_arm_position(self, dis=0.06):
         # print(f"arm side:{self.arm.side}")
