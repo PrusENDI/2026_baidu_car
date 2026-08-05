@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 import argparse
+from pathlib import Path
+import sys
 import time
 
 
 START_KEY_VALUE = 12
 START_KEY_PORT = 5
+
+
+def add_project_root_to_import_path(search_path=None):
+    if search_path is None:
+        search_path = sys.path
+    project_root = str(Path(__file__).resolve().parents[1])
+    if project_root not in search_path:
+        search_path.insert(0, project_root)
+    return project_root
 
 
 def wait_for_start(key, display, sleep=time.sleep, poll_interval=0.1):
@@ -28,6 +39,7 @@ def parse_args():
 
 
 def main():
+    add_project_root_to_import_path()
     from smartcar.whalesbot.vehicle import Key4Btn, ScreenShow
 
     args = parse_args()

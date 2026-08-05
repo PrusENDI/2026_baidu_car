@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 
 
-ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_script(name):
@@ -33,6 +33,15 @@ class RecordingDisplay:
 
 
 class KeyStartHelpersTest(unittest.TestCase):
+    def test_listener_adds_project_root_to_import_path(self):
+        module = load_script("wait_for_start_key.py")
+        search_path = []
+
+        project_root = module.add_project_root_to_import_path(search_path=search_path)
+
+        self.assertEqual(Path(project_root), ROOT)
+        self.assertEqual(search_path, [project_root])
+
     def test_wait_for_start_ignores_other_keys_and_starts_once(self):
         module = load_script("wait_for_start_key.py")
         key = SequenceKey([0, 4, 8, 12, 12])
