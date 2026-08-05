@@ -75,17 +75,17 @@ class SerialWrap(serial.Serial):
         self.timeout = 0.1
         
     def get_anwser(self, cmd:bytes, time_out=0.1)->bytes:
-        # 串行化一次完整的发送和接收，并把调用方设置的超时传给控制器。
+        # 获取相关数据。
         self.lock.acquire()
+        res = None
         try:
             self.reset_buffer()
             self.dev.send_cmd(self, cmd)
-            return self.dev.get_anwser(self, time_out)
+            res = self.dev.get_anwser(self)
         except Exception as e:
             logger.error("get_anwser error:{}".format(e))
-            return None
-        finally:
-            self.lock.release()
+        self.lock.release()
+        return res
 
     def set_bps(self, bps):
         # 设置相关参数。
@@ -246,50 +246,26 @@ class MC602(CotrollerInfo):
         # res = serial_obj.read(2)
         # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
         # 获取相关数据。
-        try:
-            receive_timeout = float(time_out)
-        except (TypeError, ValueError):
+        time_start = time.time()
+        dst_len = 0
+        res = serial_obj.read(3)
+        if len(res) != 3:
             return None
-        if receive_timeout <= 0:
-            return None
-
-        deadline = time.monotonic() + receive_timeout
-        original_timeout = serial_obj.timeout
-
-        def read_exact(size):
-            data = b''
-            while len(data) < size:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+        # 总帧长
+        dst_len = res[2]
+        # 获取剩余数据
+        res = res + serial_obj.read(dst_len-3)
+        while True:
+            if time.time() - time_start > time_out:
+                return None
+            # data = res[3:-1]
+            # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
+            if len(res) == dst_len:
+                if res[0] == self.header[0] and res[-1] == self.tail[0]:
+                    return res[3:-1]
+                else:
                     return None
-                # pyserial 的 timeout 也必须受同一个截止时间约束，避免一次
-                # 阻塞 read() 越过上层 MC602 事务的时间预算。
-                serial_obj.timeout = (
-                    remaining if original_timeout is None
-                    else min(original_timeout, remaining)
-                )
-                chunk = serial_obj.read(size - len(data))
-                if not chunk:
-                    return None
-                data += chunk
-            return data
-
-        try:
-            header = read_exact(3)
-            if header is None or header[0] != self.header[0]:
-                return None
-            dst_len = header[2]
-            if dst_len < 4:
-                return None
-            remainder = read_exact(dst_len - 3)
-            if remainder is None:
-                return None
-            res = header + remainder
-            if res[-1] != self.tail[0]:
-                return None
-            return res[3:-1]
-        finally:
-            serial_obj.timeout = original_timeout
+            res = res + serial_obj.read(dst_len - len(res))
 
     
     def ping_rx(self, serial_obj:SerialWrap, time_out=0.05):

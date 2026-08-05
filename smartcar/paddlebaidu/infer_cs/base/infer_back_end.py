@@ -10,14 +10,58 @@ from threading import Thread
 import time
 import os
 import sys
+
+# #region debug-point A-E:startup-timing
+import urllib.request
+
+def _debug_report(hypothesis_id, location, msg, data=None):
+    try:
+        meminfo = {}
+        with open("/proc/meminfo", encoding="utf-8") as mem_file:
+            for line in mem_file:
+                key, value = line.split(":", 1)
+                meminfo[key] = int(value.strip().split()[0])
+        payload = {
+            "sessionId": "dual-model-startup",
+            "runId": "post-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": "[DEBUG] " + msg,
+            "data": {
+                **(data or {}),
+                "pid": os.getpid(),
+                "rssKb": int(open(f"/proc/{os.getpid()}/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // 1024,
+                "memAvailableKb": meminfo.get("MemAvailable"),
+                "swapFreeKb": meminfo.get("SwapFree"),
+            },
+            "ts": int(time.time() * 1000),
+        }
+        urllib.request.urlopen(
+            urllib.request.Request(
+                "http://127.0.0.1:7777/event",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.2,
+        ).read()
+    except Exception:
+        pass
+# #endregion
+
 # 添加上两层目录
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 # 添加项目根目录到Python路径
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")))
 
 # 导入infer_front中的函数
+# #region debug-point D:module-import
+_debug_report("D", "infer_back_end.py:imports", "import infer_front started")
 from smartcar.paddlebaidu.infer_cs.base.infer_front import get_yaml, get_path_relative
+_debug_report("D", "infer_back_end.py:imports", "import infer_front finished")
+_debug_report("D", "infer_back_end.py:imports", "import paddle_jetson started")
 from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco
+_debug_report("D", "infer_back_end.py:imports", "import paddle_jetson finished")
+# #endregion
 # from smartcar.whalesbot.tools.tools_class import get_yaml
 
 class InferServer:
@@ -25,6 +69,8 @@ class InferServer:
         # 导入推理客户端的配置
         # configs = ClintInterface.configs
         configs = get_yaml('config_car.yml')['infer_cfg']
+        startup_started = time.perf_counter()
+        _debug_report("E", "infer_back_end.py:InferServer", "backend initialization started", {"services": [conf["name"] for conf in configs]})
         
         self.flag_infer_initok = False
     
@@ -62,6 +108,8 @@ class InferServer:
         self.infer_dict = {}
 
         for conf in configs:
+            model_started = time.perf_counter()
+            _debug_report("A", "infer_back_end.py:model-create", "model creation started", {"name": conf["name"], "modelDir": conf.get("model_dir"), "inferType": conf["infer_type"]})
             InferType = InferFactory[conf['infer_type']]
             if InferType == OCRReco :
                 if 'det_model_dir'in conf and 'rec_model_dir'  in conf:
@@ -74,6 +122,7 @@ class InferServer:
                 else:
                     infer = InferType(run_mode= conf['run_mode'])
             self.infer_dict[conf['name']] = infer
+            _debug_report("A", "infer_back_end.py:model-create", "model creation finished", {"name": conf["name"], "elapsedMs": round((time.perf_counter() - model_started) * 1000, 2)})
 
         # 创建推理模型
         # self.lane_infer = LaneInfer()
@@ -88,11 +137,15 @@ class InferServer:
         # 预加载推理几张图片，刚开始推理时速度慢，会有卡顿
         for i in range(3):
             for conf in configs:
+                warmup_started = time.perf_counter()
+                _debug_report("B", "infer_back_end.py:warmup", "warmup started", {"name": conf["name"], "round": i + 1})
                 infer_tmp = self.infer_dict[conf['name']]
                 infer_tmp(img)
+                _debug_report("B", "infer_back_end.py:warmup", "warmup finished", {"name": conf["name"], "round": i + 1, "elapsedMs": round((time.perf_counter() - warmup_started) * 1000, 2)})
         print("infer init ok")
 
         self.flag_infer_initok = True
+        _debug_report("C", "infer_back_end.py:InferServer", "backend initialization finished", {"elapsedMs": round((time.perf_counter() - startup_started) * 1000, 2)})
 
 
     def get_server(self, port):
@@ -143,7 +196,11 @@ class InferServer:
 
 def main():
     print("infer_back_end.py 程序开始运行")
-    infer_back = InferServer()
+    try:
+        infer_back = InferServer()
+    except Exception as exc:
+        _debug_report("D", "infer_back_end.py:main", "backend initialization failed", {"errorType": type(exc).__name__, "error": str(exc)})
+        raise
 
     while True:
         try:

@@ -5,7 +5,6 @@
 # Ignore
 **/dataset/
 **/test.py
-logs/orin-status/
 
 
 

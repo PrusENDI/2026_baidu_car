@@ -22,6 +22,59 @@ import time
 import sys
 
 
+class _Offset:
+    """偏移量对象，支持 += 操作"""
+    def __init__(self, driver, axis: str, unit: str = 'mm'):
+        # 初始化对象状态。
+        self._driver = driver
+        self._axis = axis
+        self._unit = unit
+
+    def __iadd__(self, delta):
+        # 执行该方法的核心功能。
+        self._driver.offset_by(self._make_offset(delta))
+        return self
+
+    def __isub__(self, delta):
+        # 执行该方法的核心功能。
+        self._driver.offset_by(self._make_offset(-delta))
+        return self
+
+    def _make_offset(self, delta):
+        # 执行该方法的核心功能。
+        return [delta, 0, 0] if self._axis == 'x' else ([0, delta, 0] if self._axis == 'y' else [0, 0, delta])
+
+
+class _OffsetGroup:
+    """偏移量组，管理 x/y/z 三个轴的偏移"""
+    def __init__(self, driver):
+        # 使用对象属性存储，避免被覆盖
+        # 初始化对象状态。
+        self._x = _Offset(driver, 'x')
+        self._y = _Offset(driver, 'y')
+        self._z = _Offset(driver, 'z')
+
+    def __getattr__(self, name):
+        # 获取相关数据。
+        if name == 'x':
+            return self._x
+        if name == 'y':
+            return self._y
+        if name == 'z':
+            return self._z
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+    def __setattr__(self, name, value):
+        # 设置相关参数。
+        if name in ('_x', '_y', '_z', '_driver'):
+            super().__setattr__(name, value)
+        elif isinstance(value, _Offset):
+            # 允许 +=/-= 操作返回的 _Offset 对象重新赋值
+            super().__setattr__(name, value)
+        else:
+            raise AttributeError(f"'{type(self).__name__}' does not allow direct assignment to '{name}' - use += or -= instead")
+
+
 # 导入自定义log模块
 from ...tools.log_wrap import logger
 from ..base.controller_wrap import WheelWrap
@@ -258,6 +311,11 @@ class MecanumDriver:
     Mecanum轮底盘驱动类
 
     整合Mecanum轮底盘的控制功能，包括速度设置、位姿控制、里程计更新等
+
+    用法示例:
+        my_car.offset.x += 100  # 相对移动x方向100mm
+        my_car.offset.y -= 50   # 相对移动y方向-50mm
+        my_car.offset.z += 90  # 相对旋转90度
     """
 
     def __init__(self, config_file=None):
@@ -295,7 +353,8 @@ class MecanumDriver:
         # 初始化线程锁，确保线程安全
         self._lock = threading.Lock()
 
-        # 初始化里程计更新线程
+        # 初始化偏移量接口
+        self.offset = _OffsetGroup(self)
         self._stop_thread = False
         self.odometry_thread = threading.Thread(target=self.update_odometry_thread)
         self.odometry_thread.daemon = True  # 守护线程，程序结束时自动退出
@@ -493,8 +552,6 @@ class MecanumDriver:
         self,
         target_position,
         duration=None,
-        # 同步自 Orin 2026-07-23 现场版本：默认定位降速并收紧到位容差；
-        # 不改变显式传入 duration/max_velocities/tolerance 时的原有行为。
         max_velocities=(0.1, 0.1, math.pi / 6),
         tolerance=(0.002, 0.002, 0.01),
         timeout=30.0,  # 添加超时参数
@@ -535,7 +592,11 @@ class MecanumDriver:
         iteration_count = 0
         max_iterations = 1000  # 最大迭代次数
 
+        reached_target = False
         while True:
+            if getattr(self, "_stop_flag", False):
+                self.set_velocity(0, 0, 0)
+                return False
             # 检查超时
             if time.time() - start_time > timeout:
                 break
@@ -554,6 +615,7 @@ class MecanumDriver:
             if error_within_threshold.all():
                 consecutive_within_threshold += 1
                 if consecutive_within_threshold > 20:
+                    reached_target = True
                     break
             else:
                 consecutive_within_threshold = 0
@@ -569,6 +631,7 @@ class MecanumDriver:
             self.set_velocity(*velocity_output)
             time.sleep(0.01)  # 添加小延迟，避免CPU占用过高
         self.set_velocity(0, 0, 0)
+        return reached_target
 
     def move_for(
         self,
@@ -606,7 +669,48 @@ class MecanumDriver:
             + position_offset[0] * math.sin(current_position[2])
         )
         target_position[2] = current_position[2] + position_offset[2]
-        self.move_to_position(target_position, duration, max_velocities, tolerance)
+        return self.move_to_position(target_position, duration, max_velocities, tolerance)
+
+    def offset_by(self, position_offset, duration=None, max_velocities=None, tolerance=None):
+        """
+        相对移动指定偏移量（单位：x/y为mm，z为度）
+
+        参数:
+            position_offset: 相对位置偏移量 [x偏移(mm), y偏移(mm), 角度偏移(度)]
+            duration: 预计运动时长（秒）
+            max_velocities: 速度上限 [x轴速度, y轴速度, 角速度]
+            tolerance: 位置误差阈值 [x误差, y误差, 角度误差]
+        """
+        # 执行该方法的核心功能。
+        offset = [
+            position_offset[0] / 1000.0,
+            position_offset[1] / 1000.0,
+            math.radians(position_offset[2]),
+        ]
+        self.move_for(offset, duration, max_velocities, tolerance)
+
+    # ==================== 便捷属性接口 ====================
+    @property
+    def x(self) -> float:
+        """获取当前x位置（单位：mm）"""
+        # 执行该方法的核心功能。
+        with self._lock:
+            return self.chassis.odometry.position[0] * 1000.0
+
+    def move_x(self, mm: float):
+        """相对移动x（单位：mm）"""
+        # 控制运动到目标状态。
+        self.offset_by([mm, 0, 0])
+
+    def move_y(self, mm: float):
+        """相对移动y（单位：mm）"""
+        # 控制运动到目标状态。
+        self.offset_by([0, mm, 0])
+
+    def move_z(self, degrees: float):
+        """相对旋转角度（单位：度）"""
+        # 控制运动到目标状态。
+        self.offset_by([0, 0, degrees])
 
 
 if __name__ == "__main__":

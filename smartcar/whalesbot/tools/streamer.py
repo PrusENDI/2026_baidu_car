@@ -437,7 +437,7 @@ class Streamer:
     def update_frame(self, image, cam_id="cam1"):
         """更新指定摄像头的视频帧"""
         # 更新内部状态。
-        if image is None:
+        if image is None or image.size == 0:
             return
         with self.frame_lock:
             self.frames[cam_id] = image.copy()

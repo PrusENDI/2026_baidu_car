@@ -32,88 +32,10 @@ import math
 """
 
 
-class _ArmCompatibilityAdapter:
-    """让 7_17 任务安全使用工作树 ArmController 的返回值和异常语义。"""
-
-    def __init__(self, arm):
-        object.__setattr__(self, "_arm", arm)
-
-    def __getattr__(self, name):
-        return getattr(self._arm, name)
-
-    def __setattr__(self, name, value):
-        if name == "_arm":
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self._arm, name, value)
-
-    @staticmethod
-    def _require_success(result, action):
-        if result is False:
-            raise RuntimeError(f"机械臂动作失败，停止当前任务: {action}")
-        return result
-
-    def reset_position(self, *args, **kwargs):
-        return self._require_success(
-            self._arm.reset_position(*args, **kwargs),
-            f"reset_position args={args!r}, kwargs={kwargs!r}",
-        )
-
-    def move_x_position(self, *args, **kwargs):
-        return self._require_success(
-            self._arm.move_x_position(*args, **kwargs),
-            f"move_x_position args={args!r}, kwargs={kwargs!r}",
-        )
-
-    def move_y_position(self, *args, **kwargs):
-        return self._require_success(
-            self._arm.move_y_position(*args, **kwargs),
-            f"move_y_position args={args!r}, kwargs={kwargs!r}",
-        )
-
-    def goto_position(self, *args, **kwargs):
-        return self._require_success(
-            self._arm.goto_position(*args, **kwargs),
-            f"goto_position args={args!r}, kwargs={kwargs!r}",
-        )
-
-    def set_arm_angle(self, *args, **kwargs):
-        return self._require_success(
-            self._arm.set_arm_angle(*args, **kwargs),
-            f"set_arm_angle args={args!r}, kwargs={kwargs!r}",
-        )
-
-    def set_arm_pose(self, x=None, y=None, arm=None, hand=None):
-        """保持 7_17 的直线轴 -> arm -> hand 顺序，并检查每步结果。"""
-        if x is not None or y is not None:
-            self.goto_position(x=x, y=y)
-        if arm is not None:
-            self.set_arm_angle(arm)
-            time.sleep(1)
-        if hand is not None:
-            self._arm.set_hand_angle(hand)
-        return True
-
-
-def _install_arm_compatibility(car):
-    car.arm = _ArmCompatibilityAdapter(car.arm)
-    original_adjust_arm_position = car.adjust_arm_position
-
-    def checked_adjust_arm_position(*args, **kwargs):
-        result = original_adjust_arm_position(*args, **kwargs)
-        return _ArmCompatibilityAdapter._require_success(
-            result,
-            f"adjust_arm_position args={args!r}, kwargs={kwargs!r}",
-        )
-
-    car.adjust_arm_position = checked_adjust_arm_position
-
-
 def init():
     time.sleep(1)
     global my_car
     my_car = MyCar()
-    _install_arm_compatibility(my_car)
     my_car.STOP_PARAM = False
     my_car.beep()
     time.sleep(1)
@@ -238,110 +160,33 @@ def auto_seeding():
     my_car.get_distance(True)
 
 
-# 动物识别阶段使用的机械臂姿态、巡线距离和扫描参数集中放在这里。
-# 后续现场标定时只需要调整本字典，不必进入任务函数查找分散的常量。
-TARGET_SHOOTING_DETECTION_POSES = {
-    # 侧摄像头搜索动物标签时的机械臂姿态。
-    "initial_search": {
-        "arm": "LEFT",
-        "hand": "UP",
-        "x": 0.05,
-        "y": 0.05,
-    },
-    # 从当前任务起点进入动物识别区域的巡线参数。
-    "task_entry": {
-        "speed": 0.30,
-        "debug_distance": 0.40,
-        "run_distance": 1.45,
-    },
-    # 进入识别区域后只修正车辆航向，保持当前平面位置不变。
-    "heading_correction": {
-        "offset_xy": [0.0, 0.0],
-    },
-    # 四个动物标签按固定间距排列；入口位置直接对应第一个扫描点。
-    "animal_scan": {
-        "count": 4,
-        "speed": 0.30,
-        "step_distance": 0.15,
-    },
-    # delta_y=None 表示识别时不驱动机械臂 X 轴跟随纵向偏差。
-    "alignment": {
-        "delta_y": None,
-    },
-    # 独立调试完成后返回的局部里程计原点。
-    "debug_return": {
-        "position": [0.0, 0.0, 0.0],
-    },
-}
+def target_shooting_detection() -> list:
 
+    animal_list = [0, 0, 0, 0]
+    my_car.arm.set_arm_pose(x=0.05, y=0.05, arm="LEFT", hand="UP")
+    my_car.lane_dis_offset(speed=0.3, dis_hold=1.45)
 
-def target_shooting_detection(debug=False) -> list:
-    """依次识别四个动物标签，并按物理射击靶位顺序返回识别结果。"""
-    scan_pose = TARGET_SHOOTING_DETECTION_POSES["initial_search"]
-    task_entry = TARGET_SHOOTING_DETECTION_POSES["task_entry"]
-    heading_correction = TARGET_SHOOTING_DETECTION_POSES["heading_correction"]
-    animal_scan = TARGET_SHOOTING_DETECTION_POSES["animal_scan"]
-    alignment = TARGET_SHOOTING_DETECTION_POSES["alignment"]
-    debug_return = TARGET_SHOOTING_DETECTION_POSES["debug_return"]
-
-    # None 表示本靶位没有获得可信结果。不能把识别失败默认当作有害动物，
-    # 否则后续射击任务可能在没有可靠判断时执行射击。
-    animal_list = [None] * animal_scan["count"]
-
-    # 先摆好侧摄像头搜索姿态，再根据调试模式选择进入任务区的距离。
-    my_car.arm.set_arm_pose(**scan_pose)
-    task_distance = (
-        task_entry["debug_distance"]
-        if debug
-        else task_entry["run_distance"]
-    )
-    my_car.lane_dis_offset(
-        speed=task_entry["speed"],
-        dis_hold=task_distance,
-    )
-
-    # 读取当前航向角并做反向补偿，使后续扫描沿靶位排列方向直行。
     _x, _y, _z = my_car.get_odometry(True)
     my_car.get_distance(True)
-    my_car.move_for([
-        heading_correction["offset_xy"][0],
-        heading_correction["offset_xy"][1],
-        -_z,
-    ])
+    my_car.move_for([0, 0, 0 - _z])
     time.sleep(3)
 
-    # 第一个动物位于任务入口，不再额外前移；从第二个动物开始，
-    # 每次按固定间距巡线到下一个扫描位置后再执行视觉对齐和分析。
-    for i in range(animal_scan["count"]):
-        if i > 0:
-            my_car.lane_dis_offset(
-                speed=animal_scan["speed"],
-                dis_hold=animal_scan["step_distance"],
-            )
+    for i in range(4):
+        my_car.lane_dis_offset(speed=0.3, dis_hold=0.15)
         time.sleep(0.5)
-        cls_id, label = my_car.move_to_detection_target(
-            delta_y=alignment["delta_y"]
-        )
+        cls_id, label = my_car.move_to_detection_target(delta_y=None)
         if label == "animal":
             res, analysis = my_car.animal_image_analysis()
             if res is not None:
                 my_car.beep()
+                print(f"第{i}个动物分析结果：{res}，{analysis}")
                 animal_list[i] = res
-
-    # 扫描结束后用双蜂鸣提示任务完成，并保留里程计和测距读取动作。
     time.sleep(0.5)
     my_car.beep()
     my_car.beep()
     my_car.get_odometry(True)
     my_car.get_distance(True)
-    if debug:
-        my_car.move_to_position(debug_return["position"])
-
-    # 扫描行进方向与物理射击靶位 0 -> 3 的顺序相反，因此只在任务边界
-    # 统一反转一次；射击函数接收到的列表始终按物理靶位编号排列。
-    target_order_animal_list = list(reversed(animal_list))
-    print(f"动物识别最终结果：{target_order_animal_list}")
-    return target_order_animal_list
+    return animal_list
 
 
 def water_tower_task(debug=True):
@@ -535,395 +380,48 @@ def water_tower_task(debug=True):
 
 
 
-# 动物射击阶段使用的机械臂姿态、靶位间距、视觉关联和击倒确认参数。
-# 参数集中管理可以避免射击流程中出现难以追踪的现场标定常量。
-TARGET_SHOOTING_POSES = {
-    # 机械臂先完成方向和末端姿态切换，再移动直线轴，保持安全动作顺序。
-    "initial_orientation": {
-        "arm": "LEFT",
-        "hand": "UP",
-    },
-    "initial_linear": {
-        "x": 0.24,
-        "y": 0.02,
-    },
-    # 入口距离已经包含旧流程中的后退补偿，并使车辆接近物理第 0 靶。
-    "task_entry": {
-        "speed": 0.30,
-        "debug_distance": 0.34,
-        "run_distance": 2.64,
-    },
-    # 四个靶位等间距排列，course_distance 是从第 0 靶到第 3 靶的总距离。
-    "targets": {
-        "count": 4,
-        "step_distance": 0.16,
-        "course_distance": 0.48,
-        "lane_speed": 0.30,
-    },
-    "alignment": {
-        # 侧摄像头画面中用于射击的目标横向位置。
-        "delta_x": 0.36,
-        "delta_y": None,
-        "sort_y": 0.0,
-        # 对齐期间限制目标框横向跳变，防止漏检后误选相邻靶位。
-        "max_delta_x_error": 0.20,
-        "target_x_direction": "increasing",
-        # 物理靶位 0 -> 3 在画面中按 dx 从大到小排列。
-        "target_order_direction": "descending",
-        # 首次进入射击区时要求四靶连续多帧稳定，随后锁定固定编号。
-        "calibration_stable_frames": 3,
-        "calibration_timeout": 15.0,
-        "calibration_frame_interval": 0.10,
-        "calibration_max_dx_shift": 0.12,
-        "selected_max_dx_jump": 0.12,
-        "alignment_attempts": 3,
-        "alignment_timeout": 10.0,
-    },
-    "shot_confirmation": {
-        # 单靶最多重复射击四次，每次射击后等待靶体稳定再检查是否倒下。
-        "max_shots_per_target": 4,
-        "post_shot_settle_seconds": 5.0,
-        "confirm_frames": 3,
-        "verification_timeout": 10.0,
-        "verification_frame_interval": 0.10,
-        "stationary_dx_tolerance": 0.15,
-    },
-    # 独立调试完成后返回的局部里程计原点。
-    "debug_return": {
-        "position": [0.0, 0.0, 0.0],
-    },
-}
+def target_shooting(animal_list=[0, 0, 0, 0]):  # noqa: E741
 
+    step = 0.16  # 每个目标间距
+    relative_loc = []  # 记录相对运动距离
+    last_index = -1  # 记录上一个打击点的索引，初始为-1
+    d_x = 0.2  # 对齐参数
 
-def target_shooting(
-    animal_list=[1, 1, 1, 0],
-    debug=False,
-    shooting_delta_x=None,
-):  # noqa: E741
-    """按识别结果锁定物理靶位，射击有害动物并确认靶体是否倒下。"""
-    # 清除上一次任务可能遗留的固定靶号显示，避免本次校准沿用旧映射。
-    my_car.clear_shooting_target_display()
-
-    initial_orientation = TARGET_SHOOTING_POSES["initial_orientation"]
-    initial_linear = TARGET_SHOOTING_POSES["initial_linear"]
-    task_entry = TARGET_SHOOTING_POSES["task_entry"]
-    targets = TARGET_SHOOTING_POSES["targets"]
-    alignment = TARGET_SHOOTING_POSES["alignment"]
-    shot_confirmation = TARGET_SHOOTING_POSES["shot_confirmation"]
-    debug_return = TARGET_SHOOTING_POSES["debug_return"]
-
-    # 默认使用现场标定值；调试调用方可以临时覆盖横向对齐位置。
-    target_delta_x = (
-        alignment["delta_x"]
-        if shooting_delta_x is None
-        else float(shooting_delta_x)
-    )
-    if not -1.0 <= target_delta_x <= 1.0:
-        raise ValueError(
-            "射击图像横向目标必须位于归一化范围 [-1.0, 1.0]: "
-            f"shooting_delta_x={target_delta_x}"
-        )
-
-    # 将输入结果规范为固定四个靶位。缺失或非法值保持为 None，
-    # 后续生成射击计划时会安全跳过，绝不把未知结果当作有害动物。
-    target_count = targets["count"]
-    if animal_list is None:
-        animal_list = [None] * target_count
-    animal_results = list(animal_list[:target_count])
-    animal_results.extend([None] * (target_count - len(animal_results)))
-
-    def ordered_animal_detections():
-        """读取当前动物框，并按固定物理靶位方向排序。"""
-        detections = [
-            item
-            for item in my_car.get_detection_results()
-            if item[2] == "animal"
-        ]
-        detections.sort(
-            key=lambda item: item[4],
-            reverse=alignment["target_order_direction"] == "descending",
-        )
-        return detections
-
-    def calibrate_target_slots():
-        """等待四个靶框连续稳定，建立物理靶号与视觉顺序的初始映射。"""
-        stable_samples = []
-        deadline = time.monotonic() + alignment["calibration_timeout"]
-        while time.monotonic() < deadline:
-            detections = ordered_animal_detections()
-            current_dx = [item[4] for item in detections]
-
-            # 数量不等于四时无法建立完整映射，丢弃此前的连续稳定计数。
-            if len(detections) != target_count:
-                stable_samples = []
-            elif stable_samples and any(
-                abs(now - previous) > alignment["calibration_max_dx_shift"]
-                for now, previous in zip(current_dx, stable_samples[-1])
-            ):
-                # 靶框位置突变时从当前帧重新计数，防止编号发生跨靶跳转。
-                stable_samples = [current_dx]
-            else:
-                stable_samples.append(current_dx)
-
-            if len(stable_samples) >= alignment["calibration_stable_frames"]:
-                locked_dx = [
-                    round(
-                        sum(sample[index] for sample in stable_samples)
-                        / len(stable_samples),
-                        3,
-                    )
-                    for index in range(target_count)
-                ]
-                return [
-                    {
-                        "index": index,
-                        "animal_result": animal_results[index],
-                        "initial_dx": locked_dx[index],
-                        "status": "standing",
-                    }
-                    for index in range(target_count)
-                ]
-            time.sleep(alignment["calibration_frame_interval"])
-        return None
-
-    def wait_for_standing_snapshot(standing_indices):
-        """等待画面中的动物框数量与仍站立的物理靶位数量一致。"""
-        deadline = time.monotonic() + alignment["alignment_timeout"]
-        expected_count = len(standing_indices)
-        while time.monotonic() < deadline:
-            detections = ordered_animal_detections()
-            if len(detections) == expected_count:
-                return detections
-            time.sleep(alignment["calibration_frame_interval"])
-        return None
-
-    def frame_matches_slots(detections, slot_indices, before_map):
-        """判断当前帧中的剩余靶框是否仍对应射击前的固定靶位。"""
-        if len(detections) != len(slot_indices):
-            return False
-        tolerance = shot_confirmation["stationary_dx_tolerance"]
-        return all(
-            abs(detection[4] - before_map[index][4]) <= tolerance
-            for index, detection in zip(slot_indices, detections)
-        )
-
-    def verify_knockdown(target_index, standing_indices, before_detections):
-        """连续检查目标靶是否消失，区分倒靶、仍站立和画面不确定。"""
-        before_map = dict(zip(standing_indices, before_detections))
-        remaining_indices = [
-            index for index in standing_indices if index != target_index
-        ]
-        absent_count = 0
-        present_count = 0
-        deadline = time.monotonic() + shot_confirmation["verification_timeout"]
-
-        while time.monotonic() < deadline:
-            detections = ordered_animal_detections()
-            if frame_matches_slots(detections, remaining_indices, before_map):
-                absent_count += 1
-                present_count = 0
-            elif frame_matches_slots(detections, standing_indices, before_map):
-                present_count += 1
-                absent_count = 0
-            else:
-                # 框数或位置无法稳定关联时，两种连续计数都重新开始。
-                absent_count = 0
-                present_count = 0
-
-            if absent_count >= shot_confirmation["confirm_frames"]:
-                return "knocked_down"
-            if present_count >= shot_confirmation["confirm_frames"]:
-                return "still_standing"
-            time.sleep(shot_confirmation["verification_frame_interval"])
-        return "verification_ambiguous"
-
-    # 只把可信的有害动物结果 0 加入射击计划。计划中的移动距离是相对
-    # 上一个待射击靶位的距离，因此可以跳过无需射击的靶位。
-    shot_plan = []
-    last_index = -1
-    skipped_indices = []
-    for idx, value in enumerate(animal_results):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value not in (0, 1)
-        ):
-            skipped_indices.append(idx)
-            continue
-        if value == 0:
+    for idx, value in enumerate(animal_list):
+        if value == 0:  # 遇到需要打击的点
             if last_index == -1:
-                dist = idx * targets["step_distance"]
+                # 第一个打击点：相对距离 = 从起点走到这里
+                dist = idx * step
             else:
-                dist = (idx - last_index) * targets["step_distance"]
-            shot_plan.append({"target_index": idx, "move_distance": dist})
-            last_index = idx
-        else:
-            skipped_indices.append(idx)
+                # 后续打击点：相对距离 = 两个点之间的间隔数 * 0.16
+                dist = (idx - last_index) * step
 
-    # 机械臂先完成方向切换，再移动 X/Y 直线轴，最后巡线进入射击区。
-    my_car.arm.set_arm_pose(**initial_orientation)
-    my_car.arm.set_arm_pose(**initial_linear)
-    task_distance = (
-        task_entry["debug_distance"]
-        if debug
-        else task_entry["run_distance"]
-    )
+            relative_loc.append(dist)
+            last_index = idx  # 更新上一个打击点位置
+    print(relative_loc)
+
+    # 射击任务
+    my_car.arm.set_arm_pose(arm="LEFT", hand="UP")
+    my_car.arm.set_arm_pose(x=0.3, y=0.02)
+
+    my_car.lane_dis_offset(speed=0.2, dis_hold=3.0)
+    my_car.move_for([-0.2, 0, 0])
+    # 对齐第一个目标
+    my_car.move_to_detection_target(delta_x=d_x, delta_y=None, sort_pos=(d_x, 0))
+
+    for dis in relative_loc:
+        my_car.lane_dis_offset(speed=0.3, dis_hold=dis)
+        cls_id, label = my_car.move_to_detection_target(
+            delta_x=d_x, delta_y=None, sort_pos=(d_x, 0)
+        )
+        time.sleep(5)
+        my_car.beep()
+        my_car.shooting()
+        time.sleep(5)
+
     my_car.lane_dis_offset(
-        speed=task_entry["speed"],
-        dis_hold=task_distance,
-    )
-
-    # 只有存在待射击靶位时才校准四靶映射；没有射击计划时直接完成赛道补偿。
-    target_slots = calibrate_target_slots() if shot_plan else []
-    standing_indices = list(range(target_count))
-    successful_indices = []
-    failed_targets = []
-    shots_by_target = {index: 0 for index in range(target_count)}
-    traveled_plan_distance = 0.0
-
-    if target_slots is not None and shot_plan:
-        my_car.set_shooting_target_display(
-            standing_indices,
-            alignment["target_order_direction"],
-        )
-
-    if target_slots is None:
-        # 初始四靶映射无法建立时禁止盲目射击，并记录所有计划靶位为失败。
-        for item in shot_plan:
-            failed_targets.append({
-                "target_index": item["target_index"],
-                "reason": "calibration_timeout",
-                "shots": 0,
-            })
-    else:
-        for plan_item in shot_plan:
-            target_index = plan_item["target_index"]
-            dis = plan_item["move_distance"]
-            if dis > 0:
-                my_car.lane_dis_offset(
-                    speed=targets["lane_speed"],
-                    dis_hold=dis,
-                )
-            traveled_plan_distance += dis
-
-            target_succeeded = False
-            target_failure_reason = None
-            while (
-                shots_by_target[target_index]
-                < shot_confirmation["max_shots_per_target"]
-            ):
-                before_detections = None
-                alignment_failure = None
-                fixed_rank = standing_indices.index(target_index)
-
-                # 每次射击前重新对齐固定编号靶位。expected_detection_count 和
-                # fixed_order_num 共同阻止相邻靶在漏检后被误认为当前目标。
-                for alignment_attempt in range(
-                    1, alignment["alignment_attempts"] + 1
-                ):
-                    cls_id, label = my_car.move_to_detection_target(
-                        delta_x=target_delta_x,
-                        delta_y=alignment["delta_y"],
-                        sort_pos=(target_delta_x, alignment["sort_y"]),
-                        label="animal",
-                        time_out=alignment["alignment_timeout"],
-                        max_delta_x_error=alignment["max_delta_x_error"],
-                        target_x_direction=alignment["target_x_direction"],
-                        require_alignment=True,
-                        fixed_order_num=fixed_rank,
-                        fixed_order_direction=alignment[
-                            "target_order_direction"
-                        ],
-                        expected_detection_count=len(standing_indices),
-                        max_selected_dx_jump=alignment["selected_max_dx_jump"],
-                        target_index=target_index,
-                    )
-                    diagnosis = getattr(
-                        my_car,
-                        "last_detection_alignment_status",
-                        {"reason": "alignment_timeout"},
-                    )
-                    if cls_id is not None and label == "animal":
-                        before_detections = wait_for_standing_snapshot(
-                            standing_indices
-                        )
-                        if before_detections is not None:
-                            break
-                        alignment_failure = "association_timeout"
-                    else:
-                        alignment_failure = diagnosis.get(
-                            "reason", "alignment_timeout"
-                        )
-
-                if before_detections is None:
-                    target_failure_reason = (
-                        alignment_failure or "alignment_timeout"
-                    )
-                    break
-
-                # 射击命令异常不会直接假定靶体状态，仍通过视觉确认结果决定
-                # 是否重试；这样可以兼容命令已下发但调用端收到异常的情况。
-                shots_by_target[target_index] += 1
-                try:
-                    my_car.beep()
-                    my_car.shooting()
-                except Exception:
-                    pass
-
-                time.sleep(shot_confirmation["post_shot_settle_seconds"])
-                verification = verify_knockdown(
-                    target_index,
-                    standing_indices,
-                    before_detections,
-                )
-                if verification == "knocked_down":
-                    standing_indices.remove(target_index)
-                    my_car.set_shooting_target_display(
-                        standing_indices,
-                        alignment["target_order_direction"],
-                    )
-                    target_slots[target_index]["status"] = "shot"
-                    successful_indices.append(target_index)
-                    target_succeeded = True
-                    break
-                if verification == "verification_ambiguous":
-                    target_failure_reason = "verification_ambiguous"
-                    break
-                # still_standing 会进入下一轮，在达到单靶射击上限前继续尝试。
-
-            if not target_succeeded:
-                if target_failure_reason is None:
-                    target_failure_reason = "max_shots_exhausted"
-                target_slots[target_index]["status"] = "failed"
-                failed_targets.append({
-                    "target_index": target_index,
-                    "reason": target_failure_reason,
-                    "shots": shots_by_target[target_index],
-                })
-
-    # 无论实际射击了哪些靶位，都补足从第 0 靶到第 3 靶的剩余赛道距离。
-    remaining_course_distance = max(
-        0.0,
-        targets["course_distance"] - traveled_plan_distance,
-    )
-    if remaining_course_distance > 0:
-        my_car.lane_dis_offset(
-            speed=targets["lane_speed"],
-            dis_hold=remaining_course_distance,
-        )
-
-    # 仅保留一次最终结果输出；详细校准、对齐和逐次射击遥测不在本测试版打印。
-    final_result = {
-        "planned": [item["target_index"] for item in shot_plan],
-        "success": successful_indices,
-        "failed": failed_targets,
-        "skipped": skipped_indices,
-        "shots_by_target": shots_by_target,
-    }
-    print(f"射击最终结果：{final_result}")
-    my_car.clear_shooting_target_display()
-    if debug:
-        my_car.move_to_position(debug_return["position"])
+        speed=0.3, dis_hold=0.48 - sum(relative_loc)
+    )  # 距离补偿到最后一个目标
 
 
 def crop_harvesting(debug=True):

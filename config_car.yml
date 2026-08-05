@@ -26,10 +26,6 @@ wbt_car: 0.1
 camera:
   front: 1
   side: 2
-# 侧摄像头光轴相对机械中心的物理偏移，单位 m；负值表示偏左。
-# 当前现场标定为偏左 6 cm，实车遥测后可直接调整此值。
-camera_calibration:
-  side_center_offset_x_m: 0
 io:
   left_sensor: 8
   right_sensor: 7
@@ -59,14 +55,12 @@ speed:
 # 巡线 PID - 用于车道线巡航控制
 lane_pid:
   cfg_pid_y:
-    # Orin 2026-07-17 最新巡线标定为 4；修改前 worktree 为 5。
     Kp: 4
     Ki: 0.1
     Kd: 0
     setpoint: 0
     output_limits: [-0.7, 0.7]
   cfg_pid_angle:
-    # Orin 2026-07-17 最新角度标定为 2；修改前 worktree 为 3。
     Kp: 2
     Ki: 0
     Kd: 0
@@ -130,23 +124,6 @@ location_pid:
 #
 # ============================================================
 
-# 推理后端模式：
-#   worktree     - 使用本工作树 infer_cfg，并在需要时自动启动本地后端。
-#   external_7_17 - 只连接已由用户启动的 7_17 后端；OCR 改为本进程本地推理。
-# 环境变量 SMARTCAR_INFER_BACKEND 可临时覆盖 mode，无需改动此文件。
-infer_backend:
-  mode: worktree
-  external_7_17:
-    connect_timeout: 15.0
-    request_timeout: 15.0
-    services:
-      - name: lane
-        port: 5001
-        img_size: [128, 128]
-      - name: task
-        port: 5002
-        img_size: Null
-
 infer_cfg:
   - name: lane
     infer_type: LaneInfer
@@ -159,29 +136,21 @@ infer_cfg:
     infer_type: YoloeInfer
     model_dir: task2026
     port: 5002
-    img_size: [416, 416]
+    img_size: Null
     run_mode: paddle
 
-  - name: front
+  - name: goods
     infer_type: YoloeInfer
-    model_dir: front_model2
-    port: 5003
-    img_size: [416, 416]
-    run_mode: paddle
-
-  - name: ocr
-    infer_type: OCRReco
-    # OCR 使用两阶段模型：检测(det) + 识别(rec)
-    det_model_dir: ch_PP-OCRv3_det_infer
-    rec_model_dir: ch_PP-OCRv3_rec_infer
-    port: 5004
+    model_dir: shucaimodel/model
+    port: 5005
     img_size: Null
     run_mode: paddle
 
 # ============================================================
-# 千帆 OpenAI 兼容多模态接口配置；API Key 从 /home/jetson/qianfan.env 读取。
+# 千帆多模态配置
 # ============================================================
 qianfan:
+  api_key: "bce-v3/ALTAK-ikr8IQEASbaX7rxNJ3cRp/3462dd3f650ffb8eb159341104764a4b663861d4"
   base_url: "https://qianfan.baidubce.com/v2"
-  multimodal_model: "ernie-4.5-turbo-vl"
+  multimodal_model: "ernie-5.0"
   request_timeout: 10.0

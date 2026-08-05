@@ -22,10 +22,7 @@ sys.path.append(deploy_path)
 
 from .deploy.python.infer import Detector
 from .deploy.python.utils import nms
-# Orin 2026-07-17 将以下重型依赖改为对应类内延迟导入，避免普通播种初始化加载 MOT/sklearn。
-# 修改前代码：from .deploy.pptracking.python.mot_sde_infer import SDE_Detector
-# 修改前代码：from .deploy.pipeline.pphuman.attr_infer import AttrDetector
-# 修改前代码：from .deploy.pipeline.ppvehicle.vehicle_plate import PlateRecognizer, PlateDetector, TextRecognizer
+# MOT、人体属性、OCR 相关模块较重，按需延迟导入，避免启动时触发非当前任务依赖。
 # from ...ernie_bot import HumAttrPrompt
 
 
@@ -139,7 +136,6 @@ class InferInterface:
     
 class MotHuman(InferInterface):
     def __init__(self, model_dir='mot_ppyoloe_s_36e_pipeline', run_mode='paddle') -> None:
-        # 延迟导入：仅创建 MOT 推理实例时加载跟踪依赖。
         from .deploy.pptracking.python.mot_sde_infer import SDE_Detector
 
         # 加载模型文件夹
@@ -302,7 +298,6 @@ def parse_mot_res(input):
 
 class HummanAtrr(InferInterface):
     def __init__(self, model_dir="PPLCNet_x1_0_person_attribute_945_infer", run_mode='paddle') -> None:
-        # 延迟导入：普通 lane/task/OCR 初始化不加载人体属性依赖。
         from .deploy.pipeline.pphuman.attr_infer import AttrDetector
 
         super().__init__(model_dir)
@@ -442,7 +437,6 @@ def get_rotate_crop_image(img, points):
 
 class OCRReco(InferInterface):
     def __init__(self, det_model_dir="ch_PP-OCRv3_det_infer", rec_model_dir="ch_PP-OCRv3_rec_infer", run_mode='paddle') -> None:
-        # 延迟导入：仅创建 OCR 实例时加载车牌检测与文字识别实现。
         from .deploy.pipeline.ppvehicle.vehicle_plate import PlateDetector, TextRecognizer
 
         parser = argparse.ArgumentParser()
@@ -464,7 +458,6 @@ class OCRReco(InferInterface):
             "word_dict_path": self.get_path_abs("deploy/pipeline/ppvehicle/rec_word_dict.txt")
         }
 
-        self.platedetector = PlateDetector(args, cfg=cfg)
         args.run_mode = 'paddle'
         self.textrecognizer = TextRecognizer(args, cfg, use_gpu=use_gpu)
         self.threshold = 0.5
@@ -472,34 +465,9 @@ class OCRReco(InferInterface):
     
     def predict(self, image, normalize_out=False):
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image_list = [image_rgb]
-
-        plate_text_list = []
-        plateboxes, det_time = self.platedetector.predict_image(image_list)
-        for idx, boxes_pcar in enumerate(plateboxes):
-            plate_pcar_list = []
-            for box in boxes_pcar:
-                # 获取中心坐标
-                box_cx = np.mean(box[:, 0])
-                box_cy = np.mean(box[:, 1])
-                # print(box_cx, box_cy)
-                plate_images = get_rotate_crop_image(image_list[idx], box)
-                plate_texts, rec_time = self.textrecognizer.predict_text([plate_images])
-                plate_texts = list(plate_texts[0])
-                # print(type(plate_text_list))
-                # print(plate_texts)
-                plate_pcar_list.append(plate_texts)
-                # print(plate_texts)
-            plate_text_list.append(plate_pcar_list)
-
-        # print(plate_text_list[0])
-        text_res = ""
-        for i in range(len(plate_text_list[0])):
-            text, score  = plate_text_list[0][-i-1]
-            if score > 0.5:
-                text_res = text_res + text
-            # print(text, score)
-        return text_res
+        rec_results, _ = self.textrecognizer.predict_text([image_rgb])
+        text, score = rec_results[0]
+        return text if score > self.threshold else ""
 
 
 class LaneInfer(InferInterface):

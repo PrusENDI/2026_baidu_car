@@ -1,0 +1,46 @@
+mode: paddle
+draw_threshold: 0.5
+metric: COCO
+use_dynamic_shape: false
+arch: YOLO
+min_subgraph_size: 3
+Preprocess:
+- interp: 2
+  keep_ratio: false
+  target_size:
+  - 640
+  - 640
+  type: Resize
+- mean:
+  - 0.0
+  - 0.0
+  - 0.0
+  norm_type: none
+  std:
+  - 1.0
+  - 1.0
+  - 1.0
+  type: NormalizeImage
+- type: Permute
+label_list:
+- animal
+- ball_blue
+- ball_yellow
+- cylinder_1
+- cylinder_2
+- cylinder_3
+- cylinder_set
+- h_dou_jiao
+- h_fan_qie
+- h_jin_zhen_gu
+- h_mo_gu
+- h_qin_cai
+- h_qing_jiao
+- h_tu_dou
+- h_xi_lan_hua
+- h_you_cai
+- water
+- water_l1
+- water_l2
+- water_l3
+- yellow_tower

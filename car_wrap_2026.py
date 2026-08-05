@@ -26,6 +26,7 @@ from smartcar import PID
 import difflib
 import cv2
 import math
+from smartcar.paddlebaidu import OCRReco
 from smartcar.paddlebaidu.infer_cs import ClintInterface, Bbox
 from smartcar.paddlebaidu.ernie_bot import (
     ErnieBotWrap,
@@ -46,45 +47,16 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from smartcar import logger
 
 
-ORDER_GOODS = frozenset(
-    {
-        "青椒",
-        "蘑菇",
-        "芹菜",
-        "番茄",
-        "油菜",
-        "豆角",
-        "西兰花",
-        "土豆",
-        "金针菇",
-    }
-)
-
 MULTIMODAL_TASKS = {
     "animal": {
+        "prompt": str(ImagePrompt()),
         "label": "animal",
         "crop_scale": 1.1,
-        "prompt": (
-            "识别图片中的动物，并判断它对农田有害还是有益。"
-            "只返回一个 JSON 对象，字段必须且只能是 result 和 analysis。"
-            "result 必须是整数：有害返回 0，有益返回 1；"
-            "analysis 必须是非空中文字符串。不要返回 Markdown。"
-        ),
     },
     "order": {
+        "prompt": str(OrderPrompt()),
         "label": "order",
         "crop_scale": 1.15,
-        "prompt": (
-            "读取图片中的订单，提取收货人姓名、所需货物和楼号。"
-            "订单可能通过菜名和已有食材间接描述需求；应推断缺少的主要食材，"
-            "并将西红柿规范为番茄。"
-            "只返回一个 JSON 对象，字段必须且只能是 name、goods、address。"
-            "goods 只能是青椒、蘑菇、芹菜、番茄、油菜、豆角、西兰花、"
-            "土豆、金针菇之一；address 只能是整数 1 或 2。"
-            "例如，‘2号楼的张三想做西红柿炒鸡蛋，已有鸡蛋’应返回"
-            "{\"name\":\"张三\",\"goods\":\"番茄\",\"address\":2}。"
-            "不要返回 Markdown 或解释文字。"
-        ),
     },
 }
 
@@ -383,9 +355,6 @@ class MyCar(MecanumDriver):
         self.display = ScreenShow()
 
         self.streamer = Streamer()
-        # 射击任务可临时启用固定物理靶号显示。整个配置作为一个对象替换，
-        # 避免取帧时读到“编号已更新但方向尚未更新”的中间状态。
-        self._shooting_target_display = None
         self.arm = ArmController()
 
         # 获取自己文件所在的目录路径
@@ -393,9 +362,6 @@ class MyCar(MecanumDriver):
         self.yaml_path = os.path.join(self.path_dir, "config_car.yml")
         # 获取配置
         cfg = get_yaml(self.yaml_path)
-        self.side_camera_center_offset_x_m = float(
-            cfg.get("camera_calibration", {}).get("side_center_offset_x_m", 0.0)
-        )
         # 根据配置设置sensor
         self.sensor_init(cfg)
 
@@ -445,14 +411,12 @@ class MyCar(MecanumDriver):
         # self.light = LedLight(cfg_sensor['light'])
         # self.left_sensor = Infrared(cfg_sensor['left_sensor'])
         # self.right_sensor = Infrared(cfg_sensor['right_sensor'])
-        self.servo_1_angle_list = [0, -85]  # 储存仓角度，收起165，放下-85
-        self.servo_1_flag = 1
+        self.servo_1_angle_list = [-42, 165]
+        self.servo_1_flag = 0
         self.servo_1 = ServoPwm(1, 180)
         self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
         self.blue_pad = BluetoothPad()
-        # MC602 物理 PWM D4 对应内部数字输出 P10。
-        self.shoot = PoutD(10)
-        self.shoot.set(0)
+        self.shoot = PoutD(4)
 
     def set_storage(self, state=False):
         """
@@ -516,139 +480,122 @@ class MyCar(MecanumDriver):
         # self.front_det = ClintInterface('front')
         # 任务识别
         self.task_det = ClintInterface("task")
-        # 7_17 后端只提供 lane/task/goods，没有 OCR 服务；外部兼容模式
-        # 使用与 7_17 代码相同的本地 OCR，工作树模式仍使用 5004 后端。
-        if self.task_det.backend_mode == "external_7_17":
-            from smartcar.paddlebaidu import OCRReco
-
-            self.ocr_rec = OCRReco()
-            logger.info("外部 7_17 后端模式：OCR 使用本进程本地模型")
-        else:
-            self.ocr_rec = ClintInterface("ocr")
+        self.goods_det = ClintInterface("goods")
+        self.ocr_rec = OCRReco()
         # 识别为None
         self.last_det = None
 
     def ernie_bot_init(self):
         """
-        初始化千帆多模态分析
+        初始化文心一言分析
 
-        动物和订单图片共用一个 OpenAI 兼容客户端。
+        初始化、图像分析和订单分析的文心一言接口。
         """
+        # 初始化相关资源。
         self.image_analysis = ErnieBotWrap()
+        self.order_analysis = self.image_analysis
 
     def _encode_detection_crop(self, label, crop_scale):
-        """裁剪指定检测标签并编码为 JPEG Base64，不执行任何运动。"""
-        detections = [
-            item for item in self.get_detection_results() if item[2] == label
-        ]
-        if not detections:
-            raise ValueError(f"未检测到多模态目标: label={label}")
-
-        image = getattr(self, "side_image", None)
-        if image is None:
-            raise ValueError("侧摄像头图像不存在")
-        image = image.copy()
-        if image.size == 0:
-            raise ValueError("侧摄像头图像为空")
-
-        detection = detections[0]
-        if len(detection) < 8:
-            raise ValueError("多模态目标检测结果字段不足")
-        x_c, y_c, width, height = detection[4:8]
+        dets = self.get_detection_results()
+        if not hasattr(self, "side_image") or self.side_image is None:
+            raise ValueError("side_image unavailable")
+        det = next((item for item in dets if len(item) >= 8 and item[2] == label), None)
+        if det is None:
+            raise ValueError("detection not found")
+        bbox = det[4:8]
+        if len(bbox) != 4 or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in bbox
+        ):
+            raise ValueError("invalid detection bbox")
+        if (isinstance(crop_scale, bool)
+                or not isinstance(crop_scale, (int, float))
+                or not math.isfinite(crop_scale)
+                or crop_scale <= 0):
+            raise ValueError("invalid crop scale")
+        image = self.side_image
+        if not hasattr(image, "shape") or len(image.shape) < 2:
+            raise ValueError("invalid side_image")
         img_h, img_w = image.shape[:2]
-        center_x = (x_c + 1.0) * img_w / 2.0
-        center_y = (y_c + 1.0) * img_h / 2.0
-        box_w = width * img_w * crop_scale / 2.0
-        box_h = height * img_h * crop_scale / 2.0
-        x1 = max(0, int(center_x - box_w / 2.0))
-        y1 = max(0, int(center_y - box_h / 2.0))
-        x2 = min(img_w, int(center_x + box_w / 2.0))
-        y2 = min(img_h, int(center_y + box_h / 2.0))
+        x_c, y_c, w, h = bbox
+        w *= crop_scale
+        h *= crop_scale
+        x_c = (x_c + 1) * img_w / 2
+        y_c = (y_c + 1) * img_h / 2
+        w = w * img_w / 2
+        h = h * img_h / 2
+        x1 = max(0, min(img_w, int(x_c - w / 2)))
+        y1 = max(0, min(img_h, int(y_c - h / 2)))
+        x2 = max(0, min(img_w, int(x_c + w / 2)))
+        y2 = max(0, min(img_h, int(y_c + h / 2)))
         if x2 <= x1 or y2 <= y1:
-            raise ValueError("多模态目标裁剪区域为空")
+            raise ValueError("invalid crop bounds")
+        ok, encoded = cv2.imencode(".jpg", image[y1:y2, x1:x2])
+        if not ok or encoded is None or not encoded.size:
+            raise ValueError("jpeg encoding failed")
+        return base64.b64encode(encoded.tobytes()).decode("ascii")
 
-        encoded_ok, encoded = cv2.imencode(".jpg", image[y1:y2, x1:x2])
-        if not encoded_ok:
-            raise ValueError("多模态目标 JPEG 编码失败")
+    def _encode_side_image(self):
+        if not hasattr(self, "side_image") or self.side_image is None:
+            raise ValueError("side_image unavailable")
+        ok, encoded = cv2.imencode(".jpg", self.side_image)
+        if not ok or encoded is None or not encoded.size:
+            raise ValueError("jpeg encoding failed")
         return base64.b64encode(encoded.tobytes()).decode("ascii")
 
     @staticmethod
-    def _validate_task_image_result(task, data):
-        """校验并规范化动物或订单的多模态 JSON。"""
-        if not isinstance(data, dict):
-            raise ValueError("多模态结果必须是 JSON 对象")
-
+    def _validate_task_image_result(task, result):
+        if not isinstance(result, dict):
+            raise ValueError("result must be object")
         if task == "animal":
-            if set(data) != {"result", "analysis"}:
-                raise ValueError("动物结果字段必须且只能是 result、analysis")
-            result = data["result"]
-            analysis = data["analysis"]
-            if isinstance(result, bool) or not isinstance(result, int):
-                raise ValueError("动物 result 必须是整数")
-            if result not in (0, 1):
-                raise ValueError("动物 result 只能是 0 或 1")
-            if not isinstance(analysis, str) or not analysis.strip():
-                raise ValueError("动物 analysis 必须是非空字符串")
-            return {"result": result, "analysis": analysis.strip()}
+            if set(result) != {"result", "analysis"}:
+                raise ValueError("invalid animal result fields")
+            if isinstance(result["result"], bool) or not isinstance(result["result"], int) or result["result"] not in (0, 1):
+                raise ValueError("invalid animal result")
+            if not isinstance(result["analysis"], str) or not result["analysis"].strip():
+                raise ValueError("invalid animal analysis")
+        elif task == "order":
+            if set(result) != {"name", "goods", "address"}:
+                raise ValueError("invalid order result fields")
+            if not isinstance(result["name"], str) or not result["name"].strip():
+                raise ValueError("invalid order name")
+            if result["goods"] not in {"青椒", "蘑菇", "芹菜", "番茄", "油菜", "豆角", "西兰花", "土豆", "金针菇"}:
+                raise ValueError("invalid order goods")
+            if isinstance(result["address"], bool) or not isinstance(result["address"], int) or result["address"] not in (1, 2):
+                raise ValueError("invalid order address")
+        else:
+            raise ValueError("unknown multimodal task")
+        return result
 
-        if task == "order":
-            if set(data) != {"name", "goods", "address"}:
-                raise ValueError("订单结果字段必须且只能是 name、goods、address")
-            name = data["name"]
-            goods = data["goods"]
-            address = data["address"]
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError("订单 name 必须是非空字符串")
-            if not isinstance(goods, str) or goods.strip() not in ORDER_GOODS:
-                raise ValueError("订单 goods 不在允许的货物集合中")
-            if isinstance(address, bool) or not isinstance(address, int):
-                raise ValueError("订单 address 必须是整数")
-            if address not in (1, 2):
-                raise ValueError("订单 address 只能是 1 或 2")
-            return {
-                "name": name.strip(),
-                "goods": goods.strip(),
-                "address": address,
-            }
-
-        raise ValueError(f"未知多模态任务: task={task}")
-
-    def analyze_task_image(self, task, label=None):
-        """裁图并调用统一多模态模型，失败时重新取帧重试一次。"""
+    def analyze_task_image(self, task, label=None, full_frame=False):
         if task not in MULTIMODAL_TASKS:
-            raise ValueError(f"未知多模态任务: task={task}")
-        spec = MULTIMODAL_TASKS[task]
-        detection_label = spec["label"] if label is None else label
-
+            raise ValueError("unknown multimodal task")
+        task_cfg = MULTIMODAL_TASKS[task]
+        label = task_cfg["label"] if label is None else label
+        last_error = None
         for attempt in range(1, 3):
             try:
-                image = self._encode_detection_crop(
-                    detection_label, spec["crop_scale"]
+                image = (
+                    self._encode_side_image()
+                    if full_frame
+                    else self._encode_detection_crop(label, task_cfg["crop_scale"])
                 )
-                data = self.image_analysis.get_multimodal_json(
-                    image, spec["prompt"]
-                )
-                validated = self._validate_task_image_result(task, data)
-                print(f"[MULTIMODAL_RESULT] task={task} result={validated}")
-                logger.info(
-                    f"多模态识别成功 task={task} attempt={attempt} "
-                    f"model={self.image_analysis.image_model}"
-                )
-                return validated
+                result = self.image_analysis.get_multimodal_json(image, task_cfg["prompt"])
+                result = self._validate_task_image_result(task, result)
+                print(f"[MULTIMODAL_RESULT] task={task} result={result}")
+                return result
             except Exception as exc:
-                logger.error(
-                    "多模态识别失败 "
-                    f"task={task} attempt={attempt} "
-                    f"error_type={type(exc).__name__}"
-                )
-                if attempt == 1:
+                last_error = exc
+                print(f"[MULTIMODAL_FAILURE] task={task} attempt={attempt} error={type(exc).__name__}")
+                if attempt < 2:
                     time.sleep(0.05)
-
-        raise RuntimeError(f"多模态识别失败，已停止任务: task={task}")
+        raise RuntimeError(f"multimodal task failed: {task}") from last_error
 
     def animal_image_analysis(self):
-        data = self.analyze_task_image(task="animal", label="animal")
-        return data["result"], data["analysis"]
+        result = self.analyze_task_image("animal")
+        return result["result"], result["analysis"]
 
     @staticmethod
     def get_cfg(path):
@@ -706,6 +653,9 @@ class MyCar(MecanumDriver):
                 # print(key_val)
                 if key_val == 3:
                     self._stop_flag = True
+                    self.stop()
+                    self.arm.x_speed(0)
+                    self.arm.y_speed(0)
                 time.sleep(0.2)
 
     # 根据某个值获取列表中匹配的结果
@@ -1331,7 +1281,7 @@ class MyCar(MecanumDriver):
                         else:
                             text_out = text
 
-    def get_ocr(self, label=None, time_out=3.0):
+    def get_ocr(self, label=None, time_out=3.0, full_frame=False):
         """
         进行OCR识别
 
@@ -1339,6 +1289,7 @@ class MyCar(MecanumDriver):
 
         参数:
             time_out: 超时时间（秒），默认为3
+            full_frame: 是否跳过检测框，直接识别整张侧面图像
 
         返回:
             str: 识别到的文本，如果超时或未检测到则返回None
@@ -1350,12 +1301,34 @@ class MyCar(MecanumDriver):
         text_out = None
         while True:
             if self._stop_flag:
-                return
+                return None
             if time.time() > time_stop:
                 return None
-            dets = self.get_detection_results()
 
-            img = self.side_image
+            img = getattr(self, "side_image", None)
+            if img is None or img.size == 0:
+                time.sleep(0.05)
+                continue
+            if full_frame:
+                try:
+                    text = self.ocr_rec(img.copy())
+                except cv2.error as exc:
+                    logger.error(f"整帧OCR图像处理失败: {exc}")
+                    time.sleep(0.05)
+                    continue
+                if not text:
+                    time.sleep(0.05)
+                    continue
+                if text_out is None:
+                    text_out = text
+                else:
+                    matcher = difflib.SequenceMatcher(None, text_out, text).ratio()
+                    if text_count(matcher > 0.85):
+                        return text_out
+                    text_out = text
+                continue
+
+            dets = self.get_detection_results()
             if len(dets) > 0:
                 for det in dets:
                     det_cls_id, det_id, det_label, det_score, det_bbox = (
@@ -1393,15 +1366,25 @@ class MyCar(MecanumDriver):
                         y_c = int((y_c + 1) / 2 * img_h)
                         w = int(w * img_w / 2)
                         h = int(h * img_h / 2)
-                        x1 = int(x_c - w / 2)
-                        y1 = int(y_c - h / 2)
-                        x2 = int(x_c + w / 2)
-                        y2 = int(y_c + h / 2)
+                        x1 = max(0, int(x_c - w / 2))
+                        y1 = max(0, int(y_c - h / 2))
+                        x2 = min(img_w, int(x_c + w / 2))
+                        y2 = min(img_h, int(y_c + h / 2))
+                        if x1 >= x2 or y1 >= y2:
+                            logger.warning("姓名检测框无效，跳过本次OCR")
+                            continue
 
-                        img_txt = img[y1:y2, x1:x2]
+                        img_txt = img[y1:y2, x1:x2].copy()
+                        if img_txt.size == 0:
+                            logger.warning("姓名裁图为空，跳过本次OCR")
+                            continue
                         self.streamer.update_frame(img_txt, "cam1")
 
-                        text = self.ocr_rec(img_txt)
+                        try:
+                            text = self.ocr_rec(img_txt)
+                        except cv2.error as exc:
+                            logger.error(f"OCR图像处理失败: {exc}")
+                            continue
                         if text_out is None:
                             text_out = text
                         else:
@@ -1451,60 +1434,7 @@ class MyCar(MecanumDriver):
         # 获取相关数据。
         return self.action_bot.get_res_json(text)
 
-    def set_shooting_target_display(self, target_indices, order_direction):
-        """让侧摄像头按车辆行进方向显示固定的射击靶位编号。"""
-        if order_direction not in ("ascending", "descending"):
-            raise ValueError(
-                "射击靶位显示顺序必须是 ascending 或 descending: "
-                f"order_direction={order_direction!r}"
-            )
-        target_indices = tuple(int(index) for index in target_indices)
-        if len(set(target_indices)) != len(target_indices):
-            raise ValueError(
-                f"射击靶位显示编号不能重复: target_indices={target_indices}"
-            )
-        self._shooting_target_display = {
-            "target_indices": target_indices,
-            "order_direction": order_direction,
-        }
-        print(
-            "[TARGET_DISPLAY] event=UPDATED "
-            f"target_indices={list(target_indices)} "
-            f"order_direction={order_direction}",
-            flush=True,
-        )
-
-    def clear_shooting_target_display(self):
-        """恢复侧摄像头原有的逐帧临时检测序号。"""
-        if self._shooting_target_display is not None:
-            print("[TARGET_DISPLAY] event=CLEARED", flush=True)
-        self._shooting_target_display = None
-
-    def _shooting_detection_display_ids(self, dets_ret):
-        """生成与检测框一一对应的固定靶号；无法安全关联时返回 T?。"""
-        display_state = self._shooting_target_display
-        if display_state is None:
-            return None
-
-        animal_positions = [
-            index for index, det in enumerate(dets_ret) if det[2] == "animal"
-        ]
-        display_ids = [None] * len(dets_ret)
-        target_indices = display_state["target_indices"]
-        if len(animal_positions) != len(target_indices):
-            for position in animal_positions:
-                display_ids[position] = "T?"
-            return display_ids
-
-        animal_positions.sort(
-            key=lambda position: dets_ret[position][4],
-            reverse=display_state["order_direction"] == "descending",
-        )
-        for position, target_index in zip(animal_positions, target_indices):
-            display_ids[position] = f"T{target_index}"
-        return display_ids
-
-    def draw_detection_results(self, img, dets_ret, display_ids=None):
+    def draw_detection_results(self, img, dets_ret):
         """
         将检测结果绘制在图像上
 
@@ -1545,12 +1475,7 @@ class MyCar(MecanumDriver):
             cv2.rectangle(img_show, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
             # 绘制标签
-            display_id = (
-                display_ids[index]
-                if display_ids is not None and display_ids[index] is not None
-                else str(index)
-            )
-            label_text = f"{display_id}-{det_label}:{det_score:.2f}"
+            label_text = f"{index}-{det_label}:{det_score:.2f}"
             cv2.putText(
                 img_show,
                 label_text,
@@ -1564,7 +1489,7 @@ class MyCar(MecanumDriver):
         return img_show
 
     def get_detection_results(
-        self, sort_pos=(0, 0), limit_x=1, limit_y=1
+        self, sort_pos=(0, 0), limit_x=1, limit_y=1, detector=None
     ) -> List[list]:
         """
         获取检测结果,使用任务的目标检测对侧边摄像头图像进行检测，返回检测结果。
@@ -1575,15 +1500,15 @@ class MyCar(MecanumDriver):
         # 获取相关数据。
         self.side_image = self.cap_side.read()
         image = self.side_image.copy()
-        det_task = self.task_det(image)
+        infer = self.task_det if detector is None else detector
+        det_task = infer(image)
         det_task = [det for det in det_task if abs(det[4]) <= limit_x]
         det_task = [det for det in det_task if abs(det[5]) <= limit_y]
 
         det_task.sort(
             key=lambda x: (x[4] - sort_pos[0]) ** 2 + (x[5] - sort_pos[1]) ** 2
         )  # 按照距离由近及远排序
-        display_ids = self._shooting_detection_display_ids(det_task)
-        image = self.draw_detection_results(image, det_task, display_ids)
+        image = self.draw_detection_results(image, det_task)
         self.streamer.update_frame(image, "cam2")
         # print(det_task)
         return det_task
@@ -1657,9 +1582,6 @@ class MyCar(MecanumDriver):
         x_c, y_c, w, h = det[4:]
 
         # 计算目标中心点在摄像头中的世界坐标
-        # 同步 Orin 2026-07-17 副本：该版本仍使用检测坐标加半宽/半高的计算。
-        # 修改前 worktree 代码：x = CAMERA_WIDTH * x_c；y = CAMERA_HEIGHT * y_c。
-        # 注意：get_target_location() 当前没有 auto_seeding() 调用方，保留该差异供后续单独标定。
         x = CAMERA_WIDTH * (x_c + w / 2)
         y = CAMERA_HEIGHT * (y_c + h / 2)
 
@@ -1669,58 +1591,15 @@ class MyCar(MecanumDriver):
 
         return loc_x, loc_y
 
-    @staticmethod
-    def _alignment_axis_reached(value, target, tolerance):
-        """判断视觉偏移是否达到指定目标，而不是默认要求偏移为零。"""
-        return abs(value - target) < tolerance
-
-    @staticmethod
-    def _camera_calibrated_delta_x(
-        task_delta_x, side_center_offset_x_m, view_width_m=0.33
-    ):
-        """把侧摄像头物理中心偏移换算并叠加到任务 dx 目标。"""
-        return task_delta_x - side_center_offset_x_m / view_width_m
-
-    @staticmethod
-    def _detection_y_control_with_chassis_handoff(
-        out_y,
-        arm_x_position,
-        arm_x_bounds=None,
-    ):
-        """机械臂到达水平边界时，将继续越界的视觉修正交给底盘横移。"""
-        # 调用方可以为具体任务提供更保守的机械臂行程；没有专用配置时，
-        # 使用 7_17 现场版本的默认安全范围 0.01～0.24 m。
-        x_min, x_max = (
-            (0.01, 0.24) if arm_x_bounds is None else arm_x_bounds
-        )
-
-        # 只接管继续向边界外运动的控制量。若控制方向指向安全区内部，
-        # 仍由机械臂执行，避免底盘产生不必要的横向位移。
-        lower_bound_blocked = arm_x_position <= x_min and out_y < 0
-        upper_bound_blocked = arm_x_position >= x_max and out_y > 0
-        if lower_bound_blocked or upper_bound_blocked:
-            return 0.0, -out_y
-        return out_y, 0.0
-
     def move_to_detection_target(
         self,
         delta_x=0.0,
         delta_y: Union[float, None] = 0.0,
         label=None,
-        # Orin 2026-07-17 最新超时为 10 秒；修改前 worktree 为 2 秒。
-        time_out=10.0,
+        time_out=4.0,
         sort_pos=(0, 0),
         num=0,
-        arm_x_bounds=None,
-        max_delta_x_error=None,
-        target_x_direction=None,
-        require_alignment=False,
-        debug_trace=False,
-        fixed_order_num=None,
-        fixed_order_direction=None,
-        expected_detection_count=None,
-        max_selected_dx_jump=None,
-        target_index=None,
+        detector=None,
     ):
         """
         前往目标位置
@@ -1730,295 +1609,81 @@ class MyCar(MecanumDriver):
             time_out: 设置超时时间
             包含目标检测信息的列表，格式为 [cls_id, obj_id,label, score, x_c, y_c, w, h]
         """
+        # 控制运动到目标状态。
         time_stop = time.time() + time_out
-        trace_interval = 0.25
-        next_trace_time = 0.0
-        x_count = CountRecord(3)
-        y_count = CountRecord(3)
-        self.last_detection_alignment_status = {
-            "ok": False,
-            "reason": "alignment_started",
-            "target_index": target_index,
-            "fixed_order_num": fixed_order_num,
-            "fixed_order_direction": fixed_order_direction,
-            "expected_detection_count": expected_detection_count,
-        }
+        x_count = CountRecord(10)
+        y_count = CountRecord(10)
 
         # pid_x.output_limits((-0.7, 0.7))
 
         out_x = 0
         out_y = 0
         out_chassis_y = 0
+
         # print(f"手柄方向：{self.arm.side}")
         if self.arm.side == "RIGHT":
-            kp_y = -0.2
-            kp_x = -0.25
-            ki_x = -0.05
+            kp_y = -0.15
+            kp_x = -0.20
+            ki_x = -0.02
         else:
-            kp_y = 0.2
-            kp_x = 0.25
-            ki_x = 0.05
+            kp_y = 0.15
+            kp_x = 0.20
+            ki_x = 0.02
 
-        calibrated_delta_x = self._camera_calibrated_delta_x(
-            delta_x, self.side_camera_center_offset_x_m
-        )
-        if max_delta_x_error is not None:
-            max_delta_x_error = float(max_delta_x_error)
-            if max_delta_x_error <= 0:
-                raise ValueError(
-                    "检测目标横向关联范围必须大于 0: "
-                    f"max_delta_x_error={max_delta_x_error}"
-                )
-        if target_x_direction not in (None, "increasing", "decreasing"):
-            raise ValueError(
-                "检测目标横向接近方向必须是 increasing、decreasing 或 None: "
-                f"target_x_direction={target_x_direction!r}"
-            )
-        if fixed_order_num is not None:
-            fixed_order_num = int(fixed_order_num)
-            if fixed_order_num < 0:
-                raise ValueError(
-                    "固定靶位候选序号不能小于 0: "
-                    f"fixed_order_num={fixed_order_num}"
-                )
-            if fixed_order_direction not in ("ascending", "descending"):
-                raise ValueError(
-                    "固定靶位物理顺序必须是 ascending 或 descending: "
-                    f"fixed_order_direction={fixed_order_direction!r}"
-                )
-        if expected_detection_count is not None:
-            expected_detection_count = int(expected_detection_count)
-            if expected_detection_count <= 0:
-                raise ValueError(
-                    "固定靶位预期检测数量必须大于 0: "
-                    f"expected_detection_count={expected_detection_count}"
-                )
-        if max_selected_dx_jump is not None:
-            max_selected_dx_jump = float(max_selected_dx_jump)
-            if max_selected_dx_jump <= 0:
-                raise ValueError(
-                    "固定靶位相邻帧跳变阈值必须大于 0: "
-                    f"max_selected_dx_jump={max_selected_dx_jump}"
-                )
-        logger.info(
-            f"视觉对齐 dx 校准 task={delta_x:.6f}, "
-            f"camera_offset_m={self.side_camera_center_offset_x_m:.6f}, "
-            f"effective={calibrated_delta_x:.6f}"
-        )
-        if debug_trace:
-            print(
-                "[TARGET_ALIGNMENT_BEGIN] "
-                f"target_dx={calibrated_delta_x:.3f} "
-                f"task_dx={delta_x:.3f} label={label} "
-                f"target_index={target_index} fixed_order_num={fixed_order_num} "
-                f"fixed_order_direction={fixed_order_direction} "
-                f"expected_count={expected_detection_count} "
-                f"direction={target_x_direction} "
-                f"overshoot_tolerance={max_delta_x_error}",
-                flush=True,
-            )
         pid_x = PID(kp_x, ki_x)
-        pid_x.setpoint = calibrated_delta_x
-        last_selected_dx = None
-        last_selection_rejection = None
-        ever_selected = False
+        if delta_x is not None:
+            pid_x.setpoint = delta_x
         while True:
             if self._stop_flag:
                 self.set_velocity(0, 0, 0)
                 self.arm.x_speed(0)
-                self.last_detection_alignment_status = {
-                    "ok": False,
-                    "reason": "stop_requested",
-                    "target_index": target_index,
-                }
                 return -1, "None"
 
-            dets = self.get_detection_results(sort_pos=sort_pos)
+            dets = self.get_detection_results(sort_pos=sort_pos, detector=detector)
 
             if label is not None:
                 dets = [item for item in dets if item[2] == label]
-            raw_candidate_dx = [round(item[4], 3) for item in dets]
-            selection_rejection = None
-            selection_num = num
-            if fixed_order_num is not None:
-                # 固定靶位模式不再删除靠边候选后滚动重编号。所有仍站立靶
-                # 始终按车辆行进方向保持同一顺序，再按会话保存的 rank 取靶。
-                dets.sort(
-                    key=lambda item: item[4],
-                    reverse=fixed_order_direction == "descending",
-                )
-                selection_num = fixed_order_num
-                if (
-                    expected_detection_count is not None
-                    and len(dets) != expected_detection_count
-                ):
-                    selection_rejection = (
-                        "candidate_count_mismatch:"
-                        f"actual={len(dets)},expected={expected_detection_count}"
-                    )
-                elif len(dets) <= selection_num:
-                    selection_rejection = (
-                        "fixed_order_rank_missing:"
-                        f"rank={selection_num},actual={len(dets)}"
-                    )
-                else:
-                    fixed_det = dets[selection_num]
-                    fixed_dx = fixed_det[4]
-                    # 固定 rank 已经提供了目标身份，不能再沿用滚动选靶模式的
-                    # 单侧 overshoot 过滤。目标即使位于校准点另一侧，也应让
-                    # PID 双向修正到 target dx，而不是停车等待到超时。
-                    if (
-                        last_selected_dx is not None
-                        and max_selected_dx_jump is not None
-                        and abs(fixed_dx - last_selected_dx)
-                        > max_selected_dx_jump
-                    ):
-                        selection_rejection = (
-                            "selected_target_dx_jump:"
-                            f"previous={last_selected_dx:.3f},current={fixed_dx:.3f}"
-                        )
-                    else:
-                        last_selected_dx = fixed_dx
-                if selection_rejection is not None:
-                    last_selection_rejection = selection_rejection
-                    dets = []
-            elif max_delta_x_error is not None:
-                if target_x_direction == "increasing":
-                    # 射击任务前进时，当前靶从图像左侧向目标 dx 接近。
-                    # 只排除已经越过目标太多的旧靶；不能对尚未接近目标的
-                    # 当前靶设置左边界，否则它会被过滤并使车辆保持零速。
-                    dets = [
-                        item
-                        for item in dets
-                        if item[4] <= calibrated_delta_x + max_delta_x_error
-                    ]
-                    # 四个 animal 同时出现时不再按校准点距离反复重排。
-                    # dx 最大的是沿前进方向最先到达的当前靶，后续靶依次
-                    # 位于更小的 dx，可保持物理顺序不反转。
-                    dets.sort(key=lambda item: item[4], reverse=True)
-                elif target_x_direction == "decreasing":
-                    dets = [
-                        item
-                        for item in dets
-                        if item[4] >= calibrated_delta_x - max_delta_x_error
-                    ]
-                    dets.sort(key=lambda item: item[4])
-                else:
-                    dets = [
-                        item
-                        for item in dets
-                        if abs(item[4] - calibrated_delta_x)
-                        <= max_delta_x_error
-                    ]
 
-            selected_det = None
-            flag_x = False
-            flag_y = delta_y is None
-            if len(dets) > selection_num:
-                det = dets[selection_num]
-                selected_det = det
-                ever_selected = True
+            if len(dets) > num:
+                det = dets[num]
                 dx, dy = det[4:6]
                 # print(f"dx:{dx} dy:{dy}")
-                out_x = -pid_x(dx)  # type: ignore
+                if delta_x is None:
+                    out_x = 0
+                else:
+                    out_x = -pid_x(dx)  # type: ignore
+                out_chassis_y = 0
                 if delta_y is None:
                     out_y = 0
-                    out_chassis_y = 0
                 else:
                     out_y = kp_y * (dy - delta_y)
-                    # 机械臂 X 轴仍有安全行程时继续由机械臂修正；到达边界且
-                    # 控制量要求继续越界时，按照 7_17 逻辑由底盘横移接管。
-                    out_y, out_chassis_y = (
-                        self._detection_y_control_with_chassis_handoff(
-                            out_y,
-                            self.arm.x_get_position(),
-                            arm_x_bounds,
-                        )
-                    )
+                    if self.arm.x_get_position() <= 0.01 or self.arm.x_get_position() >= 0.24:
+                        out_chassis_y = -out_y
+                        out_y = 0
 
-                # 修改前直接判断 abs(dx)/abs(dy)，隐含目标永远是 0；
-                # 第一轮播种使用 delta_x=-0.1、delta_y=-0.05，已经达到
-                # 设定偏移时也会被错误判为未完成。
-                flag_x = x_count(
-                    self._alignment_axis_reached(dx, calibrated_delta_x, 0.04)
-                )
+                if delta_x is None:
+                    flag_x = True
+                else:
+                    flag_x = x_count(abs(dx - delta_x) < 0.001)
                 if delta_y is None:
                     flag_y = True
                 else:
-                    flag_y = y_count(
-                        self._alignment_axis_reached(dy, delta_y, 0.02)
-                    )
-                if delta_y is None:
-                    flag_y = True
+                    flag_y = y_count(abs(dy - delta_y) < 0.001)
 
                 if flag_x:
                     out_x = 0
                 if flag_y:
                     out_y = 0
-                    out_chassis_y = 0
                 if flag_x and flag_y:
                     # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
                     self.set_velocity(0, 0, 0)
                     self.arm.x_speed(0)
-                    # 修改前这里只停车并继续循环，直到 timeout 才返回，造成
-                    # “明明已对齐却报超时”的假错误；现在立即返回检测结果。
-                    logger.info(
-                        f"视觉对齐完成 dx={dx:.6f}/{calibrated_delta_x:.6f}, "
-                        f"task_dx={delta_x:.6f}, "
-                        f"camera_offset_m={self.side_camera_center_offset_x_m:.6f}, "
-                        f"dy={dy:.6f}/{delta_y if delta_y is not None else 'None'}"
-                    )
-                    if debug_trace:
-                        print(
-                            "[TARGET_ALIGNMENT_DONE] "
-                            f"selected_dx={dx:.3f} "
-                            f"target_dx={calibrated_delta_x:.3f} "
-                            f"error={dx - calibrated_delta_x:+.3f} "
-                            f"target_index={target_index} "
-                            f"cls_id={det[0]} label={det[2]}",
-                            flush=True,
-                        )
-                    # Orin 2026-07-21 现场副本也已恢复达标后立即返回。
-                    self.last_detection_alignment_status = {
-                        "ok": True,
-                        "reason": "aligned",
-                        "target_index": target_index,
-                        "fixed_order_num": fixed_order_num,
-                        "fixed_order_direction": fixed_order_direction,
-                        "selected_dx": dx,
-                        "target_dx": calibrated_delta_x,
-                    }
-                    return det[0], det[2]
+                    return det[0],det[2]
             else:
                 x_count(False)
                 y_count(False)
                 out_x = 0
-                out_y = 0
                 out_chassis_y = 0
-            trace_now = time.monotonic()
-            if debug_trace and trace_now >= next_trace_time:
-                selected_dx = (
-                    f"{selected_det[4]:.3f}" if selected_det is not None else "None"
-                )
-                selected_error = (
-                    f"{selected_det[4] - calibrated_delta_x:+.3f}"
-                    if selected_det is not None
-                    else "None"
-                )
-                print(
-                    "[TARGET_ALIGNMENT] "
-                    f"raw_dx={raw_candidate_dx} "
-                    f"ordered_dx={[round(item[4], 3) for item in dets]} "
-                    f"selected_dx={selected_dx} target_dx={calibrated_delta_x:.3f} "
-                    f"error={selected_error} out_x={out_x:+.3f} "
-                    f"x_reached={flag_x} direction={target_x_direction} "
-                    f"target_index={target_index} fixed_order_num={fixed_order_num} "
-                    f"fixed_order_direction={fixed_order_direction} "
-                    f"expected_count={expected_detection_count} "
-                    f"rejection={selection_rejection}",
-                    flush=True,
-                )
-                next_trace_time = trace_now + trace_interval
             self.set_velocity(out_x, out_chassis_y, 0)
             self.arm.x_speed(out_y)
             time.sleep(0.05)
@@ -2027,62 +1692,16 @@ class MyCar(MecanumDriver):
                 self.set_velocity(0, 0, 0)
                 self.arm.x_speed(0)
                 logger.error("对齐目标超时")
-                # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
+                return (None, None)
 
-                if require_alignment:
-                    if (
-                        last_selection_rejection is not None
-                        and last_selection_rejection.startswith(
-                            "selected_target_dx_jump"
-                        )
-                    ):
-                        timeout_reason = "association_ambiguous"
-                    elif ever_selected:
-                        timeout_reason = "alignment_timeout"
-                    else:
-                        timeout_reason = "association_timeout"
-                    self.last_detection_alignment_status = {
-                        "ok": False,
-                        "reason": timeout_reason,
-                        "target_index": target_index,
-                        "fixed_order_num": fixed_order_num,
-                        "fixed_order_direction": fixed_order_direction,
-                        "expected_detection_count": expected_detection_count,
-                        "selection_rejection": last_selection_rejection,
-                        "raw_dx": raw_candidate_dx,
-                    }
-                    if debug_trace:
-                        print(
-                            "[TARGET_ALIGNMENT_TIMEOUT] "
-                            f"raw_dx={raw_candidate_dx} "
-                            f"ordered_dx={[round(item[4], 3) for item in dets]} "
-                            f"target_dx={calibrated_delta_x:.3f} "
-                            f"target_index={target_index} "
-                            f"rejection={last_selection_rejection}",
-                            flush=True,
-                        )
-                    return (None, None)
-
-                try:
-                    return det[0], det[2]
-                except:
-                    return (None, None)
-
-    # Orin 2026-07-17 最新默认水平补偿为 3 cm。
-    # 修改前 worktree：def adjust_arm_position(self, dis=0.01):
-    # 同步自 Orin 2026-07-23 现场标定：摄像头与吸嘴的默认水平补偿为 0.06 m。
-    # 保留本地布尔返回值，使调用方仍可在补偿失败时禁止释放。
     def adjust_arm_position(self, dis=0.06):
         # print(f"arm side:{self.arm.side}")
+        # 摄像头和吸嘴距离补偿
         x_position = self.arm.x_get_position()
         if self.arm.side == "LEFT":
-            # 把编码器闭环移动结果返回给调用方，便于放置前失败即退出。
-            return self.arm.move_x_position(x_position + dis)
+            self.arm.move_x_position(x_position + dis)
         elif self.arm.side == "RIGHT":
-            # RIGHT 侧的外伸方向与 LEFT 相反，因此从当前编码器位置减去补偿量。
-            return self.arm.move_x_position(x_position - dis)
-        logger.error(f"机械臂方向无效，无法执行水平补偿: side={self.arm.side}")
-        return False
+            self.arm.move_x_position(x_position - dis)
 
     def debug(self, inference=False):
         """

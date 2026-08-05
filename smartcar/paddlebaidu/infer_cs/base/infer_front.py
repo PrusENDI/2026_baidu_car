@@ -8,7 +8,7 @@ import subprocess
 import psutil
 import yaml
 
-import time, os, sys, socket
+import time, os, sys
 # 添加上两层目录
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..","..", ".."))) 
 from smartcar.whalesbot.tools.log_wrap import logger
@@ -49,40 +49,6 @@ def get_python_processes():
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass
     return python_processes
-
-
-def command_contains_script(cmdline, script_name):
-    """判断命令行是否真正执行目标脚本，而非仅在字符串中提到它。"""
-    if not cmdline:
-        return False
-    for index, arg in enumerate(cmdline[1:], start=1):
-        # python -c "...infer_back_end.py..." 不是后端脚本进程，不能按文件名误认。
-        if "-c" in cmdline[1:index]:
-            continue
-        if os.path.basename(str(arg)) == script_name:
-            return True
-    return False
-
-
-def is_process_in_project(project_root, process_cwd):
-    """判断进程工作目录是否属于当前项目，避免误认其他 worktree。"""
-    if not process_cwd:
-        return False
-    root = os.path.realpath(os.path.abspath(project_root))
-    cwd = os.path.realpath(os.path.abspath(process_cwd))
-    try:
-        return os.path.commonpath([root, cwd]) == root
-    except ValueError:
-        return False
-
-
-def is_port_listening(port, host="127.0.0.1", timeout=0.2):
-    """用 TCP connect 检查推理后端端口是否确实可连接。"""
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except (OSError, ValueError, TypeError):
-        return False
     # for process in python_processes:
     #     print(f"PID: {process['pid']}, Name: {process['name']}, Cmdline: {process['cmdline']}")
     # print("    ")
@@ -157,113 +123,27 @@ class ClintInterface:
     #         ]
     
     def __init__(self, name):
-        root_cfg = get_yaml('config_car.yml')
-        backend_cfg = root_cfg.get('infer_backend', {})
-        self.backend_mode = os.environ.get(
-            'SMARTCAR_INFER_BACKEND', backend_cfg.get('mode', 'worktree')
-        ).strip()
-        if self.backend_mode == 'worktree':
-            self.configs = root_cfg['infer_cfg']
-            self.auto_start_backend = True
-            self.connect_timeout = None
-        elif self.backend_mode == 'external_7_17':
-            external_cfg = backend_cfg.get('external_7_17', {})
-            self.configs = external_cfg.get('services', [])
-            self.auto_start_backend = False
-            try:
-                self.connect_timeout = float(
-                    external_cfg.get('connect_timeout', 15.0)
-                )
-                request_timeout = float(
-                    external_cfg.get('request_timeout', 15.0)
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    'external_7_17 的 connect_timeout/request_timeout 必须是数字'
-                ) from exc
-            if self.connect_timeout <= 0 or request_timeout <= 0:
-                raise ValueError(
-                    'external_7_17 的 connect_timeout/request_timeout 必须大于 0'
-                )
-            self.request_timeout_ms = int(request_timeout * 1000)
-        else:
-            raise ValueError(
-                '未知推理后端模式: '
-                f'{self.backend_mode!r}; 只能是 worktree 或 external_7_17'
-            )
-
+        self.configs = get_yaml('config_car.yml')['infer_cfg']
         logger.info("{}连接服务器...".format(name))
         model_cfg = self.get_config(name)
-        if model_cfg is None:
-            raise ValueError(
-                f'推理服务未配置 mode={self.backend_mode}, name={name!r}'
-            )
         self.img_size = model_cfg['img_size']
-        self.infer_port = model_cfg['port']
-        self.client_timeout_ms = (
-            1000 if self.backend_mode == 'external_7_17' else None
-        )
-        self.client = self.get_zmp_client(
-            self.infer_port, timeout_ms=self.client_timeout_ms
-        )
+        self.client = self.get_zmp_client(model_cfg['port'])
         
         infer_back_end_file = "infer_back_end.py"
         # 检查后台程序是否运行, 如果未开启, 则开启
-        if self.auto_start_backend:
-            self.check_back_python(infer_back_end_file, port=self.infer_port)
-        else:
-            logger.info(
-                f'使用外部 7_17 推理后端 name={name}, port={self.infer_port}; '
-                '不会扫描或启动本工作树后端'
-            )
+        self.check_back_python(infer_back_end_file)
 
         flag = False
-        deadline = (
-            None
-            if self.connect_timeout is None
-            else time.monotonic() + self.connect_timeout
-        )
-        last_error = None
         while True:
-            try:
-                if self.get_state():
-                    if flag:
-                        logger.info("")
-                    break
-                last_error = None
-            except zmq.ZMQError as exc:
-                last_error = exc
-                if not self.auto_start_backend:
-                    self.client.close(linger=0)
-                    self.client = self.get_zmp_client(
-                        self.infer_port, timeout_ms=self.client_timeout_ms
-                    )
-                else:
-                    raise
-            if deadline is not None and time.monotonic() >= deadline:
-                self.client.close(linger=0)
-                detail = (
-                    f'{type(last_error).__name__}: {last_error}'
-                    if last_error is not None
-                    else '后端尚未完成模型初始化'
-                )
-                raise RuntimeError(
-                    '无法连接外部 7_17 推理后端，请先从 7_17 目录启动 '
-                    f'infer_back_end.py: name={name}, port={self.infer_port}, '
-                    f'timeout={self.connect_timeout:.1f}s, detail={detail}'
-                )
+            if self.get_state():
+                if flag:
+                    logger.info("")
+                break
             # 输出一个提示信息，不换行
             print('.', end='', flush=True)
             # logger.info(".")
             time.sleep(1)
             flag = True
-        if not self.auto_start_backend:
-            # 就绪探测使用短超时；正式图片推理允许使用独立的较长超时。
-            self.client.close(linger=0)
-            self.client_timeout_ms = self.request_timeout_ms
-            self.client = self.get_zmp_client(
-                self.infer_port, timeout_ms=self.client_timeout_ms
-            )
         # print(self.client)
         # print("连接服务器成功")
         logger.info("{}连接服务器成功".format(name))
@@ -295,94 +175,15 @@ class ClintInterface:
             # os.system(cmd_str + " > /dev/null 2>&1")
         
 
-    # 修改后的实现放在原方法之后，保留上方旧实现作为审计记录；类定义中后出现的
-    # 同名方法会覆盖旧实现，但不会删除现场曾使用过的代码。
-    def check_back_python(self, file_name, port=None):
-        """按当前项目目录和端口确认后端，必要时启动并输出诊断信息。"""
-        dir_file = os.path.abspath(os.path.dirname(__file__))
-        file_path = os.path.join(dir_file, file_name)
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"推理后端脚本不存在: {file_path}")
-
-        project_root = os.path.abspath(os.path.join(dir_file, "..", "..", "..", ".."))
-        print(f"[infer-backend] project_root={project_root}")
-        print(f"[infer-backend] script={file_path}")
-        print(f"[infer-backend] required_port={port}")
-
-        same_project_process = False
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                cmdline = proc.info.get('cmdline') or []
-                if not command_contains_script(cmdline, file_name):
-                    continue
-                process_cwd = proc.cwd()
-                in_project = is_process_in_project(project_root, process_cwd)
-                print(
-                    f"[infer-backend] candidate pid={proc.pid} cwd={process_cwd!r} "
-                    f"same_project={in_project} cmdline={cmdline!r}"
-                )
-                if not in_project:
-                    print(
-                        f"[infer-backend][WARN] 忽略其他项目目录的 {file_name}: "
-                        f"pid={proc.pid}, cwd={process_cwd!r}"
-                    )
-                    continue
-                same_project_process = True
-                if port is None or is_port_listening(port):
-                    print(f"[infer-backend] 当前项目后端已运行: pid={proc.pid}, port={port}")
-                    return True
-                print(
-                    f"[infer-backend][WARN] 当前项目进程存在但端口 {port} 尚未监听，"
-                    "不重复启动；继续等待其完成初始化。"
-                )
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as exc:
-                print(f"[infer-backend][WARN] 读取候选进程失败: {exc}")
-
-        if same_project_process:
-            return False
-
-        print(
-            f"[infer-backend] 未找到当前项目中可用的 {file_name}，"
-            "准备启动；其他目录同名进程不会复用。"
-        )
-        try:
-            # 修改前使用 shell=True 且将 stdout/stderr 丢到 DEVNULL，会隐藏后端 traceback。
-            process = subprocess.Popen(
-                [sys.executable, file_path],
-                cwd=project_root,
-                stdout=None,
-                stderr=None,
-                start_new_session=True,
-            )
-        except Exception as exc:
-            print(f"[infer-backend][ERROR] 启动 {file_name} 失败: {exc!r}")
-            raise
-
-        print(f"[infer-backend] 已启动 pid={process.pid}, cwd={project_root}")
-        time.sleep(1)
-        if port is not None and not is_port_listening(port):
-            print(
-                f"[infer-backend][ERROR] 后端进程已启动但端口 {port} 尚未监听；"
-                "请检查后端 traceback、模型加载和串口占用。"
-            )
-            return False
-        if port is not None:
-            print(f"[infer-backend] 端口 {port} 已开始监听")
-        return True
-
     def get_config(self, name):
         for conf in self.configs:
             if conf['name'] == name:
                 return conf
             
     @staticmethod
-    def get_zmp_client(port, timeout_ms=None):
+    def get_zmp_client(port):
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        if timeout_ms is not None:
-            socket.setsockopt(zmq.SNDTIMEO, int(timeout_ms))
-            socket.setsockopt(zmq.RCVTIMEO, int(timeout_ms))
         socket.connect(f"tcp://127.0.0.1:{port}")
         return socket
 
@@ -401,21 +202,8 @@ class ClintInterface:
             img = cv2.resize(img, self.img_size)
         img = cv2.imencode('.jpg', img)[1].tobytes()
         data = bytes('image', encoding='utf-8') + img
-        try:
-            self.client.send(data)
-            response = self.client.recv()
-        except zmq.ZMQError as exc:
-            if not self.auto_start_backend:
-                # REQ 套接字超时后不能直接发送下一条请求，必须重新连接。
-                self.client.close(linger=0)
-                self.client = self.get_zmp_client(
-                    self.infer_port, timeout_ms=self.client_timeout_ms
-                )
-                raise RuntimeError(
-                    '外部 7_17 推理请求失败，连接已重置: '
-                    f'port={self.infer_port}, error={exc}'
-                ) from exc
-            raise
+        self.client.send(data)
+        response = self.client.recv()
         response = json.loads(response)
         return response
 

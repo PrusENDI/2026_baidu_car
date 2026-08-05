@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-import re
 import json
 import math
 import os
+import re
+from urllib.parse import urlparse
+
 import yaml
 from openai import OpenAI
 
@@ -250,40 +252,34 @@ class ErnieBotWrap():
 		module_dir = os.path.dirname(os.path.abspath(__file__))
 		config_path = os.path.join(module_dir, '..', '..', '..', '..', 'config_car.yml')
 		with open(config_path, 'r', encoding='utf-8') as f:
-			config = yaml.safe_load(f)
+			qianfan = yaml.safe_load(f)['qianfan']
 
-		qianfan_cfg = config.get('qianfan', {})
-		api_key_path = '/home/jetson/qianfan.env'
-		try:
-			with open(api_key_path, 'r', encoding='utf-8') as f:
-				api_key_line = f.read().strip()
-		except OSError as exc:
-			raise RuntimeError(f'无法读取千帆 API Key 文件: {api_key_path}') from exc
-		api_key_prefix = 'QIANFAN_API_KEY='
-		if not api_key_line.startswith(api_key_prefix):
-			raise RuntimeError(
-				f'千帆 API Key 文件格式错误: {api_key_path}'
-			)
-		api_key = api_key_line[len(api_key_prefix):].strip()
-		base_url = str(qianfan_cfg.get('base_url', '')).strip()
-		model = str(qianfan_cfg.get('multimodal_model', '')).strip()
-		request_timeout = float(qianfan_cfg.get('request_timeout', 10.0))
+		api_key = qianfan.get('api_key')
+		if not isinstance(api_key, str) or not api_key.strip() or api_key == '请在这里填写千帆 API Key':
+			raise RuntimeError('缺少 qianfan.api_key 配置')
+		api_key = api_key.strip()
 
-		if not api_key:
-			raise RuntimeError(f'千帆 API Key 文件内容为空: {api_key_path}')
-		if not base_url.startswith('https://'):
-			raise ValueError('千帆 base_url 必须是 HTTPS 地址')
-		if not model:
-			raise ValueError('千帆 multimodal_model 不能为空')
-		if not math.isfinite(request_timeout) or request_timeout <= 0:
-			raise ValueError('千帆 request_timeout 必须是有限正数')
+		base_url = qianfan.get('base_url')
+		if not isinstance(base_url, str):
+			raise ValueError('qianfan.base_url must be HTTPS')
+		parsed_url = urlparse(base_url.strip())
+		if parsed_url.scheme.lower() != 'https' or not parsed_url.netloc:
+			raise ValueError('qianfan.base_url must be HTTPS')
 
-		self.client = OpenAI(api_key=api_key, base_url=base_url)
-		self.image_model = model
-		self.request_timeout = request_timeout
+		model = qianfan.get('multimodal_model')
+		if not isinstance(model, str) or not model.strip():
+			raise ValueError('qianfan.multimodal_model must not be empty')
 
-		self.msgs = []
-		self.model = model
+		request_timeout = qianfan.get('request_timeout')
+		if (isinstance(request_timeout, bool)
+				or not isinstance(request_timeout, (int, float))
+				or not math.isfinite(request_timeout)
+				or request_timeout <= 0):
+			raise ValueError('qianfan.request_timeout must be finite and positive')
+
+		self.client = OpenAI(api_key=api_key, base_url=base_url.strip())
+		self.model = model.strip()
+		self.request_timeout = float(request_timeout)
 		self.prompt_str = '请根据下面的描述生成给定格式json'
 
 	@staticmethod
@@ -308,98 +304,93 @@ class ErnieBotWrap():
 		self.prompt_str = prompt_str
 		# print(self.prompt_str)
 	
-	@staticmethod
-	def parse_json_object(content):
-		"""解析纯 JSON 或单个 Markdown JSON 代码块。"""
-		if not isinstance(content, str) or not content.strip():
-			raise ValueError('千帆响应为空')
+	def get_multimodal_json(self, base64_image, prompt, request_timeout=None):
+		timeout = self.request_timeout if request_timeout is None else request_timeout
+		if (isinstance(timeout, bool)
+				or not isinstance(timeout, (int, float))
+				or not math.isfinite(timeout)
+				or timeout <= 0):
+			raise ValueError('request_timeout must be finite and positive')
+
+		response = self.client.chat.completions.create(
+			model=self.model,
+			messages=[{
+				'role': 'user',
+				'content': [
+					{'type': 'text', 'text': prompt},
+					{
+						'type': 'image_url',
+						'image_url': {
+							'url': f'data:image/jpeg;base64,{base64_image}'
+						},
+					},
+				],
+			}],
+			top_p=0.1,
+			timeout=float(timeout),
+		)
+		content = response.choices[0].message.content
+		if not isinstance(content, str):
+			raise ValueError('multimodal response content must be text')
 		text = content.strip()
-		fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
-		if fenced:
-			text = fenced.group(1).strip()
+		fence = re.fullmatch(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
+		if fence:
+			text = fence.group(1)
 		data = json.loads(text)
 		if not isinstance(data, dict):
-			raise ValueError('千帆响应必须是单个 JSON 对象')
+			raise ValueError('multimodal response must be a JSON object')
 		return data
 
-	def get_multimodal_json(self, base64_image, prompt, request_timeout=None):
-		"""调用千帆多模态模型并返回单个 JSON 对象。"""
-		if not isinstance(base64_image, str) or not base64_image:
-			raise ValueError('多模态图片 Base64 不能为空')
-		if not isinstance(prompt, str) or not prompt.strip():
-			raise ValueError('多模态提示词不能为空')
-		timeout = self.request_timeout if request_timeout is None else request_timeout
-		response = self.client.chat.completions.create(
-			model=self.image_model,
-			messages=[
-				{
-					'role': 'user',
-					'content': [
-						{'type': 'text', 'text': prompt},
-						{
-							'type': 'image_url',
-							'image_url': {
-								'url': f'data:image/jpeg;base64,{base64_image}'
-							},
-						},
-					],
-				}
-			],
-			top_p=0.1,
-			timeout=timeout,
-		)
-		return self.parse_json_object(response.choices[0].message.content)
+	def get_image_res(self, image):
+		data = self.get_multimodal_json(image, str(ImagePrompt()))
+		return data['result'], data['analysis']
 
-	def get_res(self, str_input, record=False, request_timeout=5):
-		if len(str_input)<1:
-			return False, None
-		start_str = " ```"
-		end_str = " ```, 根据这段描述生成给定格式json"
-		str_input = start_str + str_input + end_str
-		msg_tmp = self.get_mes(0, str_input)
-		if record:
-			self.msgs.append(msg_tmp)
-			msgs = self.msgs
-		else:
-			msgs = [msg_tmp]
-		try:
-			request_messages = []
-			if self.prompt_str:
-				request_messages.append({'role': 'system', 'content': self.prompt_str})
-			request_messages.extend(msgs)
-			response = self.client.chat.completions.create(
-				model=self.model,
-				messages=request_messages,
-				top_p=0.1,
-				timeout=request_timeout,
-			)
-		except Exception:
-			return False, None
-		str_res = response.choices[0].message.content
-		if record:
-			self.msgs.append(self.get_mes(1, str_res))
-		return True, str_res
-	
-
-	
-	
-	
 	@staticmethod
 	def get_json_str(json_str:str):
 		try:
-			return ErnieBotWrap.parse_json_object(json_str)
-		except (TypeError, ValueError, json.JSONDecodeError):
-			return None
+			index_s = json_str.find("```json")
+			if index_s == -1:
+				index_s = json_str.find("```") 
+				if index_s == -1:
+					return None
+				else:
+					index_s += 3
+					
+			else:
+				index_s += 7
+			# print(json_str[index_s:])
+			index_e = json_str[index_s:].find("```") + index_s
+			if index_e == -1:
+				return None
+			# json_str = json_str[index_s:index_e]
+			# print(json_str[index_s:index_e])
+			# print(index_s, index_e)
+			json_str = json_str[index_s:index_e]
+			# 找到注释内容并删除
+			json_str.replace("\n", "")
+			# print(json_str)
+			msg_json = json.loads(json_str)
+			return msg_json
+			# print(index_s)
+			# return json_str
+		except Exception as e:
+			# print(e)
+			return json_str
+			'''
+			try:
+				index_s = json_str.find("```json") + 7
+				# index_s = json_str.find("```json") + 7
+			except Exception as e:
+				index_s = 0
+			try:
+				index_e = json_str[index_s:].find("```") + index_s
+			except Exception as e:
+				index_e = len(json_str)
+			import json
+			msg_json = json.loads(json_str[index_s:index_e])
+			return msg_json
+			'''
 	
-	def get_res_json(self, str_input, record=False, request_timeout=10):
-		state, str_res = self.get_res(str_input, record, request_timeout)
-		if state:
-			# print(str_res)
-			obj_json = self.get_json_str(str_res)
-			return obj_json
-		else:
-			return None
-
 def test():
 	res = '''```json\n[\n  {\n    "func": "my_light",\n    "count": 3\n  },\n  {\n    "func": "beep",\n    "time_dur": 3  // 假设蜂鸣器持续发声3秒作为紧急警示，具体时长可根据实际情况调整\n  }\n]\n```'''
 	json_test = ErnieBotWrap.get_json_str(res)
@@ -408,44 +399,5 @@ def test():
 
 
 if __name__ == "__main__":
-	# test()
-	# str_input = ''' 如果买满200元可优惠40元。购买了3件商品,价格分别为85元、130元和115元。最终支付多少钱?	选项有: A.300元 B.180元 C.130元 D.290元'''
-	str_input = ''' 2号楼的李四要做芹菜炒肉，他现在需要芹菜。 '''
-	
-	ernie = ErnieBotWrap()
-	# 设置prompt
-	# ernie.set_promt(str(ImagePrompt()))
-	# ernie.set_promt(str(ActionPrompt()))
-	# ernie.set_promt(str(HumAttrPrompt()))
-	# ernie.set_promt(str(EduCounselerPrompt()))
-	ernie.set_promt(str(OrderPrompt()))
-	
-	# 测试图片分析功能
-	# 请将下面的路径替换为实际的动物图片路径
-	# image_path = r"C:\Users\mengc\OneDrive\WhalesBot\2026smartcar\code\baidu_smartcar_2026\smartcar\paddlebaidu\ernie_bot\base\image.png"
-	# with open(image_path, "rb") as image_file:
-	# 	image  = image_file.read()
-	# 	base64_image  = base64.b64encode(image).decode("utf-8")
-	
-	# response = ernie.get_image_res(base64_image)
-	# print("-----------------")
-	# print(response)
-	# print("-----------------")
-	# print(response.choices[0].message.content)
-	
-	# 测试文本输入
-	json_res = ernie.get_res_json(str_input)
-	print("-----------------")
-	print(json_res)
-	print(json_res['name'])
-	# while True:
-	# 	print("用户")
-	# 	str_tmp = input("输入:")
-	# 	if len(str_tmp)<1:
-	# 		continue
-	# 	# Create a chat completion
-	# 	print("文心一言")
-	# 	# _, str_res = ernie.get_res(str_tmp)
-	# 	json_res = ernie.get_res_json(str_tmp)
-	# 	print("输出:",json_res)
+	test()
 	
