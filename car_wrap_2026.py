@@ -1558,6 +1558,8 @@ class MyCar(MecanumDriver):
         limit_y=1,
         detector=None,
         rotation_angle=0,
+        camera_pitch_angle=0,
+        camera_horizontal_fov=75,
     ) -> List[list]:
         """
         获取检测结果,使用任务的目标检测对侧边摄像头图像进行检测，返回检测结果。
@@ -1567,8 +1569,37 @@ class MyCar(MecanumDriver):
         """
         # 获取相关数据。
         image = self.cap_side.read()
+        height, width = image.shape[:2]
+        if camera_pitch_angle != 0:
+            focal_length = width / (
+                2 * math.tan(math.radians(camera_horizontal_fov) / 2)
+            )
+            camera_matrix = np.array(
+                [
+                    [focal_length, 0, width / 2],
+                    [0, focal_length, height / 2],
+                    [0, 0, 1],
+                ],
+                dtype=np.float32,
+            )
+            pitch = math.radians(camera_pitch_angle)
+            pitch_rotation = np.array(
+                [
+                    [1, 0, 0],
+                    [0, math.cos(pitch), -math.sin(pitch)],
+                    [0, math.sin(pitch), math.cos(pitch)],
+                ],
+                dtype=np.float32,
+            )
+            homography = camera_matrix @ pitch_rotation @ np.linalg.inv(camera_matrix)
+            image = cv2.warpPerspective(
+                image,
+                homography,
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
         if rotation_angle != 0:
-            height, width = image.shape[:2]
             rotation_matrix = cv2.getRotationMatrix2D(
                 (width / 2, height / 2), rotation_angle, 1.0
             )
@@ -1705,6 +1736,8 @@ class MyCar(MecanumDriver):
         num=0,
         detector=None,
         rotation_angle=0,
+        camera_pitch_angle=0,
+        camera_horizontal_fov=75,
         arm_x_bounds=None,
         max_delta_x_error=None,
         target_x_direction=None,
@@ -1843,6 +1876,8 @@ class MyCar(MecanumDriver):
                 sort_pos=sort_pos,
                 detector=detector,
                 rotation_angle=rotation_angle,
+                camera_pitch_angle=camera_pitch_angle,
+                camera_horizontal_fov=camera_horizontal_fov,
             )
             if label is not None:
                 dets = [item for item in dets if item[2] == label]

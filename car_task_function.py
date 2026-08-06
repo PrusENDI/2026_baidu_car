@@ -42,7 +42,7 @@ def init():
     my_car.arm.reset_position()
     my_car.reset_position()  #
 
-def auto_lane_tracing(speed=0.3, dis_hold=0.85):
+def auto_lane_tracing(speed=0.28, dis_hold=0.85):
     my_car.lane_dis_offset(speed=speed, dis_hold=dis_hold)
     print(f"巡线停止的位置：{my_car.get_odometry()}")
 
@@ -53,9 +53,9 @@ def auto_seeding():
     sin45 = math.sin(heading)  # sin45°
     # 正对播种点车子的理论位置
     cylinder_loc = {
-        "cylinder_3": [x_length + dis * sin45 - 0.01, dis * sin45 - 0.02, 0.75],
-        "cylinder_2": [x_length + (dis + 0.15) * sin45 - 0.01, (dis + 0.15) * sin45 - 0.02, 0.75],
-        "cylinder_1": [x_length + (dis + 0.3) * sin45 - 0.01, (dis + 0.3) * sin45 - 0.02, 0.75],
+        "cylinder_3": [x_length + dis * sin45 - 0.02, dis * sin45 - 0.03, 0.76],
+        "cylinder_2": [x_length + (dis + 0.15) * sin45 - 0.02, (dis + 0.15) * sin45 - 0.03, 0.76],
+        "cylinder_1": [x_length + (dis + 0.3) * sin45 - 0.02, (dis + 0.3) * sin45 - 0.03, 0.76],
     }
     cylinder_list = ["cylinder_3", "cylinder_2", "cylinder_1"]
     cylinder_set_list = {}
@@ -96,14 +96,14 @@ def auto_seeding():
         my_car.arm.set_arm_angle("RIGHT")#再次确认
         time.sleep(2)
         # 识别目标
-        cls_id, label = my_car.move_to_detection_target(0.17,-0.04)
+        cls_id, label = my_car.move_to_detection_target(0.17,0)
         
         #直到识别到目标
         if not label:
             for i in range(10):
                 my_car.arm.set_arm_angle("RIGHT")#再次确认
                 time.sleep(0.2)
-                cls_id, label = my_car.move_to_detection_target(0.17,-0.04)
+                cls_id, label = my_car.move_to_detection_target(0.17,0)
                 if label:
                     break
         if not label:
@@ -216,6 +216,7 @@ def target_shooting_detection(debug=False) -> list:
 
     # 先摆好侧摄像头搜索姿态，再根据调试模式选择进入任务区的距离。
     my_car.arm.set_arm_pose(**scan_pose)
+    time.sleep(2)
     task_distance = (
         task_entry["debug_distance"]
         if debug
@@ -248,6 +249,7 @@ def target_shooting_detection(debug=False) -> list:
         cls_id, label = my_car.move_to_detection_target(
             delta_y=alignment["delta_y"]
         )
+        time.sleep(0.5)
         if label == "animal":
             res, analysis = my_car.animal_image_analysis()
             if res is not None:
@@ -361,7 +363,7 @@ def water_tower_task(debug=False):
         'x': 0.01,
         'y': 0.00,
         'arm': "RIGHT",
-        'hand': "UP"
+        'hand': 75
     }
 
     PLACINGING_POSE ={
@@ -406,7 +408,6 @@ def water_tower_task(debug=False):
                     time.sleep(1)
                     cls_id, label = my_car.move_to_detection_target(0.16,-0.06)
                     if label:
-                        label = None
                         break
             my_car.beep()
 
@@ -426,13 +427,13 @@ def water_tower_task(debug=False):
             x, y, arm, hand = PLACINGING_POSE.values()
             my_car.arm.set_arm_pose(arm=arm, hand=hand)
             time.sleep(3)
-            my_car.arm.set_arm_pose(x=x, y=y+0.035*i)
+            my_car.arm.set_arm_pose(x=x, y=y+0.04*i)
             
             # 回到记录的绝对坐标位置，确保每次放置水方块时车子的位置都是一致的，从而提高放置的准确性
             my_car.move_to_position(loc)
             
             # 移动到水塔内侧，确保放置位置正确
-            my_car.arm.move_x_position(0.17)
+            my_car.arm.move_x_position(0.185)
             my_car.arm.grasp(False)
             time.sleep(2)
             my_car.arm.move_x_position(0.01)
@@ -447,7 +448,12 @@ def water_tower_task(debug=False):
     my_car.lane_dis_offset(speed=0.2, dis_hold=distance)      
 
     # 识别需求标志，确定需要拾取的水方块数量
-    cls_id, label = my_car.move_to_detection_target(delta_x=0.14, delta_y=None)
+    cls_id, label = my_car.move_to_detection_target(
+        delta_x=0.14,
+        delta_y=None,
+        camera_pitch_angle=-15,
+        camera_horizontal_fov=75,
+    )
     # 根据识别结果确定第一个水塔需要的水方块数量，调试时默认3个都需要
     tower1_need = 3 if debug else get_water_block_needs_by_label(label)
     # 根据第一个水塔的需求数量，从预设的位置参数列表中取对应数量的位置参数进行拾取和放置
@@ -461,7 +467,12 @@ def water_tower_task(debug=False):
     my_car.move_for([0.24, 0, 0])
 
     # 识别需求标志，确定需要拾取的水方块数量
-    cls_id, label = my_car.move_to_detection_target(delta_x=0.14, delta_y=None)
+    cls_id, label = my_car.move_to_detection_target(
+        delta_x=0.14,
+        delta_y=None,
+        camera_pitch_angle=-15,
+        camera_horizontal_fov=75,
+    )
     # 根据识别结果确定第二个水塔需要的水方块数量，调试时默认3个都需要
     tower2_need = 3 if debug else get_water_block_needs_by_label(label)
     # 根据第二个水塔的需求数量，从预设的位置参数列表中取对应数量的位置参数进行拾取和放置
@@ -534,7 +545,7 @@ TARGET_SHOOTING_POSES = {
 
 
 def target_shooting(
-    animal_list=[0, 0, 0, 0],
+    animal_list=[1, 1, 1, 0],
     debug=False,
     shooting_delta_x=None,
 ):  # noqa: E741
@@ -860,87 +871,379 @@ def target_shooting(
     }
     print(f"射击最终结果：{final_result}")
     my_car.clear_shooting_target_display()
+
+    my_car.arm.move_y_position(0.2)
+    my_car.arm.move_x_position(0.01)
+    my_car.arm.set_arm_pose(arm="LEFT")
+    my_car.arm.set_hand_angle("DOWN")
+
     if debug:
         my_car.move_to_position(debug_return["position"])
 
 
-def crop_harvesting(debug=False):
-    """
-    作物采收
-    """
+# 比赛现场实际需要收集的球数量。它和球座总数不是同一个概念：
+# 球座固定为 8 个，但其中可以有空座；需要调整采收数量时只修改这里，
+# 或在调用 crop_harvesting(target_ball_count=...) 时临时覆盖。
+CROP_HARVESTING_TARGET_BALL_COUNT = 8
 
-    # 调整机械臂
-    my_car.arm.move_y_position(0.2)
-    my_car.set_storage(True)  # 抬起储物架。
-    my_car.arm.set_arm_pose(arm="LEFT")
-    my_car.arm.set_hand_angle("DOWN")
-    # 移动到任务位置
-    task_distance = 0.70 if debug else 2.3
-    my_car.lane_dis_offset(speed=0.2, dis_hold=task_distance)
-    my_car.arm.move_y_position(0.17)
-    first_label = None
-    for i in range(8):
-        # 调整机械臂
-        # 修改前仅按编码器移动到 x=0.0，且忽略停滞结果；现在每轮抓取前
-        # 低速触达物理回收端并重新建立零点，只有寻零成功才允许转到 LEFT。
-        # 末端手腕在初始化或上一轮放球后已经保持 DOWN；这里只翻转到 LEFT，
-        # 修改前会在翻转完成后重复下发一次 hand="DOWN"。
+
+def crop_harvesting(
+    debug=False,
+    target_ball_count=CROP_HARVESTING_TARGET_BALL_COUNT,
+    max_slots=8,
+    slot_step=0.04,
+    max_grasp_attempts=2,
+    search_speed=0.08,
+    search_timeout=15.0,
+):
+    """
+    作物采收。
+
+    采收区的 8 个球座可能存在空位，因此流程分成两个阶段：
+
+    1. 基础行驶距离结束后，用低速车道保持寻找第一个球。第一个球
+       不一定正好位于预设座位的中心，不能直接按固定距离盲走。
+    2. 找到第一个球后，车辆按照球座间距 ``slot_step`` 逐个检查后续
+       球座。空座位只前进、不执行任何机械臂抓取动作。
+
+    一次抓取并放球后，机械臂会恢复到原来的 LEFT/DOWN 识别姿态，
+    再检查刚才的球座。只有确认球已经消失，才把成功数量加一；如果
+    球仍在，则在同一球座最多重新执行一次完整抓取流程。
+
+    ``target_ball_count`` 是实际需要成功收集的球数量，达到该数量后
+    立即停止固定间距扫描；``max_slots`` 只是扫描上限，不代表一定要
+    抓取这么多个球。
+    """
+    if (
+        isinstance(target_ball_count, bool)
+        or not isinstance(target_ball_count, int)
+        or target_ball_count <= 0
+    ):
+        raise ValueError("target_ball_count 必须是正整数")
+    if (
+        isinstance(max_slots, bool)
+        or not isinstance(max_slots, int)
+        or max_slots <= 0
+    ):
+        raise ValueError("max_slots 必须是正整数")
+    if target_ball_count > max_slots:
+        raise ValueError("target_ball_count 不能大于 max_slots")
+    if slot_step <= 0 or search_speed <= 0 or search_timeout <= 0:
+        raise ValueError("slot_step、search_speed、search_timeout 必须大于 0")
+    if (
+        isinstance(max_grasp_attempts, bool)
+        or not isinstance(max_grasp_attempts, int)
+        or max_grasp_attempts <= 0
+    ):
+        raise ValueError("max_grasp_attempts 必须是正整数")
+
+    ball_labels = ("ball_blue", "ball_yellow")
+    alignment_timeout = 6.0
+    detection_stable_frames = 3
+    detection_frame_interval = 0.10
+    detection_dx_tolerance = 0.12
+    detection_dy_tolerance = 0.12
+
+    def get_ball_detections():
+        """只保留蓝球和黄球，避免把储物架等其他检测结果当成作物。"""
+        try:
+            detections = my_car.get_detection_results()
+        except Exception as exc:
+            print(f"采收视觉检测异常，当前球座按未确认处理：{exc}")
+            return []
+        return [
+            item
+            for item in detections
+            if len(item) >= 8 and item[2] in ball_labels
+        ]
+
+    def stable_ball_detection(
+        timeout=alignment_timeout,
+        reference_detection=None,
+    ):
+        """
+        连续读取当前画面，只有同一个球连续出现若干帧才返回。
+
+        这里使用检测框的横向坐标和标签关联连续帧，避免机械臂刚移开、
+        画面刷新或偶发漏检造成错误的空位判断。返回值仍然保持模型
+        原始检测结果格式，后续对齐时可以直接取 label。
+        """
+        deadline = time.monotonic() + timeout
+        previous = None
+        stable_count = 0
+        while time.monotonic() < deadline:
+            detections = get_ball_detections()
+            if reference_detection is not None:
+                # 放球后的复查必须尽量关联到刚才的物理球座；如果
+                # 画面里同时看到了相邻座位的同色球，不能把相邻球
+                # 当作当前座位的球仍然存在。
+                detections = [
+                    item
+                    for item in detections
+                    if item[2] == reference_detection[2]
+                    and abs(item[4] - reference_detection[4])
+                    <= detection_dx_tolerance
+                    and abs(item[5] - reference_detection[5])
+                    <= detection_dy_tolerance
+                ]
+            current = detections[0] if detections else None
+            if current is not None:
+                same_ball = (
+                    previous is not None
+                    and current[2] == previous[2]
+                    and abs(current[4] - previous[4]) <= detection_dx_tolerance
+                    and abs(current[5] - previous[5]) <= detection_dy_tolerance
+                )
+                stable_count = stable_count + 1 if same_ball else 1
+                previous = current
+                if stable_count >= detection_stable_frames:
+                    return current
+            else:
+                previous = None
+                stable_count = 0
+            time.sleep(detection_frame_interval)
+        return None
+
+    def reset_arm_for_detection():
+        """恢复到原流程使用的识别姿态，不引入新的机械臂动作接口。"""
         my_car.arm.set_arm_pose(arm="LEFT")
         my_car.arm.set_hand_angle("DOWN")
 
-        # 对齐目标
-        alignment_timeout = 6.0
-        alignment_start = time.time()
-        cls_id, label = my_car.move_to_detection_target(delta_x=-0.14, delta_y=-0.06, time_out=alignment_timeout,)
-        alignment_elapsed = time.time() - alignment_start
-        alignment_timed_out = alignment_elapsed >= alignment_timeout
+    def search_first_ball():
+        """
+        在基础距离之后低速巡线寻找第一个球。
 
-        if i == 0:
-            first_label = label
+        lane_base 每次完成一次前视车道计算后调用 end_function；回调中
+        轮询侧视检测结果，连续看到稳定球后返回 True，让 lane_base 停车。
+        第一个球搜索不使用 slot_step，因此不会把球座间的空隙误当成
+        已经完成一次固定座位移动。
+        """
+        state = {
+            "first_detection": None,
+            "stable_count": 0,
+            "previous": None,
+            "last_poll": 0.0,
+        }
+        deadline = time.monotonic() + search_timeout
 
-        print(f"发现第{i + 1}个作物，目标为{label}")
+        def end_search():
+            now = time.monotonic()
+            if now >= deadline:
+                return True
+            # 视觉推理不需要跟随车道控制的每一个高频循环执行，
+            # 限制轮询频率可以避免重复推理影响低速巡线稳定性。
+            if now - state["last_poll"] < detection_frame_interval:
+                return False
+            state["last_poll"] = now
+
+            detections = get_ball_detections()
+            current = detections[0] if detections else None
+            if current is None:
+                state["previous"] = None
+                state["stable_count"] = 0
+                return False
+
+            same_ball = (
+                state["previous"] is not None
+                and current[2] == state["previous"][2]
+                and abs(current[4] - state["previous"][4])
+                <= detection_dx_tolerance
+                and abs(current[5] - state["previous"][5])
+                <= detection_dy_tolerance
+            )
+            state["stable_count"] = (
+                state["stable_count"] + 1 if same_ball else 1
+            )
+            state["previous"] = current
+            if state["stable_count"] >= detection_stable_frames:
+                state["first_detection"] = current
+                return True
+            return False
+
+        my_car.lane_base(search_speed, end_search, stop=True)
+        return state["first_detection"]
+
+    def pick_and_place_ball(label, first_label):
+        """执行原 crop_harvesting 中已有的单次抓取、分类和放球动作。"""
+        cls_id, aligned_label = my_car.move_to_detection_target(
+            delta_x=-0.14,
+            delta_y=-0.06,
+            label=label,
+            time_out=alignment_timeout,
+            # 明确要求 move_to_detection_target 完成对齐后才返回成功。
+            # 该模式使用较宽的高级对齐容差和 3 帧稳定判断；超时时
+            # 会严格返回 (None, None)，不会把超时前最后一帧检测结果
+            # 误当成已经对齐成功。
+            require_alignment=True,
+        )
+        if (
+            cls_id is None
+            or aligned_label not in ball_labels
+        ):
+            alignment_status = getattr(
+                my_car,
+                "last_detection_alignment_status",
+                {},
+            )
+            print(
+                f"采收目标对齐失败 label={label}，"
+                f"status={alignment_status}"
+            )
+            return False, aligned_label
+
+        print(f"对齐第 {label} 个作物，开始抓取")
         time.sleep(0.5)
-
-        # 补偿
         my_car.adjust_arm_position()
 
-        # 抓取
+        # 以下机械臂动作顺序与修改前完全一致：先夹取/吸取，再抬起，
+        # 翻转到放置姿态，按第一个球的类别选择左右放置位置，最后释放。
         my_car.arm.grasp(True)
         time.sleep(0.3)
-
-        # 抓球高度抬高 5 cm：修改前为 0.045 m，当前调试值为 0.095 m。
-        my_car.arm.move_y_position(0.07)  # 吸取
+        my_car.arm.move_y_position(0.07)
         time.sleep(1)
-        my_car.arm.move_y_position(0.20)  # 抬起机械臂
+        my_car.arm.move_y_position(0.20)
         time.sleep(0.3)
-
-        my_car.arm.set_arm_angle(-113, 40)
+        my_car.arm.set_arm_angle(-110, 40)
         time.sleep(2)
 
-        if label == first_label:  # 第一个种类的球在一号位
-            target_x = 0.06
-        else:
-            target_x = 0.0
-        
+        target_x = 0.06 if label == first_label else 0.0
         my_car.arm.move_x_position(target_x)
-        my_car.arm.move_y_position(0.15)
+        my_car.arm.move_y_position(0.19)
         time.sleep(0.5)
-        my_car.arm.set_arm_angle(-113, 40)
-        my_car.arm.set_hand_angle(-35)
+        my_car.arm.set_arm_angle(-110, 40)
+        my_car.arm.set_hand_angle(-37)
         my_car.beep()
         time.sleep(0.5)
         my_car.arm.grasp(False)
         time.sleep(1)
-        my_car.arm.set_hand_angle("DOWN")
-        my_car.arm.set_arm_pose(arm="LEFT")
-        my_car.lane_dis_offset(speed=0.2, dis_hold=0.04)
-        time.sleep(0.5)
 
-    my_car.set_storage(False)  # 放下存储架
-    my_car.arm.move_y_position(0.2)  # 防止撞到
-    time.sleep(0.5)
-    if debug:
-        my_car.move_to_position([0.0, 0.0, 0.0])
+        # 放球后立即恢复识别方向；下一步由调用方复查同一个物理球座。
+        reset_arm_for_detection()
+        time.sleep(0.5)
+        return True, aligned_label
+
+    first_label = None
+    picked_count = 0
+    checked_slots = 0
+
+    # 调整机械臂并抬起储物架，保持原流程的起始动作不变。
+    my_car.arm.move_y_position(0.2)
+    my_car.set_storage(True)
+    reset_arm_for_detection()
+
+    try:
+        # 基础距离：正常运行进入采收区 2.45 m，调试模式进入 0.70 m。
+        task_distance = 0.70 if debug else 2.45
+        my_car.lane_dis_offset(speed=0.28, dis_hold=task_distance)
+        my_car.arm.move_y_position(0.17)
+
+        # 第一个球不一定在第 0 个名义座位，因此先低速巡线搜索。
+        first_detection = search_first_ball()
+        if first_detection is None:
+            print("低速巡线超时，未找到第一个球，跳过抓取")
+            return first_label
+
+        # 第一个搜索到的球作为当前座位处理；从第二个座位开始，
+        # 每次先固定移动一个球座间距，空座也必须消耗这一次移动。
+        for slot_index in range(max_slots):
+            if slot_index == 0:
+                current_detection = first_detection
+            else:
+                my_car.lane_dis_offset(
+                    speed=search_speed,
+                    dis_hold=slot_step,
+                )
+                current_detection = stable_ball_detection()
+
+            checked_slots += 1
+            slot_succeeded = False
+
+            # 当前座位可能为空；没有球检测时绝不调用机械臂抓取动作。
+            if current_detection is None:
+                print(f"第 {checked_slots} 个球座为空，直接检查下一个座位")
+            else:
+                for attempt in range(max_grasp_attempts):
+                    reset_arm_for_detection()
+
+                    # 第一次使用当前座位已有的检测结果；重试时重新确认球
+                    # 仍在同一位置，避免重复抓取已经消失的球。
+                    if attempt > 0:
+                        current_detection = stable_ball_detection(
+                            timeout=3.0,
+                            reference_detection=current_detection,
+                        )
+                    if current_detection is None:
+                        print(
+                            f"第 {checked_slots} 个球座在第 {attempt + 1} "
+                            "次尝试前已无球，结束当前座位处理"
+                        )
+                        break
+
+                    label = current_detection[2]
+                    if first_label is None:
+                        first_label = label
+
+                    print(
+                        f"发现第 {checked_slots} 个球座的 {label}，"
+                        f"第 {attempt + 1}/{max_grasp_attempts} 次尝试"
+                    )
+                    aligned, aligned_label = pick_and_place_ball(
+                        label,
+                        first_label,
+                    )
+                    if not aligned:
+                        print(
+                            f"第 {checked_slots} 个球座对齐失败，"
+                            "准备复查或重试"
+                        )
+                        continue
+
+                    # 关键闭环：放球后回到 LEFT/DOWN 方向复查同一球座。
+                    # 球消失才算成功；球仍存在则不增加 picked_count，
+                    # 并在本座位再次执行完整抓取流程。
+                    remaining_ball = stable_ball_detection(
+                        timeout=3.0,
+                        reference_detection=current_detection,
+                    )
+                    if remaining_ball is None:
+                        picked_count += 1
+                        slot_succeeded = True
+                        print(
+                            f"第 {checked_slots} 个球座抓取成功，"
+                            f"数量 {picked_count}/{target_ball_count}"
+                        )
+                        break
+
+                    print(
+                        f"第 {checked_slots} 个球座放球后仍检测到球，"
+                        "将在同一座位重试"
+                    )
+
+                if not slot_succeeded and current_detection is not None:
+                    print(f"第 {checked_slots} 个球座达到重试上限，跳过该座位")
+
+            # 达到用户设定的成功数量后，停止固定间距移动；清理动作在
+            # finally 中执行，主程序随后继续进入 sort_and_store。
+            if picked_count >= target_ball_count:
+                print(
+                    f"已成功抓取设定数量 {target_ball_count} 个球，"
+                    "停止继续扫描"
+                )
+                break
+
+        if picked_count < target_ball_count:
+            print(
+                f"8 个球座扫描完成，目标 {target_ball_count} 个，"
+                f"实际成功 {picked_count} 个"
+            )
+    finally:
+        # 无论是达到数量、找不到第一个球，还是中途发生异常，都要
+        # 使用原有的安全收尾动作放下储物架并抬高机械臂，避免机构碰撞。
+        my_car.set_storage(False)
+        my_car.arm.move_y_position(0.2)
+        time.sleep(0.5)
+        if debug:
+            my_car.move_to_position([0.0, 0.0, 0.0])
 
     return first_label
     

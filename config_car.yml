@@ -56,12 +56,12 @@ speed:
 lane_pid:
   cfg_pid_y:
     Kp: 4
-    Ki: 0.1
+    Ki: -0.3
     Kd: 0
     setpoint: 0
     output_limits: [-0.7, 0.7]
   cfg_pid_angle:
-    Kp: 2
+    Kp: 1.8
     Ki: 0
     Kd: 0
     setpoint: 0

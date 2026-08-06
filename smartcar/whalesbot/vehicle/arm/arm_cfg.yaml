@@ -42,9 +42,9 @@ horiz_cfg:
     safe_position: 0.015
 pos_cfg:
   pose_enable: true
-  pose_horiz: 0.010480724177426074
-  pose_vert: 0
-  side: LEFT
+  pose_horiz: 0.05888261401499376
+  pose_vert: 0.15358250000000004
+  side: RIGHT
 vert_cfg:
   motor:
     id: 3
