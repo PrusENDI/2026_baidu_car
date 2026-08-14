@@ -384,6 +384,8 @@ class MyCar(MecanumDriver):
         self._stop_flag = False
         # 按键线程结束标志
         self._end_flag = False
+        # 按键1启动事件
+        self._start_key_event = threading.Event()
         self.thread_key = threading.Thread(target=self.key_thread_func)
         self.thread_key.daemon = True
         self.thread_key.start()
@@ -417,7 +419,7 @@ class MyCar(MecanumDriver):
         # self.light = LedLight(cfg_sensor['light'])
         # self.left_sensor = Infrared(cfg_sensor['left_sensor'])
         # self.right_sensor = Infrared(cfg_sensor['right_sensor'])
-        self.servo_1_angle_list = [-42, 165]
+        self.servo_1_angle_list = [-42, 0]
         self.servo_1_flag = 0
         self.servo_1 = ServoPwm(1, 180)
         self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
@@ -588,11 +590,30 @@ class MyCar(MecanumDriver):
                     if full_frame
                     else self._encode_detection_crop(label, task_cfg["crop_scale"])
                 )
+                # #region debug-point A:multimodal-request
+                try:
+                    import json as _dbg_json, urllib.request as _dbg_request; _dbg_request.urlopen(_dbg_request.Request("http://127.0.0.1:7777/event", data=_dbg_json.dumps({"sessionId":"order-api-timeout","runId":"pre-fix","hypothesisId":"A","location":"car_wrap_2026.py:593","msg":"[DEBUG] multimodal request starting","data":{"task":task,"attempt":attempt,"image_base64_length":len(image),"request_timeout":self.image_analysis.request_timeout},"traceId":f"{task}-{attempt}"}).encode(), headers={"Content-Type":"application/json"}), timeout=1).read()
+                except Exception:
+                    pass
+                # #endregion
+                _multimodal_started_at = time.monotonic()
                 result = self.image_analysis.get_multimodal_json(image, task_cfg["prompt"])
+                # #region debug-point B:multimodal-response
+                try:
+                    import json as _dbg_json, urllib.request as _dbg_request; _dbg_request.urlopen(_dbg_request.Request("http://127.0.0.1:7777/event", data=_dbg_json.dumps({"sessionId":"order-api-timeout","runId":"pre-fix","hypothesisId":"B","location":"car_wrap_2026.py:598","msg":"[DEBUG] multimodal request succeeded","data":{"task":task,"attempt":attempt,"elapsed_seconds":time.monotonic()-_multimodal_started_at},"traceId":f"{task}-{attempt}"}).encode(), headers={"Content-Type":"application/json"}), timeout=1).read()
+                except Exception:
+                    pass
+                # #endregion
                 result = self._validate_task_image_result(task, result)
                 print(f"[MULTIMODAL_RESULT] task={task} result={result}")
                 return result
             except Exception as exc:
+                # #region debug-point C:multimodal-failure
+                try:
+                    import json as _dbg_json, urllib.request as _dbg_request; _dbg_request.urlopen(_dbg_request.Request("http://127.0.0.1:7777/event", data=_dbg_json.dumps({"sessionId":"order-api-timeout","runId":"pre-fix","hypothesisId":"C","location":"car_wrap_2026.py:606","msg":"[DEBUG] multimodal request failed","data":{"task":task,"attempt":attempt,"error_type":type(exc).__name__,"error":str(exc),"elapsed_seconds":time.monotonic()-_multimodal_started_at if "_multimodal_started_at" in locals() else None},"traceId":f"{task}-{attempt}"}).encode(), headers={"Content-Type":"application/json"}), timeout=1).read()
+                except Exception:
+                    pass
+                # #endregion
                 last_error = exc
                 print(f"[MULTIMODAL_FAILURE] task={task} attempt={attempt} error={type(exc).__name__}")
                 if attempt < 2:
@@ -652,17 +673,18 @@ class MyCar(MecanumDriver):
         """
         # 执行该方法的核心功能。
         while True:
-            if not self._stop_flag:
-                if self._end_flag:
-                    return
-                key_val = self.key.get_key()
-                # print(key_val)
-                if key_val == 3:
-                    self._stop_flag = True
-                    self.stop()
-                    self.arm.x_speed(0)
-                    self.arm.y_speed(0)
-                time.sleep(0.2)
+            if self._end_flag:
+                return
+            key_val = self.key.get_key()
+            # print(key_val)
+            if key_val == 1 or key_val == 5:
+                self._start_key_event.set()
+            elif key_val == 3 or key_val == 7:
+                self._stop_flag = True
+                self.stop()
+                self.arm.x_speed(0)
+                self.arm.y_speed(0)
+            time.sleep(0.2)
 
     # 根据某个值获取列表中匹配的结果
     @staticmethod
@@ -1003,7 +1025,7 @@ class MyCar(MecanumDriver):
                 dis_count(False)
             self.set_velocity(out_x, out_y, 0)
 
-    def lane_base(self, speed, end_fuction, stop=STOP_PARAM):
+    def lane_base(self, speed, end_fuction, stop=STOP_PARAM, CROP=True):
         """
         车道保持基础方法
 
@@ -1021,6 +1043,15 @@ class MyCar(MecanumDriver):
 
             error_y, error_angle = self.get_lane_results()
             y_speed, angle_speed = self.lane_pid.get_out(-error_y, -error_angle)
+            if CROP:
+                # 按模型原始角度误差连续降速。
+                speed_max = 0.3
+                speed_min = 0.18
+                full_turn_error = 0.39
+                turn_ratio = min(abs(error_angle) / full_turn_error, 1.0)
+                speed = speed_max - (speed_max - speed_min) * turn_ratio
+            else:
+                speed = 0.1
             self.set_velocity(speed, y_speed, angle_speed)
             if end_fuction():
                 break
@@ -1117,7 +1148,7 @@ class MyCar(MecanumDriver):
         self.lane_base(speed, end_fuction, stop=stop)
 
     # 巡航一段路程
-    def lane_dis(self, speed, dis_end, stop=STOP_PARAM):
+    def lane_dis(self, speed, dis_end, stop=STOP_PARAM, CROP=True):
         """
         车道保持定距方法
 
@@ -1133,9 +1164,9 @@ class MyCar(MecanumDriver):
         def end_fuction():
             return self.get_distance() > dis_end
 
-        self.lane_base(speed, end_fuction, stop=stop)
+        self.lane_base(speed, end_fuction, stop=stop, CROP=CROP)
 
-    def lane_dis_offset(self, speed, dis_hold, stop=STOP_PARAM):
+    def lane_dis_offset(self, speed, dis_hold, stop=STOP_PARAM, CROP=True):
         """
         车道保持距离偏移方法
 
@@ -1149,7 +1180,7 @@ class MyCar(MecanumDriver):
         # 处理巡线相关逻辑。
         dis_start = self.get_distance()
         dis_stop = dis_start + dis_hold
-        self.lane_dis(speed, dis_stop, stop=stop)
+        self.lane_dis(speed, dis_stop, stop=stop, CROP=CROP)
 
     # def lane_sensor(self, speed, value_h=None, value_l=None, dis_offset=0.0, times=1, sides=1, stop=STOP_PARAM):
     #     """
@@ -1772,9 +1803,16 @@ class MyCar(MecanumDriver):
             max_selected_dx_jump is not None,
             target_index is not None,
         ))
-        stable_frame_count = 3 if advanced_alignment else 10
+        stable_frame_count = 3 if advanced_alignment else 3
         x_count = CountRecord(stable_frame_count)
         y_count = CountRecord(stable_frame_count)
+        label_stable_frame_count = 3
+        last_detected_label = None
+        consecutive_label_count = 0
+        label_votes = {}
+        label_last_seen = {}
+        label_cls_ids = {}
+        detection_sequence = 0
         self.last_detection_alignment_status = {
             "ok": False,
             "reason": "alignment_started",
@@ -1938,10 +1976,23 @@ class MyCar(MecanumDriver):
             selected_det = None
             flag_x = False
             flag_y = delta_y is None
+            label_stable = label is not None
             if len(dets) > selection_num:
                 det = dets[selection_num]
                 selected_det = det
                 ever_selected = True
+                if label is None:
+                    detected_label = det[2]
+                    detection_sequence += 1
+                    label_votes[detected_label] = label_votes.get(detected_label, 0) + 1
+                    label_last_seen[detected_label] = detection_sequence
+                    label_cls_ids[detected_label] = det[0]
+                    if detected_label == last_detected_label:
+                        consecutive_label_count += 1
+                    else:
+                        last_detected_label = detected_label
+                        consecutive_label_count = 1
+                    label_stable = consecutive_label_count >= label_stable_frame_count
                 dx, dy = det[4:6]
                 out_x = 0 if calibrated_delta_x is None else -pid_x(dx)
                 if delta_y is None:
@@ -1960,8 +2011,8 @@ class MyCar(MecanumDriver):
                     else:
                         out_chassis_y = 0
 
-                x_tolerance = 0.04 if advanced_alignment else 0.001
-                y_tolerance = 0.02 if advanced_alignment else 0.001
+                x_tolerance = 0.04 if advanced_alignment else 0.04
+                y_tolerance = 0.02 if advanced_alignment else 0.02
                 flag_x = calibrated_delta_x is None or x_count(
                     self._alignment_axis_reached(
                         dx, calibrated_delta_x, x_tolerance
@@ -1975,7 +2026,7 @@ class MyCar(MecanumDriver):
                 if flag_y:
                     out_y = 0
                     out_chassis_y = 0
-                if flag_x and flag_y:
+                if flag_x and flag_y and label_stable:
                     self.set_velocity(0, 0, 0)
                     self.arm.x_speed(0)
                     self.last_detection_alignment_status = {
@@ -1998,6 +2049,9 @@ class MyCar(MecanumDriver):
             else:
                 x_count(False)
                 y_count(False)
+                if label is None:
+                    last_detected_label = None
+                    consecutive_label_count = 0
                 out_x = 0
                 out_y = 0
                 out_chassis_y = 0
@@ -2018,12 +2072,26 @@ class MyCar(MecanumDriver):
 
             self.set_velocity(out_x, out_chassis_y, 0)
             self.arm.x_speed(out_y)
-            time.sleep(0.05)
+            time.sleep(0.01)
 
             if time.time() > time_stop:
                 self.set_velocity(0, 0, 0)
                 self.arm.x_speed(0)
                 logger.error("对齐目标超时")
+                if label is None and label_votes:
+                    voted_label = max(
+                        label_votes,
+                        key=lambda item: (label_votes[item], label_last_seen[item]),
+                    )
+                    voted_cls_id = label_cls_ids[voted_label]
+                    self.last_detection_alignment_status = {
+                        "ok": False,
+                        "reason": "timeout_label_vote",
+                        "target_index": target_index,
+                        "voted_label": voted_label,
+                        "label_votes": dict(label_votes),
+                    }
+                    return voted_cls_id, voted_label
                 if require_alignment:
                     if (
                         last_selection_rejection is not None

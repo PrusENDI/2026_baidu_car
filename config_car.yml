@@ -55,13 +55,13 @@ speed:
 # 巡线 PID - 用于车道线巡航控制
 lane_pid:
   cfg_pid_y:
-    Kp: 4
-    Ki: -0.3
-    Kd: 0
+    Kp: 6
+    Ki: 0
+    Kd: 0.1
     setpoint: 0
     output_limits: [-0.7, 0.7]
   cfg_pid_angle:
-    Kp: 1.8
+    Kp: 1.95
     Ki: 0
     Kd: 0
     setpoint: 0
@@ -70,17 +70,17 @@ lane_pid:
 # 检测巡航 PID - 用于目标检测后的跟随控制
 det_pid:
   cfg_pid_y:
-    Kp: 1
+    Kp: 2
     Ki: 0
     Kd: 0
     setpoint: 0
-    output_limits: [-0.7, 0.7]
+    output_limits: [-10, 10]
   cfg_pid_angle:
-    Kp: 1
+    Kp: 6
     Ki: 0
     Kd: 0
     setpoint: 0
-    output_limits: [-1.5, 1.5]
+    output_limits: [-10, 10]
 
 # 定位 PID - 用于精确定位和位置控制
 location_pid:

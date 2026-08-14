@@ -629,6 +629,7 @@ class ArmController:
             angle: 目标角度，可以是字符串（"LEFT", "MID", "RIGHT"）或数字
             speed: 速度
         """
+        self.side = angle
         requested_angle = angle
         target_side = angle if isinstance(angle, str) else None
         resolved_angle = angle
@@ -642,6 +643,7 @@ class ArmController:
             result = self.arm_servo.set_angle(resolved_angle, speed)
             if result is not None:
                 response_received = True
+                return True
                 last_response = result
                 logger.info(
                     f"机械臂翻转指令已获新响应 requested={requested_angle}, "
@@ -659,8 +661,8 @@ class ArmController:
                 time.sleep(ARM_SERVO_COMMAND_RETRY_DELAY)
 
         if response_received:
-            if target_side is not None:
-                self.side = target_side
+            #if target_side is not None:
+                #self.side = target_side
             self._arm_angle_last = resolved_angle
             logger.info(
                 f"机械臂翻转重复发送完成 requested={requested_angle}, "
@@ -853,7 +855,7 @@ class ArmController:
         # time.sleep(0.2)
         if arm is not None:
             self.set_arm_angle(arm)
-            time.sleep(1)
+            time.sleep(0.2)
         if hand is not None:
             self.set_hand_angle(hand)
 

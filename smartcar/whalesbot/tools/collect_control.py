@@ -239,7 +239,7 @@ class CollectControlCar:
         )
 
         # ==================== 5. 车辆控制参数 ====================
-        self.state_base = [0.15, 0.15, 0.3]
+        self.state_base = [0.10, 0.15, 0.3]#0.15
         self.state_start = [0.3, 0.3, 0.5]
         self.car_state = [0.0, 0.0, 0.0]
         

@@ -42,8 +42,8 @@ horiz_cfg:
     safe_position: 0.015
 pos_cfg:
   pose_enable: true
-  pose_horiz: 0.05888261401499376
-  pose_vert: 0.15358250000000004
+  pose_horiz: 0.010131366704845204
+  pose_vert: 0.025469999999999993
   side: RIGHT
 vert_cfg:
   motor:
@@ -57,8 +57,8 @@ vert_cfg:
     Kd: 0.1
     setpoint: 0
     output_limits:
-    - -0.04
-    - 0.04
+    - -0.06
+    - 0.06
   threshold:
   - 0
   - 0.2

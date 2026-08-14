@@ -1,0 +1,23 @@
+[Unit]
+Description=Baidu Smart Car initialization and task service
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/workspaces/baidu_smart_2026_7_17
+Environment=HOME=/home/jetson
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /home/jetson/workspaces/baidu_smart_2026_7_17/car_start_2026.py
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

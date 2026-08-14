@@ -471,7 +471,7 @@ class OCRReco(InferInterface):
 
 
 class LaneInfer(InferInterface):
-    def __init__(self, model_dir="lane_model", run_mode="paddle") -> None:
+    def __init__(self, model_dir="lane_model_light_robustness_d3_manual_20260808_v1/lane_model_light_robustness_d3_manual_20260808_v1", run_mode="paddle") -> None:
         super().__init__(model_dir)
         model_path, params_path = self.get_model_path()
         self.config = Config(model_path, params_path)
