@@ -27,6 +27,8 @@ class Camera:
         # self.src =src
         self.cap = None
         self.frame = None
+        self.frame_timestamp = None
+        self.frame_sequence = 0
         # 暂停标志
         self.pause_flag = False
         self.stop_flag = False
@@ -83,6 +85,8 @@ class Camera:
                 ret, frame = self.cap.read()
                 if ret:
                     self.frame = frame
+                    self.frame_timestamp = time.monotonic()
+                    self.frame_sequence += 1
                 else:
                     logger.error("read:读取图像错误!!!!")
                     self.cap.release()

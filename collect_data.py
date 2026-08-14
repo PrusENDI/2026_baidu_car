@@ -18,11 +18,43 @@
 - 同时按下【1】【2】 退出
 
 """
+import argparse
+
 from smartcar import logger
-from smartcar import CollectControlCar,Camera
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Smart-car data collection")
+    parser.add_argument(
+        "--cv-low-speed", action="store_true",
+        help="run the isolated SSH-controlled OpenCV PID test (no gamepad)",
+    )
+    parser.add_argument(
+        "--cv-output", default="dataset/cv_lane_tests",
+        help="root directory for isolated CV low-speed test sessions",
+    )
+    return parser.parse_args()
 
 logger.info("log测试")
 if __name__ == "__main__":
+    args = parse_args()
+    if args.cv_low_speed:
+        from smartcar import Camera
+        from smartcar.whalesbot.tools.lane_collect.ssh_test import OpenCVLaneSshTest
+        from smartcar.whalesbot.vehicle import MecanumDriver
+
+        cam1 = Camera(1, 320, 240)
+        car = MecanumDriver()
+        try:
+            OpenCVLaneSshTest(cam1, car, output_root=args.cv_output).run()
+        finally:
+            car.set_velocity(0.0, 0.0, 0.0)
+            cam1.close()
+            car.close()
+        raise SystemExit(0)
+
+    from smartcar import CollectControlCar, Camera
+
     # 初始化双摄像头
     # cam1: index=1, 320x240（保持原有参数）
     # cam2: index=2, 320x240（可根据需要调整）
