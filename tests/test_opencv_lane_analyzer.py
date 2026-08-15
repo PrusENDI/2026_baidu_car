@@ -68,6 +68,9 @@ class OpenCVLaneAnalyzerTests(unittest.TestCase):
         self.assertTrue(result.valid, result.reason)
         self.assertAlmostEqual(result.raw_lateral, 0.0, delta=0.08)
         self.assertAlmostEqual(result.raw_heading, 0.0, delta=0.08)
+        self.assertAlmostEqual(result.metrics["perspective_k"], 0.0, delta=0.02)
+        self.assertAlmostEqual(result.metrics["perspective_b"], 0.0, delta=0.08)
+        self.assertEqual(result.metrics["perspective_fit_sides"], 2)
 
     def test_right_shift_has_positive_lateral_error(self):
         centered = self.analyzer.process(make_track())
@@ -98,6 +101,7 @@ class OpenCVLaneAnalyzerTests(unittest.TestCase):
         self.assertEqual(result.metrics["tracking_mode"], "right_only")
         self.assertEqual(np.count_nonzero(np.isfinite(result.left_line)), 0)
         self.assertGreater(np.count_nonzero(np.isfinite(result.right_line)), 20)
+        self.assertEqual(result.metrics["perspective_fit_sides"], 1)
 
     def test_both_missing_boundaries_are_not_reported_as_straight(self):
         image = np.full((240, 320, 3), 35, dtype=np.uint8)

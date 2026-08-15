@@ -89,7 +89,9 @@ class LaneAnalyzerConfig:
     corner_min_horizontalness: float = 0.65
     corner_min_score: float = 0.55
     reference_y_ratio: float = 0.78
-    fit_far_y_ratio: float = 0.25
+    # Fit only this interval of the active ROI.  Moving the far bound down
+    # reduces anticipatory steering from a bend visible at the top of frame.
+    fit_far_y_ratio: float = 0.65
     fit_near_y_ratio: float = 0.92
     morphology_kernel: int = 3
     error_mapping: ErrorMapping = field(default_factory=ErrorMapping)
@@ -225,6 +227,42 @@ class OpenCVLaneAnalyzer:
                  **self._corner_metrics(corner)})
         residual_rows = np.asarray(residual_rows, dtype=np.float64)
         residuals = np.asarray(residuals, dtype=np.float64)
+        perspective_fits = []
+        for current, standard, valid in (
+                (current_left, standard_left, left_ok),
+                (current_right, standard_right, right_ok)):
+            side_rows = rows[valid]
+            if side_rows.size < self.config.boundary_min_length:
+                continue
+            side_half_widths = np.asarray([
+                self._standard_half_width(
+                    standard_left[index], standard_right[index], width)
+                for index in np.flatnonzero(valid)
+            ], dtype=np.float64)
+            side_residuals = (
+                current[valid] - standard[valid]) / side_half_widths
+            perspective_x = ref.perspective[
+                np.clip(side_rows - ref.roi_top,
+                        0, ref.perspective.size - 1)]
+            design = np.column_stack(
+                [perspective_x, np.ones_like(perspective_x)])
+            perspective_fits.append(np.linalg.lstsq(
+                design, side_residuals, rcond=None)[0])
+        perspective_k = perspective_b = None
+        if perspective_fits:
+            perspective_k, perspective_b = np.mean(
+                np.asarray(perspective_fits, dtype=np.float64), axis=0)
+        fit_far = float(np.clip(self.config.fit_far_y_ratio, 0.0, 1.0))
+        fit_near = float(np.clip(self.config.fit_near_y_ratio, 0.0, 1.0))
+        if fit_near < fit_far:
+            fit_far, fit_near = fit_near, fit_far
+        fit_top = roi_top + (roi_bottom - roi_top - 1) * fit_far
+        fit_bottom = roi_top + (roi_bottom - roi_top - 1) * fit_near
+        fit_mask = ((residual_rows >= fit_top) &
+                    (residual_rows <= fit_bottom))
+        if int(np.count_nonzero(fit_mask)) >= self.config.boundary_min_length:
+            residual_rows = residual_rows[fit_mask]
+            residuals = residuals[fit_mask]
         weights = ref.perspective[
             np.clip(residual_rows.astype(np.int32) - ref.roi_top,
                     0, ref.perspective.size - 1)]
@@ -247,6 +285,14 @@ class OpenCVLaneAnalyzer:
             "reference_rows": len(residual_rows),
             "reference_tracking_mode": self._reference_mode(side_counts),
             "reference_side_counts": side_counts,
+            "fit_far_y": float(fit_top),
+            "fit_near_y": float(fit_bottom),
+            "fit_rows": int(residual_rows.size),
+            "perspective_k": (float(perspective_k)
+                              if perspective_k is not None else None),
+            "perspective_b": (float(perspective_b)
+                              if perspective_b is not None else None),
+            "perspective_fit_sides": len(perspective_fits),
             "reference_fit_slope": float(slope),
             "reference_fit_intercept": float(intercept),
             "perspective_median": float(np.median(weights)),

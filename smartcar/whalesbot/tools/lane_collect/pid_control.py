@@ -11,9 +11,9 @@ from .opencv_lane import LaneAnalysisResult
 
 @dataclass(frozen=True)
 class CvLanePidConfig:
-    forward_speed: float = 0.05
+    forward_speed: float = 0.20
     lateral_scale: float = 0.0
-    heading_scale: float = -0.316
+    heading_scale: float = -0.40
     lateral_kp: float = 0.0
     heading_kp: float = 1.0
     lateral_limit: float = 0.04
@@ -21,6 +21,11 @@ class CvLanePidConfig:
     max_heading_step: float = 0.04
     heading_ema_alpha: float = 0.35
     heading_deadband: float = 0.03
+    startup_straight_distance_m: float = 0.10
+    heading_onset_delay_m: float = 0.0
+    perspective_kb_enabled: bool = False
+    perspective_k_gain: float = 35.0
+    perspective_b_gain: float = 35.0 / 600.0
 
 
 @dataclass(frozen=True)
@@ -64,14 +69,21 @@ class CvLanePidController:
         )
         self._last_heading_output = 0.0
         self._filtered_heading_error = None
+        self._heading_active_sign = 0
+        self._pending_heading_sign = 0
+        self._pending_heading_distance_m = None
 
     def reset(self) -> None:
         self.pid_y.reset()
         self.pid_angle.reset()
         self._last_heading_output = 0.0
         self._filtered_heading_error = None
+        self._heading_active_sign = 0
+        self._pending_heading_sign = 0
+        self._pending_heading_distance_m = None
 
-    def compute(self, result: LaneAnalysisResult) -> CvLaneControlCommand:
+    def compute(self, result: LaneAnalysisResult,
+                distance_m=None) -> CvLaneControlCommand:
         if (not result.valid or result.raw_lateral is None or
                 result.raw_heading is None or
                 not np.isfinite(result.raw_lateral) or
@@ -81,7 +93,19 @@ class CvLanePidController:
                 result.reason or "invalid OpenCV lane result")
 
         error_y = float(result.raw_lateral * self.config.lateral_scale)
-        raw_error_angle = float(result.raw_heading * self.config.heading_scale)
+        control_heading = float(result.raw_heading)
+        control_reason = ""
+        if self.config.perspective_kb_enabled:
+            metrics = result.metrics or {}
+            perspective_k = metrics.get("perspective_k")
+            perspective_b = metrics.get("perspective_b")
+            if (perspective_k is not None and perspective_b is not None and
+                    np.isfinite(perspective_k) and np.isfinite(perspective_b)):
+                control_heading = float(
+                    float(perspective_k) * self.config.perspective_k_gain +
+                    float(perspective_b) * self.config.perspective_b_gain)
+                control_reason = "perspective_kb"
+        raw_error_angle = float(control_heading * self.config.heading_scale)
         alpha = float(np.clip(self.config.heading_ema_alpha, 0.0, 1.0))
         if self._filtered_heading_error is None:
             self._filtered_heading_error = raw_error_angle
@@ -93,6 +117,11 @@ class CvLanePidController:
         deadband = max(float(self.config.heading_deadband), 0.0)
         if abs(error_angle) < deadband:
             error_angle = 0.0
+        error_angle, startup_held = self._apply_startup_straight(
+            error_angle, distance_m)
+        if startup_held:
+            control_reason = "startup_straight"
+        error_angle = self._apply_heading_onset_delay(error_angle, distance_m)
 
         # Keep the same sign convention and control sequence as lane_base():
         # controller.get_out(-error_y, -error_angle).
@@ -108,4 +137,43 @@ class CvLanePidController:
         self._last_heading_output = requested_heading
         return CvLaneControlCommand(
             True, float(self.config.forward_speed), lateral_speed,
-            requested_heading, error_y, error_angle)
+            requested_heading, error_y, error_angle,
+            control_reason)
+
+    def _apply_startup_straight(self, error_angle, distance_m):
+        """Hold only the beginning of a collection session straight."""
+        distance = max(float(self.config.startup_straight_distance_m), 0.0)
+        if (distance == 0.0 or distance_m is None or
+                not np.isfinite(distance_m)):
+            return error_angle, False
+        if max(float(distance_m), 0.0) < distance:
+            return 0.0, True
+        return error_angle, False
+
+    def _apply_heading_onset_delay(self, error_angle, distance_m):
+        """Delay each new steering direction by a measured travel distance."""
+        sign = 1 if error_angle > 0.0 else (-1 if error_angle < 0.0 else 0)
+        if sign == 0:
+            self._heading_active_sign = 0
+            self._pending_heading_sign = 0
+            self._pending_heading_distance_m = None
+            return 0.0
+        delay = max(float(self.config.heading_onset_delay_m), 0.0)
+        if delay == 0.0 or distance_m is None or not np.isfinite(distance_m):
+            self._heading_active_sign = sign
+            return error_angle
+        distance_m = max(float(distance_m), 0.0)
+        if self._heading_active_sign == sign:
+            return error_angle
+        if self._pending_heading_sign != sign:
+            self._heading_active_sign = 0
+            self._pending_heading_sign = sign
+            self._pending_heading_distance_m = distance_m
+            return 0.0
+        traveled = max(distance_m - self._pending_heading_distance_m, 0.0)
+        if traveled < delay:
+            return 0.0
+        self._heading_active_sign = sign
+        self._pending_heading_sign = 0
+        self._pending_heading_distance_m = None
+        return error_angle

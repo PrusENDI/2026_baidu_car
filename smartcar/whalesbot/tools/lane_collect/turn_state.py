@@ -203,20 +203,21 @@ class CrossStraightState(str, Enum):
 
 @dataclass(frozen=True)
 class CrossStraightConfig:
-    """One-shot timing for the first bend followed immediately by a cross."""
+    """Route distances for the two known crossings, measured from ``start``."""
 
     corner_min_score: float = 0.52
     anomaly_heading: float = 0.75
-    curve_continue_frames: int = 30
-    cross_straight_frames: int = 30
-    heading_decay_frames: int = 8
+    curve_continue_distance_m: float = 0.20
+    cross_straight_distance_m: float = 0.14
+    heading_decay_distance_m: float = 0.05
     cross_speed_scale: float = 0.65
     history_size: int = 8
     entry_lateral_limit: float = 0.35
     entry_heading_limit: float = 0.85
-    min_trigger_frame: int = 217
+    first_trigger_distance_m: float = 3.50
     second_min_trigger_frame: int = 1100
     second_cross_straight_frames: int = 20
+    second_heading_decay_frames: int = 8
 
 
 @dataclass(frozen=True)
@@ -232,7 +233,7 @@ class CrossStraightStateMachine:
 
     This is intentionally route-specific: after the first suspicious
     horizontal boundary, it continues the prior bend for a bounded number of
-    frames, then gradually removes steering and holds the entry lateral pose.
+    distance, then gradually removes steering and holds the entry lateral pose.
     Once the crossing window is complete it never triggers again.
     """
 
@@ -249,9 +250,14 @@ class CrossStraightStateMachine:
         self._cross_frames = 0
         self._second_cross_frames = 0
         self._frame_count = 0
+        self._state_entry_distance_m = None
+        self._distance_m = None
 
-    def update(self, result: LaneAnalysisResult) -> CrossStraightDecision:
+    def update(self, result: LaneAnalysisResult,
+               distance_m=None) -> CrossStraightDecision:
         self._frame_count += 1
+        if distance_m is not None and np.isfinite(distance_m):
+            self._distance_m = max(0.0, float(distance_m))
         self._remember(result)
         if self.state == CrossStraightState.DONE:
             return CrossStraightDecision(result, self.state.value, 1.0, "normal_after_cross")
@@ -273,6 +279,7 @@ class CrossStraightStateMachine:
                 self._capture_entry_pose()
                 self.state = CrossStraightState.CURVE_CONTINUE
                 self._curve_frames = 0
+                self._mark_state_entry_distance()
                 return self._held_result(result, self._entry_lateral,
                                          self._entry_heading,
                                          self.state.value, "curve_continue_entry")
@@ -280,9 +287,10 @@ class CrossStraightStateMachine:
 
         if self.state == CrossStraightState.CURVE_CONTINUE:
             self._curve_frames += 1
-            if self._curve_frames >= max(1, self.config.curve_continue_frames):
+            if self._state_distance() >= self.config.curve_continue_distance_m:
                 self.state = CrossStraightState.CROSS_STRAIGHT
                 self._cross_frames = 0
+                self._mark_state_entry_distance()
             else:
                 return self._held_result(result, self._entry_lateral,
                                          self._entry_heading,
@@ -290,10 +298,11 @@ class CrossStraightStateMachine:
 
         if self.state == CrossStraightState.CROSS_STRAIGHT:
             self._cross_frames += 1
-            decay = min(self._cross_frames /
-                        max(1, self.config.heading_decay_frames), 1.0)
+            distance = self._state_distance()
+            decay = min(distance /
+                        max(self.config.heading_decay_distance_m, 1e-6), 1.0)
             heading = self._entry_heading * (1.0 - decay)
-            if self._cross_frames >= max(1, self.config.cross_straight_frames):
+            if distance >= self.config.cross_straight_distance_m:
                 self.state = CrossStraightState.WAIT_SECOND_CROSS
             return self._held_result(result, self._entry_lateral, heading,
                                      self.state.value, "cross_straight")
@@ -301,7 +310,7 @@ class CrossStraightStateMachine:
         if self.state == CrossStraightState.SECOND_CROSS_STRAIGHT:
             self._second_cross_frames += 1
             decay = min(self._second_cross_frames /
-                        max(1, self.config.heading_decay_frames), 1.0)
+                        max(1, self.config.second_heading_decay_frames), 1.0)
             heading = self._entry_heading * (1.0 - decay)
             if self._second_cross_frames >= max(
                     1, self.config.second_cross_straight_frames):
@@ -321,7 +330,7 @@ class CrossStraightStateMachine:
     def _is_first_cross_approach(self, result: LaneAnalysisResult) -> bool:
         if not result.valid or len(self._history) < 3:
             return False
-        if self._frame_count < self.config.min_trigger_frame:
+        if not self._distance_at_least(self.config.first_trigger_distance_m):
             return False
         metrics = result.metrics
         if metrics.get("tracking_mode") not in ("left_only", "right_only"):
@@ -331,6 +340,18 @@ class CrossStraightStateMachine:
         if float(metrics.get("corner_score", 0.0)) < self.config.corner_min_score:
             return False
         return abs(float(result.raw_heading or 0.0)) >= self.config.anomaly_heading
+
+    def _distance_at_least(self, threshold) -> bool:
+        return (self._distance_m is not None and
+                self._distance_m >= max(float(threshold), 0.0))
+
+    def _mark_state_entry_distance(self) -> None:
+        self._state_entry_distance_m = self._distance_m
+
+    def _state_distance(self) -> float:
+        if self._distance_m is None or self._state_entry_distance_m is None:
+            return 0.0
+        return max(0.0, self._distance_m - self._state_entry_distance_m)
 
     def _capture_entry_pose(self) -> None:
         values = self._history[:-1] if len(self._history) > 1 else self._history

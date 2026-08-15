@@ -18,7 +18,7 @@ from .turn_state import CrossStraightStateMachine
 
 
 class CvTestSessionWriter:
-    """Save the exact 128x128 CNN image and its applied vehicle command."""
+    """Save the raw 320x240 camera image and its applied vehicle command."""
 
     def __init__(self, output_root: Path, controller_config: CvLanePidConfig) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -30,7 +30,8 @@ class CvTestSessionWriter:
         self._write_metadata()
 
     def append(self, cnn_image, analysis, command, *, held=False,
-               command_source="opencv") -> None:
+               command_source="opencv", odometry_distance_m=None,
+               frame_distance_m=None, distance_source="unavailable") -> None:
         if self.closed:
             raise RuntimeError("CV test session is already closed")
         image_name = f"{len(self.records):06d}.jpg"
@@ -53,6 +54,14 @@ class CvTestSessionWriter:
             "label_semantics": "vehicle_command_compatible_with_manual",
             "held": bool(held),
             "command_source": str(command_source),
+            "control_reason": str(command.reason),
+            # Encoder-based distance measured by the chassis odometry.  The
+            # per-frame delta is relative to the previous saved frame, while
+            # odometry_distance_m is relative to the beginning of this
+            # collection session.
+            "odometry_distance_m": odometry_distance_m,
+            "frame_distance_m": frame_distance_m,
+            "distance_source": str(distance_source),
             "cv": analysis.to_record(),
             "timestamp": time.time(),
         })
@@ -75,13 +84,18 @@ class CvTestSessionWriter:
         metadata = {
             "purpose": "OpenCV PID low-speed real-car test",
             "usable_for_training": True,
-            "saved_image_size": [128, 128],
+            "saved_image_size": [320, 240],
             "state_fields": ["forward_speed", "lateral_speed",
                              "angular_speed"],
             "control_fields": ["forward_speed", "lateral_speed",
                                "angular_speed"],
             "label_semantics": "vehicle_command_compatible_with_manual",
             "teacher": "opencv_pid_command",
+            "distance_fields": {
+                "odometry_distance_m": "session-relative chassis odometry",
+                "frame_distance_m": "delta since previous saved frame",
+                "distance_source": "encoder_odometry when available",
+            },
             "controller": vars(self.controller_config),
         }
         (self.session_dir / "session.json").write_text(
@@ -93,7 +107,10 @@ class OpenCVLaneSshTest:
 
     LOOP_SECONDS = 0.05
     MAX_FRAME_AGE_SECONDS = 0.25
-    MAX_INVALID_HOLD_FRAMES = 5
+    MAX_INVALID_HOLD_FRAMES = 10
+    # Temporarily bypass the route-specific crossing controller while
+    # validating ordinary and right-angle bends at the higher test speed.
+    CROSS_STATE_ENABLED = False
 
     def __init__(self, camera, car, output_root="dataset/cv_lane_tests",
                  frame_callback=None, standard_root="standard") -> None:
@@ -122,6 +139,8 @@ class OpenCVLaneSshTest:
         self.writer: Optional[CvTestSessionWriter] = None
         self.last_valid_command = None
         self.invalid_hold_frames = 0
+        self.distance_origin_m = None
+        self.last_distance_m = None
 
     def run(self) -> None:
         self._stop_vehicle()
@@ -155,12 +174,21 @@ class OpenCVLaneSshTest:
                     return
             image = self.camera.read().copy()
             analysis = self.analyzer.process(image)
-            decision = self.cross_state.update(analysis)
-            analysis = decision.result
-            command = self.controller.compute(analysis)
-            command_source = decision.source
+            distance_m, distance_source = self._read_distance()
+            if distance_m is not None:
+                if self.distance_origin_m is None:
+                    self.distance_origin_m = distance_m
+                distance_m -= self.distance_origin_m
+            decision = None
+            if self.CROSS_STATE_ENABLED:
+                decision = self.cross_state.update(
+                    analysis, distance_m=distance_m)
+                analysis = decision.result
+            command = self.controller.compute(analysis, distance_m=distance_m)
+            command_source = decision.source if decision is not None else "standard"
             held = False
-            if command.valid and decision.speed_scale != 1.0:
+            if (command.valid and decision is not None and
+                    decision.speed_scale != 1.0):
                 command = replace(
                     command,
                     forward_speed=command.forward_speed * decision.speed_scale,
@@ -187,10 +215,21 @@ class OpenCVLaneSshTest:
                 command.lateral_speed,
                 command.angular_speed,
             )
-            cnn_image = self.analyzer.make_cnn_image(image)
+            frame_distance_m = None
+            if distance_m is not None:
+                if self.last_distance_m is not None:
+                    frame_distance_m = distance_m - self.last_distance_m
+                self.last_distance_m = distance_m
+            # Manual lane collection stores the raw Camera(1) frame at
+            # 320x240.  Keep CV collection in the same geometry; CNN
+            # inference can resize this source image separately when needed.
+            saved_image = image
             self.writer.append(
-                cnn_image, analysis, command, held=held,
+                saved_image, analysis, command, held=held,
                 command_source=command_source,
+                odometry_distance_m=distance_m,
+                frame_distance_m=frame_distance_m,
+                distance_source=distance_source,
             )
             if self.frame_callback is not None:
                 self.frame_callback(self.analyzer.draw_debug(image, analysis))
@@ -208,11 +247,14 @@ class OpenCVLaneSshTest:
                     print("CV control is already running.", flush=True)
                     continue
                 self.controller.reset()
-                self.cross_state.reset()
+                if self.CROSS_STATE_ENABLED:
+                    self.cross_state.reset()
                 self.last_valid_command = None
                 self.invalid_hold_frames = 0
                 self.writer = CvTestSessionWriter(
                     self.output_root, self.controller.config)
+                self.distance_origin_m = None
+                self.last_distance_m = None
                 self.running = True
                 print(f"STARTED: {self.writer.session_dir}", flush=True)
             elif command == "stop":
@@ -234,6 +276,8 @@ class OpenCVLaneSshTest:
         self.controller.reset()
         self.last_valid_command = None
         self.invalid_hold_frames = 0
+        self.distance_origin_m = None
+        self.last_distance_m = None
         if self.writer is not None:
             self.writer.close()
             session = self.writer.session_dir
@@ -245,6 +289,17 @@ class OpenCVLaneSshTest:
 
     def _stop_vehicle(self) -> None:
         self.car.set_velocity(0.0, 0.0, 0.0)
+
+    def _read_distance(self):
+        """Return chassis odometry distance, without breaking control if absent."""
+        getter = getattr(self.car, "get_distance", None)
+        if not callable(getter):
+            return None, "unavailable"
+        try:
+            value = float(getter())
+        except (TypeError, ValueError, RuntimeError, OSError):
+            return None, "unavailable"
+        return value, "encoder_odometry"
 
     def _read_commands(self) -> None:
         while not self.exiting:
