@@ -12,13 +12,14 @@ from typing import Optional
 
 import cv2
 
+from .calibration import ErrorMapping
 from .opencv_lane import LaneAnalyzerConfig, OpenCVLaneAnalyzer, StandardLaneReference
 from .pid_control import CvLanePidConfig, CvLanePidController
 from .turn_state import CrossStraightStateMachine
 
 
 class CvTestSessionWriter:
-    """Save the raw 320x240 camera image and its applied vehicle command."""
+    """Save each raw frame, PID-before label, and applied command."""
 
     def __init__(self, output_root: Path, controller_config: CvLanePidConfig) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -40,18 +41,16 @@ class CvTestSessionWriter:
             raise RuntimeError(f"could not save {image_path}")
         self.records.append({
             "img_path": image_name,
-            # Keep the same label semantics as manual collection: state is
-            # the command actually sent to car.set_velocity(x, y, z).
-            "state": [command.forward_speed, command.lateral_speed,
-                      command.angular_speed],
+            # Match the existing CNN contract: state[1:3] is consumed as
+            # error_y/error_angle and then passed through lane_pid.
+            "state": [command.forward_speed, command.error_y,
+                      command.error_angle],
+            # Keep the actual mecanum command separately for replay and
+            # closed-loop diagnostics.
             "control": [command.forward_speed, command.lateral_speed,
                         command.angular_speed],
-            # Keep the legacy manual-collection label contract: state[1:3]
-            # are the vehicle commands sent to set_velocity().  The teacher
-            # is intentionally named as a PID command teacher because its
-            # output is not a stateless geometric error.
-            "teacher": "opencv_pid_command",
-            "label_semantics": "vehicle_command_compatible_with_manual",
+            "teacher": "opencv_ipm_error",
+            "label_semantics": "cnn_pid_input_error",
             "held": bool(held),
             "command_source": str(command_source),
             "control_reason": str(command.reason),
@@ -87,12 +86,11 @@ class CvTestSessionWriter:
             "purpose": "OpenCV PID low-speed real-car test",
             "usable_for_training": True,
             "saved_image_size": [320, 240],
-            "state_fields": ["forward_speed", "lateral_speed",
-                             "angular_speed"],
+            "state_fields": ["forward_speed", "error_y", "error_angle"],
             "control_fields": ["forward_speed", "lateral_speed",
                                "angular_speed"],
-            "label_semantics": "vehicle_command_compatible_with_manual",
-            "teacher": "opencv_pid_command",
+            "label_semantics": "cnn_pid_input_error",
+            "teacher": "opencv_ipm_error",
             "distance_fields": {
                 "odometry_distance_m": "session-relative chassis odometry",
                 "frame_distance_m": "delta since previous saved frame",
@@ -100,7 +98,7 @@ class CvTestSessionWriter:
             },
             "controller": vars(self.controller_config),
             "speed_control": {
-                "source": "absolute pre-slew proportional heading request",
+                "source": "absolute PID-before heading error",
                 "entry_behavior": "fast deceleration",
                 "exit_behavior": "slow acceleration",
             },
@@ -137,6 +135,10 @@ class OpenCVLaneSshTest:
             cnn_size=(128, 128),
             roi_top_ratio=0.30,
             roi_bottom_ratio=0.20,
+            error_mapping=ErrorMapping(
+                lateral_scale=-0.10,
+                heading_scale=-0.40,
+            ),
         ), reference=reference)
         self.controller = CvLanePidController(CvLanePidConfig())
         self.cross_state = CrossStraightStateMachine()

@@ -16,8 +16,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from smartcar.whalesbot.tools.lane_collect import (
-    CrossStraightStateMachine,
     CvLanePidController,
+    ErrorMapping,
     LaneAnalyzerConfig,
     OpenCVLaneAnalyzer,
     StandardLaneReference,
@@ -51,6 +51,7 @@ def steering_metrics(values, manual, limit=None):
     valid = np.isfinite(values) & np.isfinite(manual)
     turning = valid & (np.abs(manual) >= 0.03)
     directional = turning & (np.abs(values) >= 0.03)
+    false_active = valid & (np.abs(manual) < 0.03) & (np.abs(values) >= 0.03)
     finite_values = values[np.isfinite(values)]
     differences = np.abs(np.diff(finite_values))
     active_signs = np.sign(finite_values[np.abs(finite_values) >= 0.03])
@@ -61,6 +62,7 @@ def steering_metrics(values, manual, limit=None):
             np.sign(values[directional]) == np.sign(manual[directional])))
             if np.count_nonzero(directional) else None),
         "active_frame_count": int(np.count_nonzero(np.abs(finite_values) >= 0.03)),
+        "manual_zero_cv_active_count": int(np.count_nonzero(false_active)),
         "minimum": float(np.min(finite_values)) if finite_values.size else None,
         "maximum": float(np.max(finite_values)) if finite_values.size else None,
         "mean_abs_step": float(np.mean(differences)) if differences.size else None,
@@ -140,9 +142,12 @@ def main():
     reference = StandardLaneReference.from_files(
         args.standard_root / "standard_lane.json",
         args.standard_root / "perspective.json")
-    analyzer = OpenCVLaneAnalyzer(LaneAnalyzerConfig(), reference)
+    analyzer = OpenCVLaneAnalyzer(LaneAnalyzerConfig(
+        error_mapping=ErrorMapping(
+            lateral_scale=-0.10,
+            heading_scale=-0.40,
+        )), reference)
     controller = CvLanePidController()
-    cross_state = CrossStraightStateMachine()
     last_valid_command = None
     invalid_hold_frames = 0
     rows = []
@@ -157,14 +162,9 @@ def main():
         if analysis is None:
             raise RuntimeError(f"could not decode {image_path}")
         base_valid = analysis.valid
-        decision = cross_state.update(analysis)
-        controlled = decision.result
+        controlled = analysis
         command = controller.compute(controlled)
         held_invalid = False
-        if command.valid and decision.speed_scale != 1.0:
-            command = replace(command,
-                              forward_speed=command.forward_speed * decision.speed_scale,
-                              reason=decision.source)
         if not command.valid:
             invalid_hold_frames += 1
             if last_valid_command is not None and invalid_hold_frames <= 5:
@@ -182,11 +182,12 @@ def main():
             "held_invalid": held_invalid,
             "raw_lateral": analysis.raw_lateral,
             "raw_heading": analysis.raw_heading,
-            "filtered_error_angle": command.error_angle,
+            "error_y": command.error_y,
+            "error_angle": command.error_angle,
             "angular_speed": command.angular_speed,
             "forward_speed": command.forward_speed,
-            "control_state": decision.state,
-            "control_source": decision.source,
+            "control_state": "DISABLED",
+            "control_source": "ipm_lane_pid",
             "reference_mode": metrics.get("reference_tracking_mode"),
             "false_double_rejected": metrics.get("false_double_rejected", False),
             "false_double_rejected_side": metrics.get("false_double_rejected_side", "none"),

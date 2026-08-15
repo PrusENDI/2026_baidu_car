@@ -88,11 +88,11 @@ class LaneAnalyzerConfig:
     corner_min_line_ratio: float = 0.12
     corner_min_horizontalness: float = 0.65
     corner_min_score: float = 0.55
-    reference_y_ratio: float = 0.78
-    # Fit only this interval of the active ROI.  Moving the far bound down
-    # reduces anticipatory steering from a bend visible at the top of frame.
-    fit_far_y_ratio: float = 0.75
-    fit_near_y_ratio: float = 0.96
+    reference_y_ratio: float = 0.90
+    # Fit the complete equivalent-IPM trace.  A near-field-only image-space
+    # fit cannot distinguish lateral displacement from vehicle heading.
+    fit_far_y_ratio: float = 0.0
+    fit_near_y_ratio: float = 1.0
     morphology_kernel: int = 3
     error_mapping: ErrorMapping = field(default_factory=ErrorMapping)
     boundary_max_step: float = 10.0
@@ -193,109 +193,107 @@ class OpenCVLaneAnalyzer:
         rows = np.arange(roi_top, roi_bottom, dtype=np.int32)
         standard_left = ref.left_boundary[rows]
         standard_right = ref.right_boundary[rows]
+        standard_width = standard_right - standard_left
+        standard_center = (standard_left + standard_right) / 2.0
         current_left = left[rows]
         current_right = right[rows]
-        left_ok = np.isfinite(current_left) & np.isfinite(standard_left)
-        right_ok = np.isfinite(current_right) & np.isfinite(standard_right)
-        residuals = []
-        residual_rows = []
-        side_counts = {"left": 0, "right": 0, "both": 0}
-        for i, row in enumerate(rows):
-            values = []
-            if left_ok[i]:
-                half_width = self._standard_half_width(
-                    standard_left[i], standard_right[i], width)
-                values.append((current_left[i] - standard_left[i]) / half_width)
-            if right_ok[i]:
-                half_width = self._standard_half_width(
-                    standard_left[i], standard_right[i], width)
-                values.append((current_right[i] - standard_right[i]) / half_width)
-            if not values:
-                continue
-            side_counts["both" if len(values) == 2 else
-                        ("left" if left_ok[i] else "right")] += 1
-            residual_rows.append(int(row))
-            residuals.append(float(np.mean(values)))
-        if len(residual_rows) < self.config.boundary_min_length:
+        standard_ok = (
+            np.isfinite(standard_left) & np.isfinite(standard_right) &
+            np.isfinite(standard_width) & (standard_width > 1.0))
+        left_ok = np.isfinite(current_left) & standard_ok
+        right_ok = np.isfinite(current_right) & standard_ok
+        both_ok = left_ok & right_ok
+        left_only = left_ok & ~right_ok
+        right_only = right_ok & ~left_ok
+        current_center = np.full(rows.shape, np.nan, dtype=np.float64)
+        current_center[both_ok] = (
+            current_left[both_ok] + current_right[both_ok]) / 2.0
+        current_center[left_only] = (
+            current_left[left_only] + standard_width[left_only] / 2.0)
+        current_center[right_only] = (
+            current_right[right_only] - standard_width[right_only] / 2.0)
+        valid = np.isfinite(current_center) & standard_ok
+        side_counts = {
+            "left": int(np.count_nonzero(left_only)),
+            "right": int(np.count_nonzero(right_only)),
+            "both": int(np.count_nonzero(both_ok)),
+        }
+        reference_rows = int(np.count_nonzero(valid))
+        if reference_rows < self.config.boundary_min_length:
             return self._invalid(
                 (width, height),
                 "standard reference has too few valid boundary rows", binary,
                 lane_mask, seed, left, right, center,
-                {"reference_rows": len(residual_rows),
+                {"reference_rows": reference_rows,
                  "reference_tracking_mode": self._reference_mode(side_counts),
                  **boundary_filter,
                  **self._corner_metrics(corner)})
-        residual_rows = np.asarray(residual_rows, dtype=np.float64)
-        residuals = np.asarray(residuals, dtype=np.float64)
-        perspective_fits = []
-        for current, standard, valid in (
-                (current_left, standard_left, left_ok),
-                (current_right, standard_right, right_ok)):
-            side_rows = rows[valid]
-            if side_rows.size < self.config.boundary_min_length:
-                continue
-            side_half_widths = np.asarray([
-                self._standard_half_width(
-                    standard_left[index], standard_right[index], width)
-                for index in np.flatnonzero(valid)
-            ], dtype=np.float64)
-            side_residuals = (
-                current[valid] - standard[valid]) / side_half_widths
-            perspective_x = ref.perspective[
-                np.clip(side_rows - ref.roi_top,
-                        0, ref.perspective.size - 1)]
-            design = np.column_stack(
-                [perspective_x, np.ones_like(perspective_x)])
-            perspective_fits.append(np.linalg.lstsq(
-                design, side_residuals, rcond=None)[0])
-        perspective_k = perspective_b = None
-        if perspective_fits:
-            perspective_k, perspective_b = np.mean(
-                np.asarray(perspective_fits, dtype=np.float64), axis=0)
+        # This is the same row-wise perspective normalization used by the
+        # open-source implementation, expressed as an equivalent bird's-eye
+        # center trace instead of independent left/right residual lines.
+        ipm_x = (
+            (current_center - standard_center) * float(ref.lane_width) /
+            standard_width)
+        ipm_s = ref.perspective[
+            np.clip(rows - ref.roi_top, 0, ref.perspective.size - 1)]
         fit_far = float(np.clip(self.config.fit_far_y_ratio, 0.0, 1.0))
         fit_near = float(np.clip(self.config.fit_near_y_ratio, 0.0, 1.0))
         if fit_near < fit_far:
             fit_far, fit_near = fit_near, fit_far
         fit_top = roi_top + (roi_bottom - roi_top - 1) * fit_far
         fit_bottom = roi_top + (roi_bottom - roi_top - 1) * fit_near
-        fit_mask = ((residual_rows >= fit_top) &
-                    (residual_rows <= fit_bottom))
-        if int(np.count_nonzero(fit_mask)) >= self.config.boundary_min_length:
-            residual_rows = residual_rows[fit_mask]
-            residuals = residuals[fit_mask]
-        weights = ref.perspective[
-            np.clip(residual_rows.astype(np.int32) - ref.roi_top,
-                    0, ref.perspective.size - 1)]
-        weights = weights / max(float(np.median(weights)), 1e-9)
-        forward = (height - 1.0 - residual_rows) / max(height - 1.0, 1.0)
-        design = np.column_stack([forward, np.ones_like(forward)])
-        weighted_design = design * weights[:, None]
-        weighted_residual = residuals * weights
-        slope, intercept = np.linalg.lstsq(
-            weighted_design, weighted_residual, rcond=None)[0]
+        fit_mask = (
+            valid & (rows >= fit_top) & (rows <= fit_bottom) &
+            np.isfinite(ipm_x) & np.isfinite(ipm_s))
+        if int(np.count_nonzero(fit_mask)) < self.config.boundary_min_length:
+            fit_mask = valid & np.isfinite(ipm_x) & np.isfinite(ipm_s)
+        fit_s = ipm_s[fit_mask]
+        fit_x = ipm_x[fit_mask]
+        design = np.column_stack([
+            fit_s * fit_s, fit_s, np.ones_like(fit_s)])
+        quadratic, linear, intercept = np.linalg.lstsq(
+            design, fit_x, rcond=None)[0]
         reference_y = roi_top + int(
             round((roi_bottom - roi_top - 1) * self.config.reference_y_ratio))
-        reference_forward = (height - 1.0 - reference_y) / max(height - 1.0, 1.0)
-        raw_lateral = float(slope * reference_forward + intercept)
-        raw_heading = float(np.arctan(slope))
+        reference_index = int(np.clip(
+            reference_y - ref.roi_top, 0, ref.perspective.size - 1))
+        reference_s = float(ref.perspective[reference_index])
+        reference_x = float(
+            quadratic * reference_s * reference_s +
+            linear * reference_s + intercept)
+        local_slope = float(2.0 * quadratic * reference_s + linear)
+        raw_lateral = float(
+            reference_x / max(float(ref.lane_width) / 2.0, 1e-9))
+        raw_heading = float(np.arctan(local_slope))
+        curvature = float(
+            (2.0 * quadratic) /
+            max((1.0 + local_slope * local_slope) ** 1.5, 1e-9))
         mapped = self.config.error_mapping.map(raw_lateral, raw_heading)
         cross = detect_cross_candidate(widths[np.isfinite(widths)])
+        center = np.asarray(center, dtype=np.float64).copy()
+        center[rows[valid]] = current_center[valid]
+        perspective_fit_sides = int(bool(np.any(left_ok))) + int(
+            bool(np.any(right_ok)))
         metrics = {
-            "valid_rows": len(residual_rows),
-            "reference_rows": len(residual_rows),
+            "valid_rows": int(np.count_nonzero(fit_mask)),
+            "reference_rows": reference_rows,
             "reference_tracking_mode": self._reference_mode(side_counts),
             "reference_side_counts": side_counts,
             "fit_far_y": float(fit_top),
             "fit_near_y": float(fit_bottom),
-            "fit_rows": int(residual_rows.size),
-            "perspective_k": (float(perspective_k)
-                              if perspective_k is not None else None),
-            "perspective_b": (float(perspective_b)
-                              if perspective_b is not None else None),
-            "perspective_fit_sides": len(perspective_fits),
-            "reference_fit_slope": float(slope),
+            "fit_rows": int(np.count_nonzero(fit_mask)),
+            "perspective_k": local_slope,
+            "perspective_b": reference_x,
+            "perspective_fit_sides": perspective_fit_sides,
+            "reference_fit_slope": local_slope,
             "reference_fit_intercept": float(intercept),
-            "perspective_median": float(np.median(weights)),
+            "ipm_quadratic": float(quadratic),
+            "ipm_linear": float(linear),
+            "ipm_intercept": float(intercept),
+            "ipm_reference_s": reference_s,
+            "ipm_reference_x": reference_x,
+            "curvature": curvature,
+            "perspective_median": float(np.median(fit_s)),
             "roi_top_y": roi_top,
             "roi_bottom_y": roi_bottom,
             "tracking_mode": self._dominant_tracking_mode(
@@ -306,15 +304,9 @@ class OpenCVLaneAnalyzer:
         return LaneAnalysisResult(
             True, mapped["error_y"], mapped["error_angle"],
             raw_lateral, raw_heading, float(np.clip(
-                len(residual_rows) / max(roi_bottom - roi_top, 1), 0.0, 1.0)),
+                reference_rows / max(roi_bottom - roi_top, 1), 0.0, 1.0)),
             cross.status, cross.score, None, (width, height), seed, left,
             right, center, lane_mask, binary, metrics)
-
-    @staticmethod
-    def _standard_half_width(left, right, image_width):
-        if np.isfinite(left) and np.isfinite(right) and right > left:
-            return max((right - left) / 2.0, 1.0)
-        return max(image_width / 4.0, 1.0)
 
     @staticmethod
     def _reference_mode(counts):

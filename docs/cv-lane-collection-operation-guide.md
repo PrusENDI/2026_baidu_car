@@ -4,15 +4,21 @@
 
 CV 模式用于在固定赛道上自动巡线，并同步采集可继续训练现有车道 CNN 的图像和控制标签。它只从 `collect_data.py` 启动，不替换比赛主程序中的 CNN 巡线入口。
 
-每一条训练记录保存发送给底盘的实际命令：
+每一条训练记录同时保存 PID 前 CNN 标签和 PID 后底盘命令：
 
 ```text
 state[0] = forward_speed
-state[1] = lateral_speed
-state[2] = angular_speed
+state[1] = cv_error_y
+state[2] = cv_error_angle
+
+control[0] = forward_speed
+control[1] = actual_lateral_speed
+control[2] = actual_angular_speed
 ```
 
-该字段定义与手柄采集的 `state` 一致。远程训练器读取 `state[1]` 为 `vy`、读取 `state[2]` 为 `yaw`，因此不需要额外缩放或改名。`control` 与 `state` 保存相同的实际底盘命令，用于回放和审查。
+现有 CNN 训练器仍直接读取 `state[1]` 和 `state[2]`，运行时再调用
+`lane_pid.get_out(-error_y, -error_angle)`。因此 CV 标签也保存在 `state`，但实际发送给
+麦克纳姆底盘的 `vy/wz` 单独保存在 `control`，两者不能再混为一组数据。
 
 图像链路与现有 CNN 保持一致：
 
@@ -34,17 +40,14 @@ state[2] = angular_speed
 | 控制周期基础等待 | 0.05 s |
 | 直道最高前进速度 | 0.20 m/s |
 | 急弯最低前进速度 | 0.08 m/s |
-| 满转向需求参考 | 0.40 rad/s |
+| 满转向需求参考 | 0.40（PID 前航向标签） |
 | 降速曲线指数 | 1.5 |
 | 每帧最大降速 | 0.03 m/s |
 | 每帧最大加速 | 0.005 m/s |
-| 新转向方向延迟距离 | 0.15 m |
-| 无里程计距离积分周期 | 0.05 s |
-| 横向控制 | 关闭，输出 0 |
-| 航向映射 | `-0.40 * raw_heading` |
-| 航向 EMA | `alpha = 0.35` |
-| 转向死区 | 0.03 |
-| 最大角速度 | `+-0.60 rad/s` |
+| 横向误差映射 | `-0.10 * raw_lateral` |
+| 航向误差映射 | `-0.40 * raw_heading` |
+| 横向 PID | `Kp=6, Ki=0, Kd=0.1, limit=+-0.70` |
+| 航向 PID | `Kp=1.95, Ki=0, Kd=0, limit=+-1.50` |
 | 单次最大角速度变化 | 0.04 rad/s |
 | 相机最大允许帧龄 | 0.25 s |
 | 普通无效帧命令继承 | 最多 10 帧 |
@@ -52,9 +55,12 @@ state[2] = angular_speed
 | 保存图像 | 原始 320 x 240 |
 | 灰度阈值 | 175，暗色赛道分割 |
 | ROI | 顶部裁掉 30%，底部裁掉 20% |
-| 航向拟合区 | 有效 ROI 的 75%～96% 近端区域 |
+| 中线拟合区 | 完整有效 ROI 的等效 IPM 坐标 |
 
-横向速度当前始终为 0，所以这批数据主要优化 CNN 的转向输出。训练时必须继续混合原官方/手柄数据，避免把 CNN 的 `vy` 输出头压成恒定零。
+每行先用标准宽度补全单边线中心，再用 `perspective.json` 将横向偏移和前向距离转换
+到等效鸟瞰坐标，拟合二次中心线。近端截距产生 `error_y`，近端切线产生
+`error_angle`，曲率用于诊断。固定的 0.15 m 转向延迟和 PID 前 EMA 已移除，因此每张
+图像的 `state[1:3]` 只由当前帧决定。
 
 ## 3. 固定赛道参考文件
 
@@ -88,9 +94,8 @@ standard/perspective_open_source.json
 
 当前十字状态机关闭，车辆依靠普通循迹和无效帧短时继承直接通过十字路口。
 
-弯道刚进入画面时，航向需求会立即降低前进速度，但新的左右转向方向需要车辆继续
-行驶 0.15 m 后才释放。优先使用底盘里程计；里程计不可用时，控制器按实际下发的
-前进速度和 0.05 s 控制周期积分备用距离。
+弯道航向标签增大时会立即降速并进入 PID；不再按里程延迟转向。`odometry_distance_m`
+仍保留在记录中，只用于赛段分析，不参与基础转向输出。
 
 ## 5. 启动命令
 
@@ -172,10 +177,10 @@ dataset/cv_lane_tests/
 ```json
 {
   "img_path": "000123.jpg",
-  "state": [0.14, 0.0, -0.24],
-  "control": [0.14, 0.0, -0.24],
-  "teacher": "opencv_pid_command",
-  "label_semantics": "vehicle_command_compatible_with_manual",
+  "state": [0.14, -0.025, -0.12],
+  "control": [0.14, -0.15, -0.234],
+  "teacher": "opencv_ipm_error",
+  "label_semantics": "cnn_pid_input_error",
   "held": false,
   "command_source": "standard",
   "steering_demand": 0.60,
@@ -192,7 +197,8 @@ dataset/cv_lane_tests/
 | `standard` | 标准左右边界循迹 |
 | `short_invalid_hold` | 当前帧失效，实际发送上一条有效命令 |
 
-`held=true` 仍表示真实发送给底盘的命令，因此与本项目“训练实际驾驶命令”的标签策略兼容。训练或问题分析时可以单独统计这些帧。
+`held=true` 表示图像分析失效，本帧继承上一帧的标签和实际底盘命令。训练时建议单独
+统计，若数量异常或连续时间过长则丢弃该 session。
 
 ## 9. 一圈结束后的数据检查
 
@@ -201,7 +207,7 @@ dataset/cv_lane_tests/
 1. `data.json` 可以解析，记录数大于零。
 2. JPG 数量与 JSON 记录数一致。
 3. 第一张、中间、两个十字和最后一张图片方向正常。
-4. `state` 与 `control` 每帧一致，且均有 3 个有限数值。
+4. `state` 与 `control` 均有 3 个有限数值，并确认两者语义不同。
 5. `angular_speed` 的左右符号与手柄数据一致。
 6. 转向趋势覆盖完整弯道，没有长时间错误反向。
 7. `held=true` 数量没有异常增多。
@@ -236,8 +242,8 @@ PY
 
 训练器已确认：
 
-- 从 `state[1]` 读取 `vy`；
-- 从 `state[2]` 读取 `yaw`；
+- 从 `state[1]` 读取 CNN 的 `error_y` 标签；
+- 从 `state[2]` 读取 CNN 的 `error_angle` 标签；
 - 使用 RGB、128 x 128、`/127.5 - 1`；
 - 从官方 CNN 权重开始微调；
 - 命令归一化尺度为 `vy=0.15`、`yaw=0.94`。
@@ -250,7 +256,7 @@ PY
 4. 分配 `split=train` 或 `split=validation`，并设置 `usable=true`。
 5. 新建 `mode=mixed` 的训练 YAML；当前 `official_only` 配置会完全忽略 CV 数据。
 6. 固定赛道 mixed 训练应关闭水平翻转；镜像会制造不存在的十字和弯道。
-7. 保留官方/手柄数据，不能只用横移标签全为零的 CV 数据训练整个模型。
+7. 保留官方/手柄数据；CV 已包含非零横向误差，但其初始缩放仍需实车校准。
 
 建议第一轮采样比例：
 
@@ -269,10 +275,10 @@ train:
 ## 11. 已知限制
 
 - 当前前进速度在 0.08～0.20 m/s 之间按转向需求变化，最低弯道速度仍需根据实车抓地和赛道曲率继续校准。
-- 横向控制关闭，CV session 的 `state[1]` 全为 0。
+- 横向控制已启用；图像右偏到车体横移方向的符号必须先低速实车确认。
 - 十字状态机当前关闭，连续无效超过 10 帧仍会停车。
 - 当前每帧同步写 JPG，并每 10 帧更新一次 JSON；磁盘过慢会降低实际控制频率。
-- 当前标签是发送命令，不是编码器测得的真实车体速度。
+- `state` 是单帧视觉误差标签，`control` 是发送命令；两者都不是编码器实测速度。
 - 改变赛道、摄像头姿态、分辨率或照明后，需要重新验证标准参考和阈值。
 
 ## 12. 常见问题

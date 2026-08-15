@@ -34,7 +34,7 @@ def make_near_horizontal_corner():
     return image
 
 
-def make_reference(roi_top=0, roi_bottom=192):
+def make_reference(roi_top=35, roi_bottom=192):
     rows = np.arange(240, dtype=np.float64)
     scale = (rows - 35.0) / (239.0 - 35.0)
     left = 145.0 + (118.0 - 145.0) * scale
@@ -45,15 +45,16 @@ def make_reference(roi_top=0, roi_bottom=192):
         roi_bottom=roi_bottom,
         left_boundary=left,
         right_boundary=right,
-        perspective=np.ones(roi_bottom - roi_top, dtype=np.float64),
-        lane_width=float(np.median(right - left)),
+        perspective=np.linspace(80.0, 10.0, roi_bottom - roi_top),
+        lane_width=40.0,
     )
 
 
 class OpenCVLaneAnalyzerTests(unittest.TestCase):
     def setUp(self):
         self.analyzer = OpenCVLaneAnalyzer(
-            LaneAnalyzerConfig(work_size=(320, 240), roi_top_ratio=0.0,
+            LaneAnalyzerConfig(work_size=(320, 240),
+                               roi_top_ratio=35.0 / 240.0,
                                segmentation="dark"),
             reference=make_reference(),
         )
@@ -77,6 +78,8 @@ class OpenCVLaneAnalyzerTests(unittest.TestCase):
         shifted = self.analyzer.process(make_track(offset=35))
         self.assertTrue(shifted.valid, shifted.reason)
         self.assertGreater(shifted.raw_lateral, centered.raw_lateral + 0.10)
+        self.assertAlmostEqual(shifted.raw_heading, 0.0, delta=0.13)
+        self.assertIn("curvature", shifted.metrics)
 
     def test_cross_expansion_is_reported(self):
         result = self.analyzer.process(make_track(cross=True))

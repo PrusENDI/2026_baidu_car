@@ -13,7 +13,7 @@ python collect_data.py --cv-low-speed
 程序启动后车辆保持停止，终端显示 `cv>` 提示符。可用命令：
 
 ```text
-start   开始以 0.05 m/s 进行 OpenCV+PID 低速循迹
+start   开始 OpenCV+PID 自适应速度循迹
 stop    立即停车并保存本次测试记录
 status  查看运行状态和当前测试目录
 quit    停车、保存并退出
@@ -23,16 +23,18 @@ quit    停车、保存并退出
 0.25 秒未更新，都会发送 `[0, 0, 0]` 速度并结束当前测试段。算法失效停车后不会自动恢复，
 必须检查车辆位置并重新输入 `start`。
 
-## 首轮参数
+## 当前控制与标签
 
 ```text
-forward_speed = 0.05 m/s
-state[1] = lateral_speed command
-state[2] = angular_speed command
-state == control == command sent to car.set_velocity()
+forward_speed = 0.08～0.20 m/s
+state[1] = PID-before cv_error_y
+state[2] = PID-before cv_error_angle
+control[1] = actual lateral_speed command
+control[2] = actual angular_speed command
 ```
 
-横向 PID 在首轮测试中关闭，只验证角度方向、角速度和急弯连续性。
+横向和航向使用与主程序相同的两组 PID。误差来自完整 ROI 的等效 IPM 二次中线拟合，
+固定转向距离延迟已取消。
 
 ## 测试数据
 
@@ -44,10 +46,11 @@ dataset/cv_lane_tests/cv_low_speed_YYYYMMDD_HHMMSS_xxxxxx/
 
 其中包含：
 
-- 与 CNN 输入一致的 128×128 彩色 JPG；
+- 原始 320×240 彩色 JPG，训练时再缩放为 128×128；
 - `data.json`：CV 误差、实际底盘控制量和诊断信息；
 - `session.json`：本次参数和用途说明。
 
-记录使用与手柄采集一致的底盘命令标签，并带有 `held` 和
-`command_source` 字段。正式训练是否采用该 session 仍应以整圈审查和训练侧
+记录使用现有 CNN 读取的 `state[1:3]` 字段保存 PID 前误差标签，并用 `control`
+保留实际底盘命令；同时带有 `held` 和 `command_source` 字段。正式训练是否采用该
+session 仍应以整圈审查和训练侧
 `session-classification.csv` 为准。

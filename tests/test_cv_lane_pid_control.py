@@ -17,8 +17,8 @@ from smartcar.whalesbot.tools.lane_collect.ssh_test import OpenCVLaneSshTest
 def analysis(valid=True, lateral=0.25, heading=1.0, reason=None, metrics=None):
     return LaneAnalysisResult(
         valid=valid,
-        error_y=None,
-        error_angle=None,
+        error_y=lateral if valid else None,
+        error_angle=heading if valid else None,
         raw_lateral=lateral if valid else None,
         raw_heading=heading if valid else None,
         confidence=0.8 if valid else 0.0,
@@ -69,8 +69,7 @@ class CvLanePidControllerTests(unittest.TestCase):
         speeds = []
         demands = []
         for heading in (0.0, 0.25, 0.5, 1.0):
-            command = CvLanePidController(CvLanePidConfig(
-                heading_ema_alpha=1.0)).compute(analysis(heading=heading))
+            command = CvLanePidController().compute(analysis(heading=heading))
             speeds.append(command.target_forward_speed)
             demands.append(command.steering_demand)
         self.assertEqual(speeds, sorted(speeds, reverse=True))
@@ -79,8 +78,7 @@ class CvLanePidControllerTests(unittest.TestCase):
         self.assertLessEqual(max(speeds), 0.20)
 
     def test_bend_deceleration_is_faster_than_exit_acceleration(self):
-        controller = CvLanePidController(CvLanePidConfig(
-            heading_ema_alpha=1.0))
+        controller = CvLanePidController()
         straight = controller.compute(analysis(heading=0.0))
         bend = controller.compute(analysis(heading=1.0))
         exit_command = controller.compute(analysis(heading=0.0))
@@ -89,106 +87,26 @@ class CvLanePidControllerTests(unittest.TestCase):
         self.assertAlmostEqual(
             exit_command.forward_speed - bend.forward_speed, 0.005, places=6)
 
-    def test_heading_scale_reverses_cv_sign(self):
-        controller = CvLanePidController(CvLanePidConfig(
-            startup_straight_distance_m=0.0,
-            heading_onset_delay_m=0.0))
-        command = controller.compute(analysis(heading=1.0))
+    def test_pid_uses_single_frame_labels_and_production_gains(self):
+        controller = CvLanePidController(CvLanePidConfig(max_heading_step=0.0))
+        command = controller.compute(analysis(lateral=0.05, heading=-0.10))
         self.assertTrue(command.valid)
-        self.assertAlmostEqual(command.error_angle, -0.40, places=6)
-        self.assertLess(command.angular_speed, 0.0)
-
-    def test_lateral_control_is_disabled_for_first_test(self):
-        command = CvLanePidController().compute(analysis(lateral=0.8))
-        self.assertEqual(command.error_y, 0.0)
-        self.assertEqual(command.lateral_speed, 0.0)
+        self.assertAlmostEqual(command.error_y, 0.05, places=6)
+        self.assertAlmostEqual(command.error_angle, -0.10, places=6)
+        self.assertAlmostEqual(command.lateral_speed, 0.30, places=6)
+        self.assertAlmostEqual(command.angular_speed, -0.195, places=6)
+        self.assertEqual(command.reason, "ipm_lane_pid")
 
     def test_heading_output_is_limited(self):
-        controller = CvLanePidController()
-        command = None
-        for _ in range(20):
-            command = controller.compute(analysis(heading=10.0))
-        self.assertLessEqual(abs(command.angular_speed), 0.60)
+        controller = CvLanePidController(CvLanePidConfig(max_heading_step=0.0))
+        command = controller.compute(analysis(heading=10.0))
+        self.assertLessEqual(abs(command.angular_speed), 1.50)
 
-    def test_new_heading_waits_for_travel_distance(self):
-        controller = CvLanePidController(CvLanePidConfig(
-            startup_straight_distance_m=0.0,
-            heading_onset_delay_m=0.10))
-        first = controller.compute(analysis(heading=1.0), distance_m=0.0)
-        before = controller.compute(analysis(heading=1.0), distance_m=0.09)
-        released = controller.compute(analysis(heading=1.0), distance_m=0.10)
-        self.assertEqual(first.angular_speed, 0.0)
-        self.assertEqual(before.angular_speed, 0.0)
-        self.assertLess(released.angular_speed, 0.0)
-
-    def test_default_heading_waits_fifteen_centimeters(self):
-        controller = CvLanePidController(CvLanePidConfig(
-            startup_straight_distance_m=0.0))
-        first = controller.compute(analysis(heading=1.0), distance_m=0.0)
-        before = controller.compute(analysis(heading=1.0), distance_m=0.149)
-        released = controller.compute(analysis(heading=1.0), distance_m=0.15)
-        self.assertEqual(first.angular_speed, 0.0)
-        self.assertEqual(before.angular_speed, 0.0)
-        self.assertLess(released.angular_speed, 0.0)
-        self.assertLess(first.forward_speed, 0.20)
-
-    def test_missing_odometry_uses_command_distance_fallback(self):
-        controller = CvLanePidController(CvLanePidConfig(
-            startup_straight_distance_m=0.0,
-            heading_onset_delay_m=0.02,
-            min_forward_speed=0.20,
-            max_forward_speed=0.20))
-        commands = [controller.compute(analysis(heading=1.0))
-                    for _ in range(2)]
-        released = controller.compute(analysis(heading=1.0))
-        self.assertTrue(all(command.angular_speed == 0.0
-                            for command in commands))
-        self.assertLess(released.angular_speed, 0.0)
-
-    def test_only_session_start_is_held_straight_for_ten_centimeters(self):
-        controller = CvLanePidController()
-        first = controller.compute(analysis(heading=1.0), distance_m=0.0)
-        before = controller.compute(analysis(heading=1.0), distance_m=0.099)
-        startup_released = controller.compute(
-            analysis(heading=1.0), distance_m=0.10)
-        released = controller.compute(analysis(heading=1.0), distance_m=0.25)
-        later = CvLanePidController(CvLanePidConfig(
-            heading_onset_delay_m=0.0)).compute(
-            analysis(heading=-1.0), distance_m=0.50)
-        self.assertEqual(first.angular_speed, 0.0)
-        self.assertEqual(first.reason, "startup_straight")
-        self.assertEqual(before.angular_speed, 0.0)
-        self.assertEqual(startup_released.angular_speed, 0.0)
-        self.assertLess(released.angular_speed, 0.0)
-        self.assertGreater(later.angular_speed, 0.0)
-        self.assertNotEqual(later.reason, "startup_straight")
-
-    def test_default_controller_uses_near_field_raw_heading(self):
-        command = CvLanePidController(CvLanePidConfig(
-            startup_straight_distance_m=0.0,
-            heading_onset_delay_m=0.0)).compute(analysis(
-            heading=1.0,
-            metrics={"perspective_k": -0.02, "perspective_b": -0.12},
-        ))
+    def test_distance_does_not_delay_current_frame_heading(self):
+        command = CvLanePidController().compute(
+            analysis(heading=-0.20), distance_m=0.0)
         self.assertLess(command.angular_speed, 0.0)
-        self.assertEqual(command.reason, "")
-
-    def test_perspective_kb_drives_heading_without_lateral_speed(self):
-        controller = CvLanePidController(CvLanePidConfig(
-            startup_straight_distance_m=0.0,
-            heading_onset_delay_m=0.0,
-            perspective_kb_enabled=True))
-        command = controller.compute(analysis(
-            heading=-1.0,
-            lateral=0.8,
-            metrics={
-                "perspective_k": 0.02,
-                "perspective_b": 0.12,
-            },
-        ))
-        self.assertLess(command.angular_speed, 0.0)
-        self.assertEqual(command.lateral_speed, 0.0)
-        self.assertEqual(command.reason, "perspective_kb")
+        self.assertAlmostEqual(command.error_angle, -0.20, places=6)
 
     def test_invalid_analysis_commands_stop(self):
         command = CvLanePidController().compute(
@@ -235,16 +153,19 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
             metadata = json.loads((session_dir / "session.json").read_text())
             self.assertEqual(saved.shape, (240, 320, 3))
             self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["teacher"], "opencv_pid_command")
+            self.assertEqual(records[0]["teacher"], "opencv_ipm_error")
             self.assertFalse(records[0]["held"])
             self.assertEqual(records[0]["command_source"], "standard")
             self.assertIn("control_reason", records[0])
             self.assertIn("steering_demand", records[0])
             self.assertIn("target_forward_speed", records[0])
-            self.assertEqual(records[0]["state"], records[0]["control"])
+            self.assertNotEqual(records[0]["state"], records[0]["control"])
+            self.assertEqual(records[0]["state"][1], records[0]["cv"]["error_y"])
+            self.assertEqual(
+                records[0]["state"][2], records[0]["cv"]["error_angle"])
             self.assertEqual(
                 metadata["state_fields"],
-                ["forward_speed", "lateral_speed", "angular_speed"],
+                ["forward_speed", "error_y", "error_angle"],
             )
             self.assertTrue(metadata["usable_for_training"])
             self.assertEqual(
@@ -276,6 +197,7 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
             runner._consume_commands()
             runner._control_once()
             last_valid = car.commands[-1]
+            first_state = list(runner.writer.records[-1]["state"])
 
             camera.image = np.full((240, 320, 3), 35, dtype=np.uint8)
             for _ in range(10):
@@ -285,7 +207,9 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
 
             held_records = runner.writer.records[-10:]
             self.assertTrue(all(row["held"] for row in held_records))
-            self.assertTrue(all(row["state"] == list(last_valid)
+            self.assertTrue(all(row["state"] == first_state
+                                for row in held_records))
+            self.assertTrue(all(row["control"] == list(last_valid)
                                 for row in held_records))
 
             runner._control_once()
