@@ -1,6 +1,8 @@
 """OpenCV lane teacher used by data collection only."""
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
@@ -10,6 +12,46 @@ from .calibration import ErrorMapping
 from .cross import detect_cross_candidate
 
 Size = Tuple[int, int]
+
+
+@dataclass(frozen=True)
+class StandardLaneReference:
+    """Fixed-track boundary and perspective reference for one camera setup."""
+
+    image_size: Size
+    roi_top: int
+    roi_bottom: int
+    left_boundary: np.ndarray
+    right_boundary: np.ndarray
+    perspective: np.ndarray
+    lane_width: float
+
+    @classmethod
+    def from_files(cls, lane_path: Path, perspective_path: Path):
+        lane_data = json.loads(Path(lane_path).read_text(encoding="utf-8"))
+        perspective_data = json.loads(
+            Path(perspective_path).read_text(encoding="utf-8"))
+        image_size = tuple(int(v) for v in lane_data["image_size"])
+        roi = lane_data["roi"]
+        width, height = image_size
+        left = np.asarray(lane_data["left_boundary"], dtype=np.float64)
+        right = np.asarray(lane_data["right_boundary"], dtype=np.float64)
+        perspective = np.asarray(perspective_data["arr"], dtype=np.float64)
+        roi_top, roi_bottom = int(roi["top"]), int(roi["bottom"])
+        if (width <= 0 or height <= 0 or roi_top < 0 or
+                roi_bottom > height or roi_top >= roi_bottom):
+            raise ValueError("invalid standard lane image/ROI")
+        if left.size != height or right.size != height:
+            raise ValueError("standard boundary length must equal image height")
+        if perspective.size != roi_bottom - roi_top:
+            raise ValueError("perspective length must equal ROI height")
+        if (not np.all(np.isfinite(perspective)) or
+                np.any(perspective <= 0)):
+            raise ValueError("perspective values must be positive and finite")
+        left[left < 0] = np.nan
+        right[right < 0] = np.nan
+        return cls(image_size, roi_top, roi_bottom, left, right,
+                   perspective, float(perspective_data.get("wid", 1.0)))
 
 
 @dataclass(frozen=True)
@@ -51,6 +93,12 @@ class LaneAnalyzerConfig:
     fit_near_y_ratio: float = 0.92
     morphology_kernel: int = 3
     error_mapping: ErrorMapping = field(default_factory=ErrorMapping)
+    boundary_max_step: float = 10.0
+    boundary_min_length: int = 10
+    boundary_max_gap: int = 3
+    false_double_max_width_ratio: float = 0.22
+    false_double_min_slope_ratio: float = 1.8
+    false_double_min_horizontal_slope: float = 0.25
 
 
 @dataclass
@@ -88,8 +136,15 @@ class LaneAnalysisResult:
 class OpenCVLaneAnalyzer:
     """Extract a connected dark track and fit its center line."""
 
-    def __init__(self, config: Optional[LaneAnalyzerConfig] = None) -> None:
+    def __init__(self, config: Optional[LaneAnalyzerConfig] = None,
+                 reference: Optional[StandardLaneReference] = None) -> None:
         self.config = config or LaneAnalyzerConfig()
+        if reference is None:
+            raise ValueError("standard lane reference is required")
+        expected = self.config.work_size
+        if expected is None or tuple(reference.image_size) != tuple(expected):
+            raise ValueError("standard reference image size must match work_size")
+        self.reference = reference
 
     def make_cnn_image(self, image: np.ndarray) -> np.ndarray:
         self._validate_image(image)
@@ -117,67 +172,224 @@ class OpenCVLaneAnalyzer:
         roi_top, roi_bottom = self._roi_bounds(height)
         roi_height = max(roi_bottom - roi_top, 1)
         left, right, center, widths, modes = self._extract_boundaries(lane_mask)
-        center = self._keep_longest_center_segment(center, width)
-        valid_rows = np.flatnonzero(np.isfinite(center))
-        mode_counts = self._tracking_mode_counts(modes, valid_rows)
+        left = self._clean_boundary_trace(left)
+        right = self._clean_boundary_trace(right)
+        left, right, boundary_filter = self._reject_false_double_boundary(
+            left, right, width)
+        modes = self._boundary_modes(left, right)
+        center = self._center_from_boundaries(left, right)
         corner = self._detect_steep_corner(lane_mask)
-        reaches_near_roi = (valid_rows.size > 0 and
-                            valid_rows[-1] >= roi_top +
-                            int(roi_height * self.config.min_center_reach_ratio))
-        center_reliable = (
-            valid_rows.size >= max(8, int(roi_height * self.config.min_valid_rows_ratio)) and
-            reaches_near_roi)
-        reaches_relaxed_roi = (valid_rows.size > 0 and
-                               valid_rows[-1] >= roi_top + int(
-                                   roi_height * self.config.relaxed_center_reach_ratio))
-        relaxed_center_reliable = (
-            valid_rows.size >= max(8, int(roi_height * self.config.min_valid_rows_ratio)) and
-            reaches_relaxed_roi)
-        direct_corner = self._direct_corner_geometry(
-            center, valid_rows, corner, height, width)
-        use_direct = (not center_reliable and direct_corner is not None and
-                      (direct_corner["corner_confirmed"] or
-                       not relaxed_center_reliable))
-        if use_direct:
-            finite_widths = widths[np.isfinite(widths)]
-            cross = detect_cross_candidate(finite_widths)
-            raw_lateral = direct_corner["raw_lateral"]
-            raw_heading = direct_corner["raw_heading"]
-            mapped = self.config.error_mapping.map(raw_lateral, raw_heading)
-            metrics = {
-                "valid_rows": int(valid_rows.size),
-                "median_lane_width": (float(np.median(finite_widths))
-                                      if finite_widths.size else 0.0),
-                "roi_top_y": roi_top, "roi_bottom_y": roi_bottom,
-                "tracking_mode": direct_corner["tracking_mode"],
-                "tracking_mode_counts": mode_counts,
-                "corner_direction_source": direct_corner["direction_source"],
-                **self._corner_metrics(corner),
-            }
-            return LaneAnalysisResult(
-                True, mapped["error_y"], mapped["error_angle"],
-                float(raw_lateral), float(raw_heading),
-                direct_corner["confidence"],
-                cross.status, cross.score, None, (width, height), seed,
-                left, right, center, lane_mask, binary, metrics)
-        if not center_reliable and relaxed_center_reliable:
-            center_reliable = True
-        if not center_reliable:
-            corner_metrics = self._corner_metrics(corner)
-            return self._invalid((width, height),
-                                 "lane boundaries do not provide a reliable near-field center", binary,
-                                 lane_mask, seed, left, right, center,
-                                 {"valid_rows": int(valid_rows.size),
-                                  "reaches_near_roi": bool(reaches_near_roi),
-                                  "reaches_relaxed_roi": bool(reaches_relaxed_roi),
-                                  "tracking_mode": self._dominant_tracking_mode(mode_counts),
-                                  "tracking_mode_counts": mode_counts,
-                                  **corner_metrics})
-        fit_far = roi_top + int(roi_height * self.config.fit_far_y_ratio)
-        fit_near = roi_top + int(roi_height * self.config.fit_near_y_ratio)
-        fit_rows = valid_rows[(valid_rows >= fit_far) & (valid_rows <= fit_near)]
-        if fit_rows.size < 8:
-            fit_rows = valid_rows
+        return self._standard_relative_result(
+            width, height, left, right, center, widths, modes, lane_mask,
+            binary, seed, corner, boundary_filter)
+
+    def _standard_relative_result(self, width, height, left, right, center,
+                                  widths, modes, lane_mask, binary, seed,
+                                  corner, boundary_filter):
+        ref = self.reference
+        roi_top, roi_bottom = self._roi_bounds(height)
+        rows = np.arange(roi_top, roi_bottom, dtype=np.int32)
+        standard_left = ref.left_boundary[rows]
+        standard_right = ref.right_boundary[rows]
+        current_left = left[rows]
+        current_right = right[rows]
+        left_ok = np.isfinite(current_left) & np.isfinite(standard_left)
+        right_ok = np.isfinite(current_right) & np.isfinite(standard_right)
+        residuals = []
+        residual_rows = []
+        side_counts = {"left": 0, "right": 0, "both": 0}
+        for i, row in enumerate(rows):
+            values = []
+            if left_ok[i]:
+                half_width = self._standard_half_width(
+                    standard_left[i], standard_right[i], width)
+                values.append((current_left[i] - standard_left[i]) / half_width)
+            if right_ok[i]:
+                half_width = self._standard_half_width(
+                    standard_left[i], standard_right[i], width)
+                values.append((current_right[i] - standard_right[i]) / half_width)
+            if not values:
+                continue
+            side_counts["both" if len(values) == 2 else
+                        ("left" if left_ok[i] else "right")] += 1
+            residual_rows.append(int(row))
+            residuals.append(float(np.mean(values)))
+        if len(residual_rows) < self.config.boundary_min_length:
+            return self._invalid(
+                (width, height),
+                "standard reference has too few valid boundary rows", binary,
+                lane_mask, seed, left, right, center,
+                {"reference_rows": len(residual_rows),
+                 "reference_tracking_mode": self._reference_mode(side_counts),
+                 **boundary_filter,
+                 **self._corner_metrics(corner)})
+        residual_rows = np.asarray(residual_rows, dtype=np.float64)
+        residuals = np.asarray(residuals, dtype=np.float64)
+        weights = ref.perspective[
+            np.clip(residual_rows.astype(np.int32) - ref.roi_top,
+                    0, ref.perspective.size - 1)]
+        weights = weights / max(float(np.median(weights)), 1e-9)
+        forward = (height - 1.0 - residual_rows) / max(height - 1.0, 1.0)
+        design = np.column_stack([forward, np.ones_like(forward)])
+        weighted_design = design * weights[:, None]
+        weighted_residual = residuals * weights
+        slope, intercept = np.linalg.lstsq(
+            weighted_design, weighted_residual, rcond=None)[0]
+        reference_y = roi_top + int(
+            round((roi_bottom - roi_top - 1) * self.config.reference_y_ratio))
+        reference_forward = (height - 1.0 - reference_y) / max(height - 1.0, 1.0)
+        raw_lateral = float(slope * reference_forward + intercept)
+        raw_heading = float(np.arctan(slope))
+        mapped = self.config.error_mapping.map(raw_lateral, raw_heading)
+        cross = detect_cross_candidate(widths[np.isfinite(widths)])
+        metrics = {
+            "valid_rows": len(residual_rows),
+            "reference_rows": len(residual_rows),
+            "reference_tracking_mode": self._reference_mode(side_counts),
+            "reference_side_counts": side_counts,
+            "reference_fit_slope": float(slope),
+            "reference_fit_intercept": float(intercept),
+            "perspective_median": float(np.median(weights)),
+            "roi_top_y": roi_top,
+            "roi_bottom_y": roi_bottom,
+            "tracking_mode": self._dominant_tracking_mode(
+                self._tracking_mode_counts(modes, np.arange(height))),
+            **boundary_filter,
+            **self._corner_metrics(corner),
+        }
+        return LaneAnalysisResult(
+            True, mapped["error_y"], mapped["error_angle"],
+            raw_lateral, raw_heading, float(np.clip(
+                len(residual_rows) / max(roi_bottom - roi_top, 1), 0.0, 1.0)),
+            cross.status, cross.score, None, (width, height), seed, left,
+            right, center, lane_mask, binary, metrics)
+
+    @staticmethod
+    def _standard_half_width(left, right, image_width):
+        if np.isfinite(left) and np.isfinite(right) and right > left:
+            return max((right - left) / 2.0, 1.0)
+        return max(image_width / 4.0, 1.0)
+
+    @staticmethod
+    def _reference_mode(counts):
+        if counts["both"]:
+            return "both" if not (counts["left"] or counts["right"]) else "mixed"
+        if counts["left"]:
+            return "left_only"
+        if counts["right"]:
+            return "right_only"
+        return "none"
+
+    def _clean_boundary_trace(self, line):
+        line = np.asarray(line, dtype=np.float64)
+        clean = np.full_like(line, np.nan)
+        rows = np.flatnonzero(np.isfinite(line))
+        if rows.size == 0:
+            return clean
+        max_step = float(self.config.boundary_max_step)
+        max_gap = max(int(self.config.boundary_max_gap), 0)
+        segments = []
+        start = 0
+        for index in range(1, rows.size):
+            row_gap = int(rows[index] - rows[index - 1])
+            value_jump = abs(float(line[rows[index]]) -
+                             float(line[rows[index - 1]]))
+            if row_gap > max_gap + 1 or value_jump > max_step:
+                segments.append(rows[start:index])
+                start = index
+        segments.append(rows[start:])
+        segment = max(segments, key=lambda r: r.size)
+        if segment.size < self.config.boundary_min_length:
+            return clean
+        clean[segment] = line[segment]
+        start, end = int(segment[0]), int(segment[-1])
+        for row in range(start + 1, end):
+            if np.isfinite(clean[row]):
+                continue
+            before = row - 1
+            while before >= start and not np.isfinite(clean[before]):
+                before -= 1
+            after = row + 1
+            while after <= end and not np.isfinite(line[after]):
+                after += 1
+            if (before >= start and after <= end and
+                    after - before <= self.config.boundary_max_gap + 1):
+                clean[row] = np.interp(row, [before, after],
+                                       [clean[before], line[after]])
+        return clean
+
+    def _reject_false_double_boundary(self, left, right, image_width):
+        """Drop a likely second trace cut from one sharply curved boundary.
+
+        The open-source implementation used near-field width and line slope.
+        This version additionally requires a strong slope contrast so a real,
+        narrow two-sided lane is left untouched.
+        """
+        left = np.asarray(left, dtype=np.float64).copy()
+        right = np.asarray(right, dtype=np.float64).copy()
+        metrics = {
+            "false_double_rejected": False,
+            "false_double_rejected_side": "none",
+        }
+        roi_top, roi_bottom = self._roi_bounds(left.size)
+        near_top = roi_top + (roi_bottom - roi_top) // 2
+        rows = np.flatnonzero(
+            np.isfinite(left) & np.isfinite(right) &
+            (np.arange(left.size) >= near_top) &
+            (np.arange(left.size) < roi_bottom))
+        if rows.size < self.config.boundary_min_length:
+            return left, right, metrics
+
+        separation = right[rows] - left[rows]
+        separation = separation[np.isfinite(separation) & (separation > 0)]
+        if separation.size < self.config.boundary_min_length:
+            return left, right, metrics
+        median_width = float(np.median(separation))
+        metrics["false_double_median_width"] = median_width
+        if median_width >= image_width * self.config.false_double_max_width_ratio:
+            return left, right, metrics
+
+        left_slope = abs(float(np.polyfit(rows, left[rows], 1)[0]))
+        right_slope = abs(float(np.polyfit(rows, right[rows], 1)[0]))
+        metrics["false_double_left_slope"] = left_slope
+        metrics["false_double_right_slope"] = right_slope
+        smaller = min(left_slope, right_slope)
+        larger = max(left_slope, right_slope)
+        slope_ratio = larger / max(smaller, 1e-6)
+        if (larger < self.config.false_double_min_horizontal_slope or
+                slope_ratio < self.config.false_double_min_slope_ratio):
+            return left, right, metrics
+
+        rejected = "right" if left_slope < right_slope else "left"
+        if rejected == "right":
+            right[:] = np.nan
+        else:
+            left[:] = np.nan
+        metrics["false_double_rejected"] = True
+        metrics["false_double_rejected_side"] = rejected
+        metrics["false_double_slope_ratio"] = slope_ratio
+        return left, right, metrics
+
+    @staticmethod
+    def _boundary_modes(left, right):
+        modes = np.zeros(len(left), dtype=np.uint8)
+        left_ok = np.isfinite(left)
+        right_ok = np.isfinite(right)
+        modes[left_ok] = 1
+        modes[right_ok] = 2
+        modes[left_ok & right_ok] = 3
+        return modes
+
+    @staticmethod
+    def _center_from_boundaries(left, right):
+        center = np.full_like(left, np.nan)
+        both = np.isfinite(left) & np.isfinite(right)
+        center[both] = (left[both] + right[both]) / 2.0
+        left_only = np.isfinite(left) & ~np.isfinite(right)
+        right_only = np.isfinite(right) & ~np.isfinite(left)
+        center[left_only] = left[left_only]
+        center[right_only] = right[right_only]
+        return center
         finite_widths = widths[np.isfinite(widths)]
         median_width = float(np.median(finite_widths)) if finite_widths.size else 0.0
         forward = (height - 1 - fit_rows).astype(np.float64)

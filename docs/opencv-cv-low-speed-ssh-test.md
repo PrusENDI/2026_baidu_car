@@ -27,10 +27,9 @@ quit    停车、保存并退出
 
 ```text
 forward_speed = 0.05 m/s
-error_angle = -0.316 * raw_heading
-error_y = 0
-angular_speed limit = +/-0.35 rad/s
-angular speed step = 0.08 rad/s per control update
+state[1] = lateral_speed command
+state[2] = angular_speed command
+state == control == command sent to car.set_velocity()
 ```
 
 横向 PID 在首轮测试中关闭，只验证角度方向、角速度和急弯连续性。
@@ -49,4 +48,6 @@ dataset/cv_lane_tests/cv_low_speed_YYYYMMDD_HHMMSS_xxxxxx/
 - `data.json`：CV 误差、实际底盘控制量和诊断信息；
 - `session.json`：本次参数和用途说明。
 
-首轮记录带有 `usable_for_training: false`，不得直接合并进正式训练集。
+记录使用与手柄采集一致的底盘命令标签，并带有 `held` 和
+`command_source` 字段。正式训练是否采用该 session 仍应以整圈审查和训练侧
+`session-classification.csv` 为准。

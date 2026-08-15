@@ -72,9 +72,9 @@ class CvLanePidControllerTests(unittest.TestCase):
     def test_heading_output_is_limited(self):
         controller = CvLanePidController()
         command = None
-        for _ in range(10):
+        for _ in range(20):
             command = controller.compute(analysis(heading=10.0))
-        self.assertLessEqual(abs(command.angular_speed), 0.35)
+        self.assertLessEqual(abs(command.angular_speed), 0.60)
 
     def test_invalid_analysis_commands_stop(self):
         command = CvLanePidController().compute(
@@ -104,8 +104,15 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
             metadata = json.loads((session_dir / "session.json").read_text())
             self.assertEqual(saved.shape, (128, 128, 3))
             self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["teacher"], "opencv_stateless")
-            self.assertFalse(metadata["usable_for_training"])
+            self.assertEqual(records[0]["teacher"], "opencv_pid_command")
+            self.assertFalse(records[0]["held"])
+            self.assertEqual(records[0]["command_source"], "standard")
+            self.assertEqual(records[0]["state"], records[0]["control"])
+            self.assertEqual(
+                metadata["state_fields"],
+                ["forward_speed", "lateral_speed", "angular_speed"],
+            )
+            self.assertTrue(metadata["usable_for_training"])
             self.assertEqual(car.commands[-1], (0.0, 0.0, 0.0))
 
     def test_invalid_frame_disarms_and_stops(self):

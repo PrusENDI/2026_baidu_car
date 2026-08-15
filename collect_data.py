@@ -19,6 +19,7 @@
 
 """
 import argparse
+from pathlib import Path
 
 from smartcar import logger
 
@@ -46,7 +47,12 @@ if __name__ == "__main__":
         cam1 = Camera(1, 320, 240)
         car = MecanumDriver()
         try:
-            OpenCVLaneSshTest(cam1, car, output_root=args.cv_output).run()
+            OpenCVLaneSshTest(
+                cam1,
+                car,
+                output_root=args.cv_output,
+                standard_root=Path(__file__).resolve().parent / "standard",
+            ).run()
         finally:
             car.set_velocity(0.0, 0.0, 0.0)
             cam1.close()

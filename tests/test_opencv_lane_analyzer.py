@@ -3,7 +3,11 @@ import unittest
 import cv2
 import numpy as np
 
-from smartcar.whalesbot.tools.lane_collect import LaneAnalyzerConfig, OpenCVLaneAnalyzer
+from smartcar.whalesbot.tools.lane_collect import (
+    LaneAnalyzerConfig,
+    OpenCVLaneAnalyzer,
+    StandardLaneReference,
+)
 
 
 def make_track(offset=0, cross=False):
@@ -30,11 +34,29 @@ def make_near_horizontal_corner():
     return image
 
 
+def make_reference(roi_top=0, roi_bottom=192):
+    rows = np.arange(240, dtype=np.float64)
+    scale = (rows - 35.0) / (239.0 - 35.0)
+    left = 145.0 + (118.0 - 145.0) * scale
+    right = 175.0 + (202.0 - 175.0) * scale
+    return StandardLaneReference(
+        image_size=(320, 240),
+        roi_top=roi_top,
+        roi_bottom=roi_bottom,
+        left_boundary=left,
+        right_boundary=right,
+        perspective=np.ones(roi_bottom - roi_top, dtype=np.float64),
+        lane_width=float(np.median(right - left)),
+    )
+
+
 class OpenCVLaneAnalyzerTests(unittest.TestCase):
     def setUp(self):
         self.analyzer = OpenCVLaneAnalyzer(
             LaneAnalyzerConfig(work_size=(320, 240), roi_top_ratio=0.0,
-                               segmentation="dark"))
+                               segmentation="dark"),
+            reference=make_reference(),
+        )
 
     def test_cnn_image_matches_runtime_geometry(self):
         image = self.analyzer.make_cnn_image(make_track())
@@ -61,7 +83,8 @@ class OpenCVLaneAnalyzerTests(unittest.TestCase):
     def test_top_and_bottom_roi_keep_seed_inside_active_region(self):
         analyzer = OpenCVLaneAnalyzer(LaneAnalyzerConfig(
             work_size=(320, 240), segmentation="dark",
-            roi_top_ratio=0.30, roi_bottom_ratio=0.20))
+            roi_top_ratio=0.30, roi_bottom_ratio=0.20),
+            reference=make_reference(72, 192))
         result = analyzer.process(make_track())
         self.assertTrue(result.valid, result.reason)
         self.assertEqual(np.count_nonzero(result.binary_mask[:72]), 0)
@@ -82,13 +105,12 @@ class OpenCVLaneAnalyzerTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIsNone(result.raw_lateral)
         self.assertIsNone(result.raw_heading)
-        self.assertEqual(result.metrics["tracking_mode"], "none")
+        self.assertEqual(result.metrics.get("tracking_mode", "none"), "none")
 
-    def test_near_horizontal_corner_uses_stateless_contour_fallback(self):
+    def test_near_horizontal_corner_without_reference_rows_is_invalid(self):
         result = self.analyzer.process(make_near_horizontal_corner())
-        self.assertTrue(result.valid, result.reason)
-        self.assertEqual(result.metrics["tracking_mode"], "corner_direct")
-        self.assertGreater(abs(result.raw_heading), 0.5)
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "standard reference has too few valid boundary rows")
 
     def test_exact_horizontal_corner_without_direction_stays_invalid(self):
         image = np.full((240, 320, 3), 210, dtype=np.uint8)

@@ -1,8 +1,10 @@
 """Temporal sharp-turn handling for the data-collection OpenCV teacher."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional
+
+import numpy as np
 
 from .calibration import ErrorMapping
 from .opencv_lane import LaneAnalysisResult
@@ -188,3 +190,164 @@ class SharpTurnStateMachine:
         return TurnCommand(result.valid, result.error_y, result.error_angle,
                            result.raw_lateral, result.raw_heading,
                            self.state.value, source, result.reason)
+
+
+class CrossStraightState(str, Enum):
+    NORMAL = "normal"
+    CURVE_CONTINUE = "curve_continue"
+    CROSS_STRAIGHT = "cross_straight"
+    WAIT_SECOND_CROSS = "wait_second_cross"
+    SECOND_CROSS_STRAIGHT = "second_cross_straight"
+    DONE = "done"
+
+
+@dataclass(frozen=True)
+class CrossStraightConfig:
+    """One-shot timing for the first bend followed immediately by a cross."""
+
+    corner_min_score: float = 0.52
+    anomaly_heading: float = 0.75
+    curve_continue_frames: int = 30
+    cross_straight_frames: int = 30
+    heading_decay_frames: int = 8
+    cross_speed_scale: float = 0.65
+    history_size: int = 8
+    entry_lateral_limit: float = 0.35
+    entry_heading_limit: float = 0.85
+    min_trigger_frame: int = 217
+    second_min_trigger_frame: int = 1100
+    second_cross_straight_frames: int = 20
+
+
+@dataclass(frozen=True)
+class CrossStraightDecision:
+    result: LaneAnalysisResult
+    state: str
+    speed_scale: float
+    source: str
+
+
+class CrossStraightStateMachine:
+    """One-shot bend continuation followed by straight-through crossing.
+
+    This is intentionally route-specific: after the first suspicious
+    horizontal boundary, it continues the prior bend for a bounded number of
+    frames, then gradually removes steering and holds the entry lateral pose.
+    Once the crossing window is complete it never triggers again.
+    """
+
+    def __init__(self, config: CrossStraightConfig = None) -> None:
+        self.config = config or CrossStraightConfig()
+        self.reset()
+
+    def reset(self) -> None:
+        self.state = CrossStraightState.NORMAL
+        self._history = []
+        self._entry_lateral = 0.0
+        self._entry_heading = 0.0
+        self._curve_frames = 0
+        self._cross_frames = 0
+        self._second_cross_frames = 0
+        self._frame_count = 0
+
+    def update(self, result: LaneAnalysisResult) -> CrossStraightDecision:
+        self._frame_count += 1
+        self._remember(result)
+        if self.state == CrossStraightState.DONE:
+            return CrossStraightDecision(result, self.state.value, 1.0, "normal_after_cross")
+
+        if self.state == CrossStraightState.WAIT_SECOND_CROSS:
+            if (self._frame_count >= self.config.second_min_trigger_frame and
+                    not result.valid):
+                self._capture_entry_pose()
+                self.state = CrossStraightState.SECOND_CROSS_STRAIGHT
+                self._second_cross_frames = 0
+                return self._held_result(
+                    result, self._entry_lateral, self._entry_heading,
+                    self.state.value, "second_cross_straight")
+            return CrossStraightDecision(result, self.state.value, 1.0,
+                                         "standard_wait_second_cross")
+
+        if self.state == CrossStraightState.NORMAL:
+            if self._is_first_cross_approach(result):
+                self._capture_entry_pose()
+                self.state = CrossStraightState.CURVE_CONTINUE
+                self._curve_frames = 0
+                return self._held_result(result, self._entry_lateral,
+                                         self._entry_heading,
+                                         self.state.value, "curve_continue_entry")
+            return CrossStraightDecision(result, self.state.value, 1.0, "standard")
+
+        if self.state == CrossStraightState.CURVE_CONTINUE:
+            self._curve_frames += 1
+            if self._curve_frames >= max(1, self.config.curve_continue_frames):
+                self.state = CrossStraightState.CROSS_STRAIGHT
+                self._cross_frames = 0
+            else:
+                return self._held_result(result, self._entry_lateral,
+                                         self._entry_heading,
+                                         self.state.value, "curve_continue_hold")
+
+        if self.state == CrossStraightState.CROSS_STRAIGHT:
+            self._cross_frames += 1
+            decay = min(self._cross_frames /
+                        max(1, self.config.heading_decay_frames), 1.0)
+            heading = self._entry_heading * (1.0 - decay)
+            if self._cross_frames >= max(1, self.config.cross_straight_frames):
+                self.state = CrossStraightState.WAIT_SECOND_CROSS
+            return self._held_result(result, self._entry_lateral, heading,
+                                     self.state.value, "cross_straight")
+
+        if self.state == CrossStraightState.SECOND_CROSS_STRAIGHT:
+            self._second_cross_frames += 1
+            decay = min(self._second_cross_frames /
+                        max(1, self.config.heading_decay_frames), 1.0)
+            heading = self._entry_heading * (1.0 - decay)
+            if self._second_cross_frames >= max(
+                    1, self.config.second_cross_straight_frames):
+                self.state = CrossStraightState.DONE
+            return self._held_result(
+                result, self._entry_lateral, heading, self.state.value,
+                "second_cross_straight")
+
+        return CrossStraightDecision(result, self.state.value, 1.0, "standard")
+
+    def _remember(self, result: LaneAnalysisResult) -> None:
+        if not result.valid or result.raw_lateral is None or result.raw_heading is None:
+            return
+        self._history.append((float(result.raw_lateral), float(result.raw_heading)))
+        del self._history[:-max(1, self.config.history_size)]
+
+    def _is_first_cross_approach(self, result: LaneAnalysisResult) -> bool:
+        if not result.valid or len(self._history) < 3:
+            return False
+        if self._frame_count < self.config.min_trigger_frame:
+            return False
+        metrics = result.metrics
+        if metrics.get("tracking_mode") not in ("left_only", "right_only"):
+            return False
+        if not metrics.get("corner_detected", False):
+            return False
+        if float(metrics.get("corner_score", 0.0)) < self.config.corner_min_score:
+            return False
+        return abs(float(result.raw_heading or 0.0)) >= self.config.anomaly_heading
+
+    def _capture_entry_pose(self) -> None:
+        values = self._history[:-1] if len(self._history) > 1 else self._history
+        lateral = [item[0] for item in values]
+        heading = [item[1] for item in values]
+        self._entry_lateral = float(np.median(lateral))
+        self._entry_heading = float(np.clip(
+            np.median(heading), -self.config.entry_heading_limit,
+            self.config.entry_heading_limit))
+        self._entry_lateral = float(np.clip(
+            self._entry_lateral, -self.config.entry_lateral_limit,
+            self.config.entry_lateral_limit))
+
+    def _held_result(self, result, lateral, heading, state, source):
+        held = replace(result, valid=True, reason=None,
+                       raw_lateral=float(lateral), raw_heading=float(heading))
+        return CrossStraightDecision(held, state,
+                                     (self.config.cross_speed_scale
+                                      if "cross_straight" in source else 0.85),
+                                     source)

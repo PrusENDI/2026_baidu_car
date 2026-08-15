@@ -17,8 +17,10 @@ class CvLanePidConfig:
     lateral_kp: float = 0.0
     heading_kp: float = 1.0
     lateral_limit: float = 0.04
-    heading_limit: float = 0.35
-    max_heading_step: float = 0.08
+    heading_limit: float = 0.60
+    max_heading_step: float = 0.04
+    heading_ema_alpha: float = 0.35
+    heading_deadband: float = 0.03
 
 
 @dataclass(frozen=True)
@@ -61,24 +63,36 @@ class CvLanePidController:
                            self.config.heading_limit),
         )
         self._last_heading_output = 0.0
+        self._filtered_heading_error = None
 
     def reset(self) -> None:
         self.pid_y.reset()
         self.pid_angle.reset()
         self._last_heading_output = 0.0
+        self._filtered_heading_error = None
 
     def compute(self, result: LaneAnalysisResult) -> CvLaneControlCommand:
         if (not result.valid or result.raw_lateral is None or
                 result.raw_heading is None or
                 not np.isfinite(result.raw_lateral) or
                 not np.isfinite(result.raw_heading)):
-            self.reset()
             return CvLaneControlCommand(
                 False, 0.0, 0.0, 0.0, 0.0, 0.0,
                 result.reason or "invalid OpenCV lane result")
 
         error_y = float(result.raw_lateral * self.config.lateral_scale)
-        error_angle = float(result.raw_heading * self.config.heading_scale)
+        raw_error_angle = float(result.raw_heading * self.config.heading_scale)
+        alpha = float(np.clip(self.config.heading_ema_alpha, 0.0, 1.0))
+        if self._filtered_heading_error is None:
+            self._filtered_heading_error = raw_error_angle
+        else:
+            self._filtered_heading_error = float(
+                alpha * raw_error_angle +
+                (1.0 - alpha) * self._filtered_heading_error)
+        error_angle = self._filtered_heading_error
+        deadband = max(float(self.config.heading_deadband), 0.0)
+        if abs(error_angle) < deadband:
+            error_angle = 0.0
 
         # Keep the same sign convention and control sequence as lane_base():
         # controller.get_out(-error_y, -error_angle).
