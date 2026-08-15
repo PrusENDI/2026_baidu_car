@@ -90,7 +90,9 @@ class CvLanePidControllerTests(unittest.TestCase):
             exit_command.forward_speed - bend.forward_speed, 0.005, places=6)
 
     def test_heading_scale_reverses_cv_sign(self):
-        controller = CvLanePidController()
+        controller = CvLanePidController(CvLanePidConfig(
+            startup_straight_distance_m=0.0,
+            heading_onset_delay_m=0.0))
         command = controller.compute(analysis(heading=1.0))
         self.assertTrue(command.valid)
         self.assertAlmostEqual(command.error_angle, -0.40, places=6)
@@ -119,22 +121,52 @@ class CvLanePidControllerTests(unittest.TestCase):
         self.assertEqual(before.angular_speed, 0.0)
         self.assertLess(released.angular_speed, 0.0)
 
+    def test_default_heading_waits_fifteen_centimeters(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            startup_straight_distance_m=0.0))
+        first = controller.compute(analysis(heading=1.0), distance_m=0.0)
+        before = controller.compute(analysis(heading=1.0), distance_m=0.149)
+        released = controller.compute(analysis(heading=1.0), distance_m=0.15)
+        self.assertEqual(first.angular_speed, 0.0)
+        self.assertEqual(before.angular_speed, 0.0)
+        self.assertLess(released.angular_speed, 0.0)
+        self.assertLess(first.forward_speed, 0.20)
+
+    def test_missing_odometry_uses_command_distance_fallback(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            startup_straight_distance_m=0.0,
+            heading_onset_delay_m=0.02,
+            min_forward_speed=0.20,
+            max_forward_speed=0.20))
+        commands = [controller.compute(analysis(heading=1.0))
+                    for _ in range(2)]
+        released = controller.compute(analysis(heading=1.0))
+        self.assertTrue(all(command.angular_speed == 0.0
+                            for command in commands))
+        self.assertLess(released.angular_speed, 0.0)
+
     def test_only_session_start_is_held_straight_for_ten_centimeters(self):
         controller = CvLanePidController()
         first = controller.compute(analysis(heading=1.0), distance_m=0.0)
         before = controller.compute(analysis(heading=1.0), distance_m=0.099)
-        released = controller.compute(analysis(heading=1.0), distance_m=0.10)
-        later = CvLanePidController().compute(
+        startup_released = controller.compute(
+            analysis(heading=1.0), distance_m=0.10)
+        released = controller.compute(analysis(heading=1.0), distance_m=0.25)
+        later = CvLanePidController(CvLanePidConfig(
+            heading_onset_delay_m=0.0)).compute(
             analysis(heading=-1.0), distance_m=0.50)
         self.assertEqual(first.angular_speed, 0.0)
         self.assertEqual(first.reason, "startup_straight")
         self.assertEqual(before.angular_speed, 0.0)
+        self.assertEqual(startup_released.angular_speed, 0.0)
         self.assertLess(released.angular_speed, 0.0)
         self.assertGreater(later.angular_speed, 0.0)
         self.assertNotEqual(later.reason, "startup_straight")
 
     def test_default_controller_uses_near_field_raw_heading(self):
-        command = CvLanePidController().compute(analysis(
+        command = CvLanePidController(CvLanePidConfig(
+            startup_straight_distance_m=0.0,
+            heading_onset_delay_m=0.0)).compute(analysis(
             heading=1.0,
             metrics={"perspective_k": -0.02, "perspective_b": -0.12},
         ))
@@ -144,6 +176,7 @@ class CvLanePidControllerTests(unittest.TestCase):
     def test_perspective_kb_drives_heading_without_lateral_speed(self):
         controller = CvLanePidController(CvLanePidConfig(
             startup_straight_distance_m=0.0,
+            heading_onset_delay_m=0.0,
             perspective_kb_enabled=True))
         command = controller.compute(analysis(
             heading=-1.0,

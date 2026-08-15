@@ -17,6 +17,7 @@ class CvLanePidConfig:
     speed_curve_exponent: float = 1.5
     max_deceleration_step: float = 0.03
     max_acceleration_step: float = 0.005
+    control_period_s: float = 0.05
     lateral_scale: float = 0.0
     heading_scale: float = -0.40
     lateral_kp: float = 0.0
@@ -27,7 +28,7 @@ class CvLanePidConfig:
     heading_ema_alpha: float = 0.35
     heading_deadband: float = 0.03
     startup_straight_distance_m: float = 0.10
-    heading_onset_delay_m: float = 0.0
+    heading_onset_delay_m: float = 0.15
     perspective_kb_enabled: bool = False
     perspective_k_gain: float = 35.0
     perspective_b_gain: float = 35.0 / 600.0
@@ -82,6 +83,7 @@ class CvLanePidController:
         self._pending_heading_sign = 0
         self._pending_heading_distance_m = None
         self._last_forward_speed = None
+        self._fallback_distance_m = 0.0
 
     def reset(self) -> None:
         self.pid_y.reset()
@@ -92,6 +94,7 @@ class CvLanePidController:
         self._pending_heading_sign = 0
         self._pending_heading_distance_m = None
         self._last_forward_speed = None
+        self._fallback_distance_m = 0.0
 
     def compute(self, result: LaneAnalysisResult,
                 distance_m=None) -> CvLaneControlCommand:
@@ -103,6 +106,7 @@ class CvLanePidController:
                 False, 0.0, 0.0, 0.0, 0.0, 0.0,
                 result.reason or "invalid OpenCV lane result")
 
+        effective_distance_m = self._effective_distance(distance_m)
         error_y = float(result.raw_lateral * self.config.lateral_scale)
         control_heading = float(result.raw_heading)
         control_reason = ""
@@ -131,10 +135,11 @@ class CvLanePidController:
         steering_demand, target_forward_speed = self._speed_target(error_angle)
         forward_speed = self._apply_speed_slew(target_forward_speed)
         error_angle, startup_held = self._apply_startup_straight(
-            error_angle, distance_m)
+            error_angle, effective_distance_m)
         if startup_held:
             control_reason = "startup_straight"
-        error_angle = self._apply_heading_onset_delay(error_angle, distance_m)
+        error_angle = self._apply_heading_onset_delay(
+            error_angle, effective_distance_m)
 
         # Keep the same sign convention and control sequence as lane_base():
         # controller.get_out(-error_y, -error_angle).
@@ -148,10 +153,23 @@ class CvLanePidController:
                 self._last_heading_output + step,
             ))
         self._last_heading_output = requested_heading
+        self._advance_fallback_distance(forward_speed, distance_m)
         return CvLaneControlCommand(
             True, forward_speed, lateral_speed,
             requested_heading, error_y, error_angle,
             control_reason, steering_demand, target_forward_speed)
+
+    def _effective_distance(self, distance_m):
+        if distance_m is not None and np.isfinite(distance_m):
+            return max(float(distance_m), 0.0)
+        return float(self._fallback_distance_m)
+
+    def _advance_fallback_distance(self, forward_speed, distance_m):
+        if distance_m is not None and np.isfinite(distance_m):
+            self._fallback_distance_m = max(float(distance_m), 0.0)
+            return
+        period = max(float(self.config.control_period_s), 0.0)
+        self._fallback_distance_m += max(float(forward_speed), 0.0) * period
 
     def _speed_target(self, error_angle):
         """Map current steering demand to a bounded forward-speed target."""
