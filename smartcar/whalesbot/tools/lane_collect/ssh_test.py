@@ -102,6 +102,11 @@ class CvTestSessionWriter:
                 "entry_behavior": "fast deceleration",
                 "exit_behavior": "slow acceleration",
             },
+            "launch_guard": {
+                "distance_m": float(self.controller_config.initial_straight_distance_m),
+                "source": "encoder_odometry",
+                "behavior": "forward-only before first bend",
+            },
         }
         (self.session_dir / "session.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -219,6 +224,18 @@ class OpenCVLaneSshTest:
             else:
                 self.invalid_hold_frames = 0
                 self.last_valid_command = command
+            # The first 0.10 m is a launch-only protection.  It is based on
+            # chassis odometry, never on image/frame number, and is not reused
+            # for subsequent bends.
+            launch_distance = max(
+                float(self.controller.config.initial_straight_distance_m), 0.0)
+            launch_guard = (distance_m is not None and
+                            distance_m < launch_distance)
+            if launch_guard:
+                command = replace(
+                    command, lateral_speed=0.0, angular_speed=0.0,
+                    reason="initial_straight_guard")
+                command_source = "initial_straight_guard"
             self.car.set_velocity(
                 command.forward_speed,
                 command.lateral_speed,

@@ -13,6 +13,10 @@ from .opencv_lane import LaneAnalysisResult
 class CvLanePidConfig:
     max_forward_speed: float = 0.20
     min_forward_speed: float = 0.08
+    # The launch segment is the only route-position exception: keep the
+    # chassis straight for a short odometry distance before the first bend.
+    # The generic lane logic must not reuse this as a per-turn delay.
+    initial_straight_distance_m: float = 0.10
     full_turn_reference: float = 0.40
     speed_curve_exponent: float = 1.5
     max_deceleration_step: float = 0.03
