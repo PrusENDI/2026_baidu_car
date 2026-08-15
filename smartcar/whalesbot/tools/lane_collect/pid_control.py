@@ -11,7 +11,12 @@ from .opencv_lane import LaneAnalysisResult
 
 @dataclass(frozen=True)
 class CvLanePidConfig:
-    forward_speed: float = 0.20
+    max_forward_speed: float = 0.20
+    min_forward_speed: float = 0.08
+    full_turn_reference: float = 0.40
+    speed_curve_exponent: float = 1.5
+    max_deceleration_step: float = 0.03
+    max_acceleration_step: float = 0.005
     lateral_scale: float = 0.0
     heading_scale: float = -0.40
     lateral_kp: float = 0.0
@@ -37,6 +42,8 @@ class CvLaneControlCommand:
     error_y: float
     error_angle: float
     reason: str = ""
+    steering_demand: float = 0.0
+    target_forward_speed: float = 0.0
 
     def to_record(self) -> Dict[str, float]:
         return {
@@ -47,6 +54,8 @@ class CvLaneControlCommand:
             "error_y": float(self.error_y),
             "error_angle": float(self.error_angle),
             "reason": self.reason,
+            "steering_demand": float(self.steering_demand),
+            "target_forward_speed": float(self.target_forward_speed),
         }
 
 
@@ -72,6 +81,7 @@ class CvLanePidController:
         self._heading_active_sign = 0
         self._pending_heading_sign = 0
         self._pending_heading_distance_m = None
+        self._last_forward_speed = None
 
     def reset(self) -> None:
         self.pid_y.reset()
@@ -81,6 +91,7 @@ class CvLanePidController:
         self._heading_active_sign = 0
         self._pending_heading_sign = 0
         self._pending_heading_distance_m = None
+        self._last_forward_speed = None
 
     def compute(self, result: LaneAnalysisResult,
                 distance_m=None) -> CvLaneControlCommand:
@@ -117,6 +128,8 @@ class CvLanePidController:
         deadband = max(float(self.config.heading_deadband), 0.0)
         if abs(error_angle) < deadband:
             error_angle = 0.0
+        steering_demand, target_forward_speed = self._speed_target(error_angle)
+        forward_speed = self._apply_speed_slew(target_forward_speed)
         error_angle, startup_held = self._apply_startup_straight(
             error_angle, distance_m)
         if startup_held:
@@ -136,9 +149,37 @@ class CvLanePidController:
             ))
         self._last_heading_output = requested_heading
         return CvLaneControlCommand(
-            True, float(self.config.forward_speed), lateral_speed,
+            True, forward_speed, lateral_speed,
             requested_heading, error_y, error_angle,
-            control_reason)
+            control_reason, steering_demand, target_forward_speed)
+
+    def _speed_target(self, error_angle):
+        """Map current steering demand to a bounded forward-speed target."""
+        minimum = max(float(self.config.min_forward_speed), 0.0)
+        maximum = max(float(self.config.max_forward_speed), minimum)
+        reference = max(float(self.config.full_turn_reference), 1e-6)
+        proportional_request = abs(
+            float(error_angle) * float(self.config.heading_kp))
+        demand = float(np.clip(proportional_request / reference, 0.0, 1.0))
+        exponent = max(float(self.config.speed_curve_exponent), 1e-6)
+        target = minimum + (maximum - minimum) * ((1.0 - demand) ** exponent)
+        return demand, float(np.clip(target, minimum, maximum))
+
+    def _apply_speed_slew(self, target):
+        """Reduce bend-entry speed faster than speed is restored after a bend."""
+        target = float(target)
+        if self._last_forward_speed is None:
+            self._last_forward_speed = target
+            return target
+        current = float(self._last_forward_speed)
+        if target < current:
+            step = max(float(self.config.max_deceleration_step), 0.0)
+        else:
+            step = max(float(self.config.max_acceleration_step), 0.0)
+        if step > 0.0:
+            target = float(np.clip(target, current - step, current + step))
+        self._last_forward_speed = target
+        return target
 
     def _apply_startup_straight(self, error_angle, distance_m):
         """Hold only the beginning of a collection session straight."""

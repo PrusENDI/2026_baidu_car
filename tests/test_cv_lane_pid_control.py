@@ -59,6 +59,36 @@ class FakeCar:
 
 
 class CvLanePidControllerTests(unittest.TestCase):
+    def test_straight_uses_maximum_forward_speed(self):
+        command = CvLanePidController().compute(analysis(heading=0.0))
+        self.assertAlmostEqual(command.forward_speed, 0.20, places=6)
+        self.assertAlmostEqual(command.target_forward_speed, 0.20, places=6)
+        self.assertEqual(command.steering_demand, 0.0)
+
+    def test_forward_speed_decreases_with_steering_demand(self):
+        speeds = []
+        demands = []
+        for heading in (0.0, 0.25, 0.5, 1.0):
+            command = CvLanePidController(CvLanePidConfig(
+                heading_ema_alpha=1.0)).compute(analysis(heading=heading))
+            speeds.append(command.target_forward_speed)
+            demands.append(command.steering_demand)
+        self.assertEqual(speeds, sorted(speeds, reverse=True))
+        self.assertEqual(demands, sorted(demands))
+        self.assertGreaterEqual(min(speeds), 0.08)
+        self.assertLessEqual(max(speeds), 0.20)
+
+    def test_bend_deceleration_is_faster_than_exit_acceleration(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            heading_ema_alpha=1.0))
+        straight = controller.compute(analysis(heading=0.0))
+        bend = controller.compute(analysis(heading=1.0))
+        exit_command = controller.compute(analysis(heading=0.0))
+        self.assertAlmostEqual(
+            straight.forward_speed - bend.forward_speed, 0.03, places=6)
+        self.assertAlmostEqual(
+            exit_command.forward_speed - bend.forward_speed, 0.005, places=6)
+
     def test_heading_scale_reverses_cv_sign(self):
         controller = CvLanePidController()
         command = controller.compute(analysis(heading=1.0))
@@ -176,12 +206,19 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
             self.assertFalse(records[0]["held"])
             self.assertEqual(records[0]["command_source"], "standard")
             self.assertIn("control_reason", records[0])
+            self.assertIn("steering_demand", records[0])
+            self.assertIn("target_forward_speed", records[0])
             self.assertEqual(records[0]["state"], records[0]["control"])
             self.assertEqual(
                 metadata["state_fields"],
                 ["forward_speed", "lateral_speed", "angular_speed"],
             )
             self.assertTrue(metadata["usable_for_training"])
+            self.assertEqual(
+                metadata["controller"]["max_forward_speed"], 0.20)
+            self.assertEqual(
+                metadata["controller"]["min_forward_speed"], 0.08)
+            self.assertIn("speed_control", metadata)
             self.assertEqual(car.commands[-1], (0.0, 0.0, 0.0))
 
     def test_invalid_frame_disarms_and_stops(self):
@@ -212,6 +249,11 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
                 runner._control_once()
                 self.assertTrue(runner.running)
                 self.assertEqual(car.commands[-1], last_valid)
+
+            held_records = runner.writer.records[-10:]
+            self.assertTrue(all(row["held"] for row in held_records))
+            self.assertTrue(all(row["state"] == list(last_valid)
+                                for row in held_records))
 
             runner._control_once()
             self.assertFalse(runner.running)

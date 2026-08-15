@@ -55,6 +55,8 @@ class CvTestSessionWriter:
             "held": bool(held),
             "command_source": str(command_source),
             "control_reason": str(command.reason),
+            "steering_demand": float(command.steering_demand),
+            "target_forward_speed": float(command.target_forward_speed),
             # Encoder-based distance measured by the chassis odometry.  The
             # per-frame delta is relative to the previous saved frame, while
             # odometry_distance_m is relative to the beginning of this
@@ -97,6 +99,11 @@ class CvTestSessionWriter:
                 "distance_source": "encoder_odometry when available",
             },
             "controller": vars(self.controller_config),
+            "speed_control": {
+                "source": "absolute pre-slew proportional heading request",
+                "entry_behavior": "fast deceleration",
+                "exit_behavior": "slow acceleration",
+            },
         }
         (self.session_dir / "session.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -91,8 +91,8 @@ class LaneAnalyzerConfig:
     reference_y_ratio: float = 0.78
     # Fit only this interval of the active ROI.  Moving the far bound down
     # reduces anticipatory steering from a bend visible at the top of frame.
-    fit_far_y_ratio: float = 0.65
-    fit_near_y_ratio: float = 0.92
+    fit_far_y_ratio: float = 0.75
+    fit_near_y_ratio: float = 0.96
     morphology_kernel: int = 3
     error_mapping: ErrorMapping = field(default_factory=ErrorMapping)
     boundary_max_step: float = 10.0
