@@ -98,6 +98,7 @@ class SharpTurnStateMachine:
 
         if self.state in (TurnState.TURNING_LEFT, TurnState.TURNING_RIGHT):
             mode = result.metrics.get("tracking_mode", "none")
+            two_sided = mode in ("both", "mixed")
             recovered = (result.valid and mode in ("both", "mixed") and
                          abs(float(result.raw_heading)) <= self.config.exit_heading)
             self._exit_frames = self._exit_frames + 1 if recovered else 0
@@ -113,7 +114,9 @@ class SharpTurnStateMachine:
                     return self._from_result(result, "turn_opencv")
                 return self._held_turn("corner observation sustains confirmed turn")
 
-            if direction == -self._turn_direction:
+            # A single visible boundary cannot disprove the locked direction.
+            # Only a two-sided observation may confirm an opposite direction.
+            if direction == -self._turn_direction and two_sided:
                 self._opposite_frames += 1
                 if self._opposite_frames >= max(1, self.config.confirm_frames):
                     self._enter_turn(direction)
@@ -127,9 +130,11 @@ class SharpTurnStateMachine:
 
             heading_agrees = (result.valid and result.raw_heading is not None and
                               float(result.raw_heading) * self._turn_direction >= 0)
-            if heading_agrees:
+            if heading_agrees or not two_sided:
                 self._missing_frames = 0
-                return self._from_result(result, "turn_opencv")
+                if heading_agrees:
+                    return self._from_result(result, "turn_opencv")
+                return self._held_turn("single boundary holds locked turn direction")
 
             self._missing_frames += 1
             if self._missing_frames <= max(0, self.config.max_missing_frames):
