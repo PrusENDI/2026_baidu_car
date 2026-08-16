@@ -1638,6 +1638,10 @@ tests/test_opencv_lane_analyzer.py
 Windows 本地无 Python/OpenCV，单元测试未运行；实图等效回放结果记录在 18.19 和 18.20，
 聚焦文件的 `git diff --check` 通过。
 
+GitHub 同步已完成：CV 源码、测试和当时的文档提交为
+`4ccb632 feat(cv): stabilize pure pursuit lane collection`，并已成功推送到
+`origin/orin-main-20260814`。本段同步结果记录随后以仅包含本文档的补充提交推送。
+
 ### 18.17 仅取消右锐角后半段的通用 2 倍增强（2026-08-16）
 
 `right_turn_curvature_gain=0.65` 已在最新 session
