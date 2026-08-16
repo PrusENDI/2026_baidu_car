@@ -58,10 +58,12 @@ class StandardLaneReference:
 class LaneAnalyzerConfig:
     cnn_size: Size = (128, 128)
     work_size: Optional[Size] = (320, 240)
-    # The old implementation used 190, but the new camera/lighting makes
-    # that too permissive on the supplied photos.  175 is provisional and
-    # must be rechecked against the complete course before closed-loop use.
-    threshold: Optional[int] = 175
+    # None enables per-frame global Otsu segmentation.  Clamp the result so
+    # course geometry cannot drive the histogram threshold to an unsafe
+    # extreme when an intersection or a sharp corner fills most of the ROI.
+    threshold: Optional[int] = None
+    adaptive_threshold_min: int = 150
+    adaptive_threshold_max: int = 165
     segmentation: str = "dark"
     orange_hue_low: int = 5
     orange_hue_high: int = 35
@@ -93,6 +95,40 @@ class LaneAnalyzerConfig:
     # fit cannot distinguish lateral displacement from vehicle heading.
     fit_far_y_ratio: float = 0.0
     fit_near_y_ratio: float = 1.0
+    # perspective.json stores centimetres (wid=track width, arr=forward
+    # distance).  Pure pursuit deliberately samples one mid/near-field point
+    # instead of steering from the far-field tangent of the complete fit.
+    pure_pursuit_lookahead_m: float = 0.30
+    ipm_units_per_meter: float = 100.0
+    pure_pursuit_sharp_ratio_threshold: float = 0.80
+    pure_pursuit_sharp_gain: float = 1.8
+    # The final right acute turn is already tighter in raw pure-pursuit
+    # geometry than the three left corners.  Its left-only negative-curvature
+    # phase must not receive the generic sharp-corner boost.
+    pure_pursuit_right_turn_sharp_gain: float = 1.20
+    # A confirmed entering corner can expose a stable contour tangent before
+    # the fixed lookahead point moves laterally.  Use that tangent only for
+    # this narrow failure mode; ordinary bends remain pure-pursuit driven.
+    corner_pursuit_min_score: float = 0.70
+    corner_pursuit_max_lateral_ratio: float = 0.15
+    corner_pursuit_max_near_progress: float = 0.50
+    # A weaker early gate is allowed only when both reference types are
+    # present and the fitted path still looks straight.  This targets the
+    # wide acute-corner entrance where the contour tangent leads the IPM fit.
+    corner_pursuit_early_min_score: float = 0.58
+    corner_pursuit_early_max_abs_heading: float = 0.15
+    corner_pursuit_early_min_near_progress: float = 0.15
+    # The right acute-turn gate is stateless.  Its command comes from the
+    # current contour heading and the calibrated forward distance of the
+    # contour's near endpoint, rather than a fixed curvature or frame count.
+    right_turn_candidate_min_score: float = 0.70
+    right_turn_candidate_max_heading: float = -1.35
+    right_turn_candidate_max_lateral_ratio: float = 0.20
+    right_turn_candidate_min_near_progress: float = 0.20
+    right_turn_candidate_max_near_progress: float = 0.45
+    right_turn_curvature_gain: float = 0.65
+    right_turn_min_distance_m: float = 0.20
+    right_turn_max_curvature_m_inv: float = 10.0
     morphology_kernel: int = 3
     error_mapping: ErrorMapping = field(default_factory=ErrorMapping)
     boundary_max_step: float = 10.0
@@ -164,13 +200,17 @@ class OpenCVLaneAnalyzer:
         except (TypeError, ValueError) as exc:
             return self._invalid((0, 0), str(exc))
         height, width = work.shape[:2]
-        binary = self._segment_track(work)
+        binary, segmentation_metrics = self._segment_track(work)
         seed = self._find_seed(binary)
         if seed is None:
-            return self._invalid((width, height), "no dark seed connected to near field", binary)
+            return self._invalid(
+                (width, height), "no dark seed connected to near field",
+                binary, metrics=segmentation_metrics)
         lane_mask = self._connected_seed_component(binary, seed)
         if lane_mask is None:
-            return self._invalid((width, height), "seed component is empty", binary)
+            return self._invalid(
+                (width, height), "seed component is empty", binary,
+                metrics=segmentation_metrics)
         roi_top, roi_bottom = self._roi_bounds(height)
         roi_height = max(roi_bottom - roi_top, 1)
         left, right, center, widths, modes = self._extract_boundaries(lane_mask)
@@ -183,11 +223,12 @@ class OpenCVLaneAnalyzer:
         corner = self._detect_steep_corner(lane_mask)
         return self._standard_relative_result(
             width, height, left, right, center, widths, modes, lane_mask,
-            binary, seed, corner, boundary_filter)
+            binary, seed, corner, boundary_filter, segmentation_metrics)
 
     def _standard_relative_result(self, width, height, left, right, center,
                                   widths, modes, lane_mask, binary, seed,
-                                  corner, boundary_filter):
+                                  corner, boundary_filter,
+                                  segmentation_metrics):
         ref = self.reference
         roi_top, roi_bottom = self._roi_bounds(height)
         rows = np.arange(roi_top, roi_bottom, dtype=np.int32)
@@ -224,10 +265,11 @@ class OpenCVLaneAnalyzer:
                 (width, height),
                 "standard reference has too few valid boundary rows", binary,
                 lane_mask, seed, left, right, center,
-                {"reference_rows": reference_rows,
-                 "reference_tracking_mode": self._reference_mode(side_counts),
-                 **boundary_filter,
-                 **self._corner_metrics(corner)})
+                 {"reference_rows": reference_rows,
+                  "reference_tracking_mode": self._reference_mode(side_counts),
+                  **segmentation_metrics,
+                  **boundary_filter,
+                  **self._corner_metrics(corner)})
         # This is the same row-wise perspective normalization used by the
         # open-source implementation, expressed as an equivalent bird's-eye
         # center trace instead of independent left/right residual lines.
@@ -274,6 +316,59 @@ class OpenCVLaneAnalyzer:
         curvature = float(
             (2.0 * quadratic) /
             max((1.0 + local_slope * local_slope) ** 1.5, 1e-9))
+        lookahead_units = (
+            max(float(self.config.pure_pursuit_lookahead_m), 1e-3) *
+            max(float(self.config.ipm_units_per_meter), 1e-6))
+        pursuit = self._pure_pursuit_target(
+            fit_s, fit_x, lookahead_units,
+            self.config.ipm_units_per_meter)
+        sharp_pursuit_control = self._apply_sharp_curvature_gain(
+            pursuit, self.config.pure_pursuit_sharp_ratio_threshold,
+            self.config.pure_pursuit_sharp_gain,
+            self._reference_mode(side_counts),
+            self.config.pure_pursuit_right_turn_sharp_gain)
+        pursuit_control = self._apply_corner_curvature_fallback(
+            sharp_pursuit_control, corner,
+            self._reference_mode(side_counts),
+            raw_heading, self.config.pure_pursuit_lookahead_m,
+            self.config.corner_pursuit_min_score,
+            self.config.corner_pursuit_max_lateral_ratio,
+            self.config.corner_pursuit_max_near_progress,
+            self.config.corner_pursuit_early_min_score,
+            self.config.corner_pursuit_early_max_abs_heading,
+            self.config.corner_pursuit_early_min_near_progress)
+        right_turn_reason = self._right_turn_reason(
+            corner, self._reference_mode(side_counts),
+            pursuit_control["target_lateral_ratio"],
+            self.config.right_turn_candidate_min_score,
+            self.config.right_turn_candidate_max_heading,
+            self.config.right_turn_candidate_max_lateral_ratio,
+            self.config.right_turn_candidate_min_near_progress,
+            self.config.right_turn_candidate_max_near_progress)
+        right_turn_candidate = right_turn_reason is not None
+        right_turn_waiting = (
+            right_turn_reason is None and
+            self._right_turn_geometry(
+                corner, self._reference_mode(side_counts),
+                self.config.right_turn_candidate_max_heading))
+        if right_turn_waiting:
+            # A right-acute contour tangent has the opposite sign from the
+            # generic corner fallback.  Before the near-field gate is ready,
+            # retain ordinary pure pursuit instead of steering left.
+            pursuit_control = dict(sharp_pursuit_control)
+            pursuit_control.update({
+                "corner_fallback": False,
+                "corner_fallback_reason": "right_turn_wait",
+                "corner_curvature_m_inv": None,
+            })
+        right_turn_geometry = self._right_turn_curvature(
+            corner, ref.perspective, ref.roi_top,
+            self.config.ipm_units_per_meter,
+            self.config.right_turn_curvature_gain,
+            self.config.right_turn_min_distance_m,
+            self.config.right_turn_max_curvature_m_inv)
+        pursuit_control = self._apply_right_turn_override(
+            pursuit_control, right_turn_candidate, right_turn_geometry)
         mapped = self.config.error_mapping.map(raw_lateral, raw_heading)
         cross = detect_cross_candidate(widths[np.isfinite(widths)])
         center = np.asarray(center, dtype=np.float64).copy()
@@ -281,6 +376,7 @@ class OpenCVLaneAnalyzer:
         perspective_fit_sides = int(bool(np.any(left_ok))) + int(
             bool(np.any(right_ok)))
         metrics = {
+            **segmentation_metrics,
             "valid_rows": int(np.count_nonzero(fit_mask)),
             "reference_rows": reference_rows,
             "reference_tracking_mode": self._reference_mode(side_counts),
@@ -303,6 +399,36 @@ class OpenCVLaneAnalyzer:
             "preview_offset": preview_offset,
             "preview_offset_normalized": preview_offset_normalized,
             "curvature": curvature,
+            "pure_pursuit_lookahead_m": float(
+                self.config.pure_pursuit_lookahead_m),
+            "pure_pursuit_target_s_m": pursuit["target_s_m"],
+            "pure_pursuit_target_x_m": pursuit["target_x_m"],
+            "pure_pursuit_raw_curvature_m_inv": pursuit["curvature_m_inv"],
+            "pure_pursuit_target_lateral_ratio": pursuit_control[
+                "target_lateral_ratio"],
+            "pure_pursuit_sharp_boosted": pursuit_control["sharp_boosted"],
+            "pure_pursuit_sharp_gain_applied": pursuit_control[
+                "sharp_gain_applied"],
+            "pure_pursuit_corner_fallback": pursuit_control[
+                "corner_fallback"],
+            "pure_pursuit_corner_fallback_reason": pursuit_control[
+                "corner_fallback_reason"],
+            "pure_pursuit_corner_curvature_m_inv": pursuit_control[
+                "corner_curvature_m_inv"],
+            "route_right_turn_candidate": right_turn_candidate,
+            "route_right_turn_reason": right_turn_reason,
+            "route_right_turn_waiting": right_turn_waiting,
+            "route_right_turn_override": pursuit_control[
+                "right_turn_override"],
+            "route_right_turn_distance_m": (
+                right_turn_geometry["distance_m"]
+                if right_turn_candidate else None),
+            "route_right_turn_curvature_m_inv": (
+                right_turn_geometry["curvature_m_inv"]
+                if right_turn_candidate else None),
+            "pure_pursuit_curvature_m_inv": pursuit_control[
+                "curvature_m_inv"],
+            "pure_pursuit_lookahead_clipped": pursuit["lookahead_clipped"],
             "perspective_median": float(np.median(fit_s)),
             "roi_top_y": roi_top,
             "roi_bottom_y": roi_bottom,
@@ -317,6 +443,187 @@ class OpenCVLaneAnalyzer:
                 reference_rows / max(roi_bottom - roi_top, 1), 0.0, 1.0)),
             cross.status, cross.score, None, (width, height), seed, left,
             right, center, lane_mask, binary, metrics)
+
+    @staticmethod
+    def _pure_pursuit_target(fit_s, fit_x, lookahead_units,
+                             units_per_meter):
+        """Interpolate one path point and return geometric curvature.
+
+        Selecting the point directly from the IPM trace prevents far rows
+        from changing the steering command before the bend reaches the
+        configured lookahead distance.  The quadratic fit remains available
+        for heading/curvature diagnostics only.
+        """
+        fit_s = np.asarray(fit_s, dtype=np.float64)
+        fit_x = np.asarray(fit_x, dtype=np.float64)
+        valid = np.isfinite(fit_s) & np.isfinite(fit_x)
+        if not np.any(valid):
+            raise ValueError("pure pursuit requires a valid IPM trace")
+        fit_s, fit_x = fit_s[valid], fit_x[valid]
+        order = np.argsort(fit_s)
+        fit_s, fit_x = fit_s[order], fit_x[order]
+        unique_s, inverse = np.unique(fit_s, return_inverse=True)
+        if unique_s.size != fit_s.size:
+            sums = np.bincount(inverse, weights=fit_x)
+            counts = np.bincount(inverse)
+            fit_s, fit_x = unique_s, sums / np.maximum(counts, 1)
+        requested_s = float(lookahead_units)
+        target_s = float(np.clip(requested_s, fit_s[0], fit_s[-1]))
+        target_x = float(np.interp(target_s, fit_s, fit_x))
+        scale = max(float(units_per_meter), 1e-6)
+        target_s_m = target_s / scale
+        target_x_m = target_x / scale
+        distance_sq = target_s_m * target_s_m + target_x_m * target_x_m
+        # Image/IPM x grows to the right, while chassis-positive yaw turns
+        # left.  Negate the geometric image curvature at this boundary.
+        curvature = -2.0 * target_x_m / max(distance_sq, 1e-9)
+        return {
+            "target_s_m": float(target_s_m),
+            "target_x_m": float(target_x_m),
+            "curvature_m_inv": float(curvature),
+            "lookahead_clipped": bool(abs(target_s - requested_s) > 1e-6),
+        }
+
+    @staticmethod
+    def _apply_sharp_curvature_gain(pursuit, ratio_threshold, sharp_gain,
+                                    reference_mode="none",
+                                    right_turn_sharp_gain=1.0):
+        target_s = abs(float(pursuit["target_s_m"]))
+        target_x = abs(float(pursuit["target_x_m"]))
+        ratio = target_x / max(target_s, 1e-6)
+        threshold = max(float(ratio_threshold), 0.0)
+        boosted = bool(ratio >= threshold)
+        gain = 1.0
+        if boosted:
+            gain = max(float(sharp_gain), 0.0)
+            if (reference_mode == "left_only" and
+                    float(pursuit["curvature_m_inv"]) < 0.0):
+                gain = max(float(right_turn_sharp_gain), 0.0)
+        return {
+            "curvature_m_inv": float(pursuit["curvature_m_inv"]) * gain,
+            "target_lateral_ratio": float(ratio),
+            "sharp_boosted": boosted,
+            "sharp_gain_applied": float(gain),
+        }
+
+    @staticmethod
+    def _apply_corner_curvature_fallback(pursuit_control, corner,
+                                         reference_mode, raw_heading,
+                                         lookahead_m,
+                                         min_score, max_lateral_ratio,
+                                         max_near_progress,
+                                         early_min_score,
+                                         early_max_abs_heading,
+                                         early_min_near_progress):
+        """Use a confirmed entering-corner tangent when lookahead stays flat."""
+        result = dict(pursuit_control)
+        result.update({
+            "corner_fallback": False,
+            "corner_fallback_reason": None,
+            "corner_curvature_m_inv": None,
+        })
+        if corner is None or reference_mode == "none":
+            return result
+        if (not corner.get("direction_known", False) or
+                float(result["target_lateral_ratio"]) >=
+                float(max_lateral_ratio) or
+                float(corner.get("near_progress", 1.0)) >
+                float(max_near_progress)):
+            return result
+        score = float(corner.get("score", 0.0))
+        near_progress = float(corner.get("near_progress", 1.0))
+        strong_gate = score >= float(min_score)
+        early_gate = (
+            score >= float(early_min_score) and
+            reference_mode == "mixed" and
+            abs(float(raw_heading)) <= float(early_max_abs_heading) and
+            near_progress >= float(early_min_near_progress))
+        if not strong_gate and not early_gate:
+            return result
+        lookahead = max(float(lookahead_m), 1e-3)
+        # Image-positive heading points right, while chassis-positive yaw is
+        # left, matching the sign conversion in _pure_pursuit_target().
+        curvature = float(
+            -2.0 * np.sin(float(corner["heading"])) / lookahead)
+        if abs(curvature) <= abs(float(result["curvature_m_inv"])):
+            return result
+        result["curvature_m_inv"] = curvature
+        result["corner_fallback"] = True
+        result["corner_fallback_reason"] = (
+            "strong_score" if strong_gate else "early_mixed_flat")
+        result["corner_curvature_m_inv"] = curvature
+        return result
+
+    @staticmethod
+    def _right_turn_reason(corner, reference_mode, lateral_ratio,
+                           min_score, max_heading,
+                           max_lateral_ratio, min_near_progress,
+                           max_near_progress):
+        if corner is None:
+            return None
+        score = float(corner.get("score", 0.0))
+        near_progress = float(corner.get("near_progress", 1.0))
+        entry = (
+            reference_mode == "mixed" and
+            corner.get("direction_known", False) and
+            score >= float(min_score) and
+            float(corner.get("heading", 0.0)) <= float(max_heading) and
+            float(lateral_ratio) < float(max_lateral_ratio) and
+            near_progress >= float(min_near_progress) and
+            near_progress <= float(max_near_progress))
+        if entry:
+            return "near_entry"
+        return None
+
+    @staticmethod
+    def _right_turn_geometry(corner, reference_mode, max_heading):
+        return bool(
+            corner is not None and reference_mode == "mixed" and
+            corner.get("direction_known", False) and
+            float(corner.get("heading", 0.0)) <= float(max_heading))
+
+    @staticmethod
+    def _right_turn_curvature(corner, perspective, roi_top,
+                              units_per_meter, curvature_gain, min_distance_m,
+                              max_curvature_m_inv):
+        """Convert the current corner tangent and endpoint to curvature."""
+        if corner is None or not corner.get("direction_known", False):
+            return None
+        segment = corner.get("segment")
+        if not segment or len(segment) < 2:
+            return None
+        perspective = np.asarray(perspective, dtype=np.float64)
+        if perspective.size == 0:
+            return None
+        near_y = int(round(float(segment[1])))
+        index = int(np.clip(near_y - int(roi_top), 0,
+                            perspective.size - 1))
+        scale = max(float(units_per_meter), 1e-6)
+        measured_distance_m = float(perspective[index]) / scale
+        distance_m = max(measured_distance_m, float(min_distance_m), 1e-3)
+        heading = abs(float(corner.get("heading", 0.0)))
+        gain = max(float(curvature_gain), 0.0)
+        curvature = -2.0 * np.sin(heading) / distance_m * gain
+        limit = max(float(max_curvature_m_inv), 0.0)
+        curvature = float(np.clip(curvature, -limit, 0.0))
+        return {
+            "distance_m": measured_distance_m,
+            "curvature_m_inv": curvature,
+        }
+
+    @staticmethod
+    def _apply_right_turn_override(pursuit_control, candidate, geometry):
+        result = dict(pursuit_control)
+        enabled = bool(candidate and geometry is not None)
+        result["right_turn_override"] = enabled
+        if not enabled:
+            return result
+        curvature = float(geometry["curvature_m_inv"])
+        result["curvature_m_inv"] = float(curvature)
+        result["corner_fallback"] = True
+        result["corner_fallback_reason"] = "right_turn_direct"
+        result["corner_curvature_m_inv"] = float(curvature)
+        return result
 
     @staticmethod
     def _reference_mode(counts):
@@ -503,7 +810,7 @@ class OpenCVLaneAnalyzer:
                     0.42, color, 1, cv2.LINE_AA)
         return debug
 
-    def _segment_track(self, image: np.ndarray) -> np.ndarray:
+    def _segment_track(self, image: np.ndarray):
         if self.config.segmentation == "orange_boundary":
             hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
             orange = cv2.inRange(
@@ -520,15 +827,39 @@ class OpenCVLaneAnalyzer:
                 orange = cv2.dilate(orange, kernel, iterations=1)
             # White means traversable candidate. Orange boundary pixels are
             # barriers for the seed-connected-component search.
-            return cv2.bitwise_not(orange)
+            return cv2.bitwise_not(orange), {
+                "segmentation_threshold_mode": "orange_boundary",
+                "segmentation_threshold_otsu": None,
+                "segmentation_threshold_used": None,
+            }
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         if self.config.threshold is None:
-            _, binary = cv2.threshold(gray, 0, 255,
-                                      cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+            otsu_threshold, _ = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+            lower = int(np.clip(self.config.adaptive_threshold_min, 0, 255))
+            upper = int(np.clip(self.config.adaptive_threshold_max, 0, 255))
+            if upper < lower:
+                lower, upper = upper, lower
+            threshold_used = float(np.clip(otsu_threshold, lower, upper))
+            _, binary = cv2.threshold(
+                gray, threshold_used, 255, cv2.THRESH_BINARY_INV)
+            threshold_metrics = {
+                "segmentation_threshold_mode": "otsu_clamped",
+                "segmentation_threshold_otsu": float(otsu_threshold),
+                "segmentation_threshold_used": threshold_used,
+                "segmentation_threshold_min": lower,
+                "segmentation_threshold_max": upper,
+            }
         else:
-            _, binary = cv2.threshold(gray, self.config.threshold, 255,
+            threshold_used = int(np.clip(self.config.threshold, 0, 255))
+            _, binary = cv2.threshold(gray, threshold_used, 255,
                                       cv2.THRESH_BINARY_INV)
+            threshold_metrics = {
+                "segmentation_threshold_mode": "fixed",
+                "segmentation_threshold_otsu": None,
+                "segmentation_threshold_used": threshold_used,
+            }
         roi_top, roi_bottom = self._roi_bounds(binary.shape[0])
         binary[:roi_top, :] = 0
         binary[roi_bottom:, :] = 0
@@ -537,7 +868,7 @@ class OpenCVLaneAnalyzer:
             kernel = np.ones((size, size), dtype=np.uint8)
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
             binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        return binary
+        return binary, threshold_metrics
 
     def _find_seed(self, binary: np.ndarray) -> Optional[Tuple[int, int]]:
         height, width = binary.shape

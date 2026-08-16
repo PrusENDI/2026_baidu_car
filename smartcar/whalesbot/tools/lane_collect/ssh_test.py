@@ -27,6 +27,9 @@ class CvTestSessionWriter:
         self.session_dir = Path(output_root) / f"cv_low_speed_{stamp}"
         self.session_dir.mkdir(parents=True, exist_ok=False)
         self.controller_config = controller_config
+        self.teacher = ("opencv_ipm_pure_pursuit"
+                        if controller_config.steering_mode == "pure_pursuit"
+                        else "opencv_ipm_error")
         self.records = []
         self.closed = False
         self._write_metadata()
@@ -50,7 +53,7 @@ class CvTestSessionWriter:
             # closed-loop diagnostics.
             "control": [command.forward_speed, command.lateral_speed,
                         command.angular_speed],
-            "teacher": "opencv_ipm_error",
+            "teacher": self.teacher,
             "label_semantics": "cnn_pid_input_error",
             "held": bool(held),
             "command_source": str(command_source),
@@ -91,7 +94,7 @@ class CvTestSessionWriter:
             "control_fields": ["forward_speed", "lateral_speed",
                                "angular_speed"],
             "label_semantics": "cnn_pid_input_error",
-            "teacher": "opencv_ipm_error",
+            "teacher": self.teacher,
             "distance_fields": {
                 "odometry_distance_m": "session-relative chassis odometry",
                 "frame_distance_m": "delta since previous saved frame",
@@ -99,7 +102,10 @@ class CvTestSessionWriter:
             },
             "controller": vars(self.controller_config),
             "speed_control": {
-                "source": "absolute PID-before heading error",
+                "source": ("absolute pure-pursuit curvature"
+                           if self.controller_config.steering_mode ==
+                           "pure_pursuit" else
+                           "absolute PID-before heading error"),
                 "entry_behavior": "fast deceleration",
                 "exit_behavior": "slow acceleration",
             },
@@ -138,7 +144,9 @@ class OpenCVLaneSshTest:
             standard_root / "perspective.json",
         )
         self.analyzer = OpenCVLaneAnalyzer(LaneAnalyzerConfig(
-            threshold=175,
+            threshold=None,
+            adaptive_threshold_min=150,
+            adaptive_threshold_max=165,
             segmentation="dark",
             work_size=(320, 240),
             cnn_size=(128, 128),
@@ -149,7 +157,8 @@ class OpenCVLaneSshTest:
                 heading_scale=-0.40,
             ),
         ), reference=reference)
-        self.controller = CvLanePidController(CvLanePidConfig())
+        self.controller = CvLanePidController(CvLanePidConfig(
+            steering_mode="pure_pursuit"))
         self.temporal_filter = PreviewTimingFilter(
             error_mapping=self.analyzer.config.error_mapping)
         self.cross_state = CrossStraightStateMachine()
@@ -232,7 +241,7 @@ class OpenCVLaneSshTest:
             else:
                 self.invalid_hold_frames = 0
                 self.last_valid_command = command
-            # The first 0.10 m is a launch-only protection.  It is based on
+            # The first 0.15 m is a launch-only protection.  It is based on
             # chassis odometry, never on image/frame number, and is not reused
             # for subsequent bends.
             launch_distance = max(

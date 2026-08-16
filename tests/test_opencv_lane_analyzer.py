@@ -80,6 +80,184 @@ class OpenCVLaneAnalyzerTests(unittest.TestCase):
         self.assertGreater(shifted.raw_lateral, centered.raw_lateral + 0.10)
         self.assertAlmostEqual(shifted.raw_heading, 0.0, delta=0.13)
         self.assertIn("curvature", shifted.metrics)
+        self.assertLess(
+            shifted.metrics["pure_pursuit_curvature_m_inv"], 0.0)
+
+    def test_pure_pursuit_uses_only_the_configured_target_point(self):
+        result = self.analyzer._pure_pursuit_target(
+            fit_s=np.array([10.0, 20.0, 40.0, 80.0]),
+            fit_x=np.array([0.0, 2.0, 30.0, 60.0]),
+            lookahead_units=20.0,
+            units_per_meter=100.0,
+        )
+        self.assertAlmostEqual(result["target_s_m"], 0.20)
+        self.assertAlmostEqual(result["target_x_m"], 0.02)
+        self.assertAlmostEqual(
+            result["curvature_m_inv"], -2.0 * 0.02 / (0.20 ** 2 + 0.02 ** 2))
+        self.assertFalse(result["lookahead_clipped"])
+
+    def test_sharp_gain_only_applies_to_large_lateral_ratio(self):
+        ordinary = self.analyzer._apply_sharp_curvature_gain({
+            "target_s_m": 0.30,
+            "target_x_m": 0.12,
+            "curvature_m_inv": -2.3,
+        }, ratio_threshold=0.80, sharp_gain=1.8)
+        sharp = self.analyzer._apply_sharp_curvature_gain({
+            "target_s_m": 0.30,
+            "target_x_m": 0.27,
+            "curvature_m_inv": -3.3,
+        }, ratio_threshold=0.80, sharp_gain=1.8)
+        self.assertFalse(ordinary["sharp_boosted"])
+        self.assertAlmostEqual(ordinary["curvature_m_inv"], -2.3)
+        self.assertTrue(sharp["sharp_boosted"])
+        self.assertAlmostEqual(sharp["curvature_m_inv"], -5.94)
+        right_sharp = self.analyzer._apply_sharp_curvature_gain({
+            "target_s_m": 0.30,
+            "target_x_m": 0.27,
+            "curvature_m_inv": -3.3,
+        }, ratio_threshold=0.80, sharp_gain=1.8,
+            reference_mode="left_only", right_turn_sharp_gain=1.20)
+        self.assertTrue(right_sharp["sharp_boosted"])
+        self.assertAlmostEqual(right_sharp["sharp_gain_applied"], 1.20)
+        self.assertAlmostEqual(right_sharp["curvature_m_inv"], -3.96)
+        left_sharp = self.analyzer._apply_sharp_curvature_gain({
+            "target_s_m": 0.30,
+            "target_x_m": -0.27,
+            "curvature_m_inv": 3.3,
+        }, ratio_threshold=0.80, sharp_gain=1.8,
+            reference_mode="right_only", right_turn_sharp_gain=1.0)
+        self.assertAlmostEqual(left_sharp["sharp_gain_applied"], 1.8)
+        self.assertAlmostEqual(left_sharp["curvature_m_inv"], 5.94)
+
+    def test_global_otsu_threshold_is_clamped_to_configured_bounds(self):
+        analyzer = OpenCVLaneAnalyzer(
+            LaneAnalyzerConfig(
+                threshold=None,
+                adaptive_threshold_min=150,
+                adaptive_threshold_max=165,
+                work_size=(320, 240),
+                roi_top_ratio=35.0 / 240.0,
+                segmentation="dark"),
+            reference=make_reference(),
+        )
+        low_histogram = np.full((240, 320, 3), 100, dtype=np.uint8)
+        low_histogram[:, :160] = 20
+        _, low_metrics = analyzer._segment_track(low_histogram)
+        self.assertLess(low_metrics["segmentation_threshold_otsu"], 150)
+        self.assertEqual(low_metrics["segmentation_threshold_used"], 150)
+
+        high_histogram = np.full((240, 320, 3), 240, dtype=np.uint8)
+        high_histogram[:, :160] = 180
+        _, high_metrics = analyzer._segment_track(high_histogram)
+        self.assertGreater(high_metrics["segmentation_threshold_otsu"], 165)
+        self.assertEqual(high_metrics["segmentation_threshold_used"], 165)
+
+    def test_corner_tangent_fallback_only_replaces_flat_entering_target(self):
+        pursuit = {
+            "curvature_m_inv": 0.1,
+            "target_lateral_ratio": 0.02,
+            "sharp_boosted": False,
+        }
+        corner = {
+            "score": 0.78,
+            "heading": -1.40,
+            "direction_known": True,
+            "near_progress": 0.35,
+        }
+        result = self.analyzer._apply_corner_curvature_fallback(
+            pursuit, corner, "mixed", 0.40, 0.30, 0.70, 0.15, 0.50,
+            0.58, 0.15, 0.15)
+        self.assertTrue(result["corner_fallback"])
+        self.assertEqual(result["corner_fallback_reason"], "strong_score")
+        self.assertGreater(result["curvature_m_inv"], 6.0)
+        self.assertAlmostEqual(
+            result["curvature_m_inv"],
+            result["corner_curvature_m_inv"])
+
+        exiting = dict(corner, near_progress=0.75)
+        result = self.analyzer._apply_corner_curvature_fallback(
+            pursuit, exiting, "mixed", 0.40, 0.30, 0.70, 0.15, 0.50,
+            0.58, 0.15, 0.15)
+        self.assertFalse(result["corner_fallback"])
+        self.assertAlmostEqual(result["curvature_m_inv"], 0.1)
+
+    def test_weak_corner_fallback_requires_mixed_near_straight_entry(self):
+        pursuit = {
+            "curvature_m_inv": 0.0,
+            "target_lateral_ratio": 0.01,
+            "sharp_boosted": False,
+        }
+        corner = {
+            "score": 0.60,
+            "heading": -1.43,
+            "direction_known": True,
+            "near_progress": 0.20,
+        }
+        args = (pursuit, corner, "mixed", 0.02, 0.30, 0.70, 0.15,
+                0.50, 0.58, 0.15, 0.15)
+        result = self.analyzer._apply_corner_curvature_fallback(*args)
+        self.assertTrue(result["corner_fallback"])
+        self.assertEqual(
+            result["corner_fallback_reason"], "early_mixed_flat")
+
+        result = self.analyzer._apply_corner_curvature_fallback(
+            pursuit, corner, "left_only", 0.02, 0.30, 0.70, 0.15,
+            0.50, 0.58, 0.15, 0.15)
+        self.assertFalse(result["corner_fallback"])
+        result = self.analyzer._apply_corner_curvature_fallback(
+            pursuit, corner, "mixed", 0.30, 0.30, 0.70, 0.15,
+            0.50, 0.58, 0.15, 0.15)
+        self.assertFalse(result["corner_fallback"])
+
+    def test_right_turn_trigger_is_stateless_near_entry_only(self):
+        corner = {
+            "score": 0.75,
+            "heading": -1.40,
+            "direction_known": True,
+            "near_progress": 0.30,
+            "segment": [260, 100, 205, 90],
+        }
+        args = (corner, "mixed", 0.10, 0.70, -1.35, 0.20,
+                0.20, 0.45)
+        self.assertEqual(
+            self.analyzer._right_turn_reason(*args), "near_entry")
+        continuation = dict(corner, score=0.82, direction_known=False)
+        result = self.analyzer._right_turn_reason(
+            continuation, "left_only", 0.25, 0.70, -1.35,
+            0.20, 0.20, 0.45)
+        self.assertIsNone(result)
+        result = self.analyzer._right_turn_reason(
+            dict(corner, near_progress=0.48), "mixed", 0.10,
+            0.70, -1.35, 0.20, 0.20, 0.45)
+        self.assertIsNone(result)
+        self.assertTrue(self.analyzer._right_turn_geometry(
+            corner, "mixed", -1.35))
+        self.assertFalse(self.analyzer._right_turn_geometry(
+            corner, "left_only", -1.35))
+        pursuit = {
+            "curvature_m_inv": 0.1,
+            "target_lateral_ratio": 0.10,
+            "sharp_boosted": False,
+            "corner_fallback": False,
+            "corner_fallback_reason": None,
+            "corner_curvature_m_inv": None,
+        }
+        geometry = self.analyzer._right_turn_curvature(
+            corner, self.analyzer.reference.perspective,
+            self.analyzer.reference.roi_top, 100.0, 0.65, 0.20, 10.0)
+        overridden = self.analyzer._apply_right_turn_override(
+            pursuit, True, geometry)
+        self.assertTrue(overridden["right_turn_override"])
+        expected_index = 100 - self.analyzer.reference.roi_top
+        expected_distance = (
+            self.analyzer.reference.perspective[expected_index] / 100.0)
+        expected_curvature = (
+            -2.0 * np.sin(1.40) / expected_distance * 0.65)
+        self.assertAlmostEqual(geometry["distance_m"], expected_distance)
+        self.assertAlmostEqual(
+            overridden["curvature_m_inv"], expected_curvature)
+        self.assertEqual(
+            overridden["corner_fallback_reason"], "right_turn_direct")
 
     def test_cross_expansion_is_reported(self):
         result = self.analyzer.process(make_track(cross=True))

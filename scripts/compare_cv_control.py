@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from smartcar.whalesbot.tools.lane_collect import (
     CvLanePidController,
+    CvLanePidConfig,
     ErrorMapping,
     LaneAnalyzerConfig,
     OpenCVLaneAnalyzer,
@@ -36,6 +37,12 @@ def parse_args():
     parser.add_argument(
         "--temporal-filter", action="store_true",
         help="apply far-direction/near-arrival temporal filtering")
+    parser.add_argument(
+        "--pure-pursuit", action="store_true",
+        help="use the IPM pure-pursuit controller")
+    parser.add_argument(
+        "--lookahead-m", type=float, default=0.30,
+        help="pure-pursuit target distance in metres (default: 0.30)")
     return parser.parse_args()
 
 
@@ -197,6 +204,7 @@ def main():
         args.standard_root / "standard_lane.json",
         args.standard_root / "perspective.json")
     analyzer = OpenCVLaneAnalyzer(LaneAnalyzerConfig(
+        pure_pursuit_lookahead_m=args.lookahead_m,
         error_mapping=ErrorMapping(
             lateral_scale=-0.10,
             heading_scale=-0.40,
@@ -204,7 +212,9 @@ def main():
     temporal_filter = (PreviewTimingFilter(
         error_mapping=analyzer.config.error_mapping)
                        if args.temporal_filter else None)
-    controller = CvLanePidController()
+    controller = CvLanePidController(CvLanePidConfig(
+        steering_mode=("pure_pursuit" if args.pure_pursuit
+                       else "heading_pid")))
     last_valid_command = None
     invalid_hold_frames = 0
     rows = []
@@ -225,7 +235,7 @@ def main():
         held_invalid = False
         if not command.valid:
             invalid_hold_frames += 1
-            if last_valid_command is not None and invalid_hold_frames <= 5:
+            if last_valid_command is not None and invalid_hold_frames <= 10:
                 command = replace(last_valid_command, reason="short_invalid_hold")
                 held_invalid = True
         else:
@@ -246,7 +256,15 @@ def main():
             "forward_speed": command.forward_speed,
             "control_state": ("PREVIEW_TIMING_FILTER"
                                if temporal_filter is not None else "DISABLED"),
-            "control_source": "ipm_lane_pid",
+            "control_source": command.reason,
+            "pure_pursuit_curvature_m_inv": metrics.get(
+                "pure_pursuit_curvature_m_inv"),
+            "pure_pursuit_raw_curvature_m_inv": metrics.get(
+                "pure_pursuit_raw_curvature_m_inv"),
+            "pure_pursuit_target_lateral_ratio": metrics.get(
+                "pure_pursuit_target_lateral_ratio"),
+            "pure_pursuit_sharp_boosted": metrics.get(
+                "pure_pursuit_sharp_boosted", False),
             "reference_mode": metrics.get("reference_tracking_mode"),
             "false_double_rejected": metrics.get("false_double_rejected", False),
             "false_double_rejected_side": metrics.get("false_double_rejected_side", "none"),

@@ -59,10 +59,85 @@ class FakeCar:
 
 
 class CvLanePidControllerTests(unittest.TestCase):
+    def test_launch_guard_default_is_fifteen_centimetres(self):
+        self.assertAlmostEqual(
+            CvLanePidConfig().initial_straight_distance_m, 0.15)
+
+    def test_pure_pursuit_converts_curvature_to_yaw_rate(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            steering_mode="pure_pursuit", max_heading_step=0.0,
+            pure_pursuit_entry_step=0.0, max_heading_release_step=0.0,
+            max_deceleration_step=0.0))
+        result = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": 2.0,
+        })
+        command = controller.compute(result)
+        self.assertTrue(command.valid)
+        self.assertEqual(command.reason, "ipm_pure_pursuit")
+        self.assertAlmostEqual(
+            command.angular_speed, command.forward_speed * 2.0, places=6)
+        self.assertAlmostEqual(
+            -command.error_angle * controller.config.heading_kp,
+            command.target_forward_speed * 2.0, places=6)
+
+    def test_pure_pursuit_builds_turn_faster_than_it_releases(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            steering_mode="pure_pursuit", max_forward_speed=0.20,
+            min_forward_speed=0.20, pure_pursuit_entry_step=0.10,
+            max_heading_release_step=0.04))
+        bend = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": 5.0,
+        })
+        straight = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": 0.0,
+        })
+        first = controller.compute(bend)
+        second = controller.compute(bend)
+        release = controller.compute(straight)
+        self.assertAlmostEqual(first.angular_speed, 0.10)
+        self.assertAlmostEqual(second.angular_speed, 0.20)
+        self.assertAlmostEqual(release.angular_speed, 0.16)
+
+    def test_pure_pursuit_reverses_faster_than_same_direction_release(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            steering_mode="pure_pursuit", max_forward_speed=0.20,
+            min_forward_speed=0.20, pure_pursuit_entry_step=0.10,
+            max_heading_release_step=0.04,
+            max_heading_reverse_step=0.10))
+        right = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": 5.0,
+        })
+        left = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": -5.0,
+        })
+        controller.compute(right)
+        controller.compute(right)
+        reverse = controller.compute(left)
+        self.assertAlmostEqual(reverse.angular_speed, 0.10)
+
+    def test_right_turn_geometric_command_bypasses_frame_slew(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            steering_mode="pure_pursuit", max_forward_speed=0.20,
+            min_forward_speed=0.20, pure_pursuit_entry_step=0.10))
+        result = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": -6.0,
+            "route_right_turn_override": True,
+        })
+        command = controller.compute(result)
+        self.assertEqual(command.reason, "route_right_turn")
+        self.assertAlmostEqual(command.angular_speed, -1.20)
+
+    def test_pure_pursuit_requires_curvature_metric(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            steering_mode="pure_pursuit"))
+        command = controller.compute(analysis(heading=0.0))
+        self.assertFalse(command.valid)
+        self.assertIn("curvature", command.reason)
+
     def test_straight_uses_maximum_forward_speed(self):
         command = CvLanePidController().compute(analysis(heading=0.0))
-        self.assertAlmostEqual(command.forward_speed, 0.20, places=6)
-        self.assertAlmostEqual(command.target_forward_speed, 0.20, places=6)
+        self.assertAlmostEqual(command.forward_speed, 0.30, places=6)
+        self.assertAlmostEqual(command.target_forward_speed, 0.30, places=6)
         self.assertEqual(command.steering_demand, 0.0)
 
     def test_forward_speed_decreases_with_steering_demand(self):
@@ -74,8 +149,8 @@ class CvLanePidControllerTests(unittest.TestCase):
             demands.append(command.steering_demand)
         self.assertEqual(speeds, sorted(speeds, reverse=True))
         self.assertEqual(demands, sorted(demands))
-        self.assertGreaterEqual(min(speeds), 0.08)
-        self.assertLessEqual(max(speeds), 0.20)
+        self.assertGreaterEqual(min(speeds), 0.12)
+        self.assertLessEqual(max(speeds), 0.30)
 
     def test_bend_deceleration_is_faster_than_exit_acceleration(self):
         controller = CvLanePidController()
@@ -83,17 +158,17 @@ class CvLanePidControllerTests(unittest.TestCase):
         bend = controller.compute(analysis(heading=1.0))
         exit_command = controller.compute(analysis(heading=0.0))
         self.assertAlmostEqual(
-            straight.forward_speed - bend.forward_speed, 0.03, places=6)
+            straight.forward_speed - bend.forward_speed, 0.015, places=6)
         self.assertAlmostEqual(
-            exit_command.forward_speed - bend.forward_speed, 0.005, places=6)
+            exit_command.forward_speed - bend.forward_speed, 0.010, places=6)
 
-    def test_pid_uses_single_frame_labels_and_production_gains(self):
+    def test_pid_keeps_single_frame_labels_while_vy_is_disabled(self):
         controller = CvLanePidController(CvLanePidConfig(max_heading_step=0.0))
         command = controller.compute(analysis(lateral=0.05, heading=-0.10))
         self.assertTrue(command.valid)
         self.assertAlmostEqual(command.error_y, 0.05, places=6)
         self.assertAlmostEqual(command.error_angle, -0.10, places=6)
-        self.assertAlmostEqual(command.lateral_speed, 0.30, places=6)
+        self.assertEqual(command.lateral_speed, 0.0)
         self.assertAlmostEqual(command.angular_speed, -0.195, places=6)
         self.assertEqual(command.reason, "ipm_lane_pid")
 
@@ -153,7 +228,8 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
             metadata = json.loads((session_dir / "session.json").read_text())
             self.assertEqual(saved.shape, (240, 320, 3))
             self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["teacher"], "opencv_ipm_error")
+            self.assertEqual(
+                records[0]["teacher"], "opencv_ipm_pure_pursuit")
             self.assertFalse(records[0]["held"])
             self.assertEqual(records[0]["command_source"], "standard")
             self.assertIn("control_reason", records[0])
@@ -161,17 +237,23 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
             self.assertIn("target_forward_speed", records[0])
             self.assertNotEqual(records[0]["state"], records[0]["control"])
             self.assertEqual(records[0]["state"][1], records[0]["cv"]["error_y"])
-            self.assertEqual(
-                records[0]["state"][2], records[0]["cv"]["error_angle"])
+            curvature = records[0]["cv"]["metrics"][
+                "pure_pursuit_curvature_m_inv"]
+            self.assertAlmostEqual(
+                -records[0]["state"][2] * 1.95,
+                records[0]["target_forward_speed"] * curvature,
+                places=6)
             self.assertEqual(
                 metadata["state_fields"],
                 ["forward_speed", "error_y", "error_angle"],
             )
             self.assertTrue(metadata["usable_for_training"])
             self.assertEqual(
-                metadata["controller"]["max_forward_speed"], 0.20)
+                metadata["controller"]["max_forward_speed"], 0.30)
             self.assertEqual(
-                metadata["controller"]["min_forward_speed"], 0.08)
+                metadata["controller"]["min_forward_speed"], 0.12)
+            self.assertEqual(
+                metadata["controller"]["steering_mode"], "pure_pursuit")
             self.assertIn("speed_control", metadata)
             self.assertEqual(car.commands[-1], (0.0, 0.0, 0.0))
 
