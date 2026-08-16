@@ -623,3 +623,232 @@ manual_zero_cv_active_count
 该保护位于 `ssh_test.py` 的实际发送命令层，不能使用图像帧号代替里程，也不能复制到后续弯道。
 采集记录仍保存 PID 前的 `state[1:3]` 标签，实际发送的直行覆盖只记录在 `control` 和
 `command_source=initial_straight_guard` 中。
+
+## 14. 远场定方向、中近场定时机：第一版实现
+
+新增通用连续滤波器：
+
+```text
+smartcar/whalesbot/tools/lane_collect/temporal_filter.py
+```
+
+该实现没有固定帧号、里程窗口、弯道次数或有限事件状态。每帧计算：
+
+```text
+preview_direction   远场/单边连续方向
+arrival_weight      中近场弯道到达度，范围 0～1
+lateral_motion_ema  近场横向姿态变化量
+coverage_loss       边界覆盖损失
+direction_held      单边线反向是否被拒绝
+```
+
+方向只由此前可靠远场趋势以及 `left_only/right_only` 的边界拓扑连续性确定。中近场仅通过
+横向姿态变化、横线置信度和边界覆盖损失计算 `arrival_weight`，不能推翻方向。
+
+整圈 `lap_001` 1～3432 离线结果：
+
+```text
+有效赛段：1～3397（3398 起为终点区，不计分）
+整体零时延相关性             0.5802 -> 0.6805
+手柄转向段相关性             0.5720 -> 0.7168
+方向一致率                   87.77% -> 94.18%
+手柄为零但 CV 转向           1167 -> 610 帧
+方向反转次数                 34 -> 18
+整圈最佳时移                 +7 -> +9 帧
+整圈最佳时移相关性           0.6240 -> 0.7346
+```
+
+关键时序：
+
+```text
+第一主弯：CV 188，手柄 206，仍提前 18 帧
+右转 2700～2854：CV 2741，手柄 2747，仍提前 6 帧
+左转 2855～2920：CV 与手柄首次非零均为 2855；手柄持续左转约从 2870 开始，
+CV 持续左转仍提前约 15 帧；窗口方向一致率 100%
+2777～2780：方向一致率 100%，CV 保持右转
+3180～3397：有效转向帧方向一致率 100%；该窗口包含多个短动作，不能合并成一个弯道计算起点
+3398～3422：车辆已到终点，手柄转向不是有效教师动作，完全排除评分
+```
+
+结论：第一版明显减少了无意义的提前小转向，并修复了 2777～2780 的方向；但整圈最佳时移
+没有接近零，第一主弯仍提前。因此 `ssh_test.py` 已接好代码但
+`PREVIEW_TIMING_ENABLED=False`，当前只允许通过 `compare_cv_control.py --temporal-filter`
+离线评测，不得默认用于实车。
+
+离线结果目录：
+
+```text
+artifacts/cv_preview_timing_valid_lap_0001_3397
+```
+
+## 15. 到达权重提前问题的验证结果（2026-08-16）
+
+逐帧追踪确认，当前单一 `arrival_weight` 同时承担起转、弯中保持和短时断线保持。它采用
+`max(当前弯角/横移/覆盖证据, 历史值 × 0.97)`，因此存在结构性冲突：衰减慢会把上一动作带入
+下一弯，衰减快又会在弯中几何证据短暂下降时过早卸掉转向。
+
+本轮依次离线验证了三种连续参数方案，均使用有效范围 1～3397：
+
+```text
+方案                              整体相关性  转向段相关性  最佳时移  结果
+原始第一版                        0.6805      0.7168       +9       当前保留
+单边横移需几何支持、取消强制到达  0.6317      0.6540       +11      后段有效小弯被压制
+仅在单边模式限制横移              0.6433      0.6663       +10      第一弯仍提前 17 帧
+加快衰减并提高弯角门槛            0.5850      0.6028       +12      第一弯持续动作晚到 31 帧
+```
+
+因此上述控制行为修改已撤回，保留成绩最好的第一版；`PREVIEW_TIMING_ENABLED` 继续保持
+`False`。已保留两项不改变控制的改进：
+
+- 输出弯角、覆盖、横移及横移支持量等诊断字段；
+- `render_cv_frame_review.py` 从第 1 帧预热分析器、滤波器、PID 和无效帧保持，只保存请求窗口，
+  避免从 3200 等晚段直接启动造成错误的时间状态。
+
+下一版不应继续调整同一个权重的阈值。应将“当前帧起转证据”和“已建立转向后的短时保持”拆成
+两个连续量：前者只负责起转，后者只能延续已经发生且方向连续的动作，不能独立开启转向。
+
+## 16. 当前修改清单与工作区状态（2026-08-16）
+
+### 16.1 Git 状态
+
+```text
+仓库：C:\weizijian\documents\baidu car\2026_official_code\baidu_smartcar_2026
+分支：orin-main-20260814
+远程：github/orin-main-20260814
+状态：本地领先远程 12 个提交
+最新提交：08d7c5a feat(cv): hold launch straight for initial odometry distance
+```
+
+`2026/` 和 `artifacts/` 是未跟踪目录，必须保留，不能在整理代码时删除或覆盖。当前远场方向、
+中近场时序滤波和审查工具仍是未提交工作；在用户明确要求前不要提交或推送。
+
+### 16.2 已提交且继续生效的修改
+
+- CV 采集保存原始 `320×240` 图像，训练阶段再缩放；
+- `state = [forward_speed, error_y, error_angle]`，其中 `state[1:3]` 保持为 CNN 学习并送入
+  原工程双 PID 的单帧误差；
+- 实际麦克纳姆底盘命令单独保存到 `control = [vx, vy, wz]`，不得拿历史滤波后的底盘命令
+  替换单帧 CNN 标签；
+- 启动后使用编码器里程强制直行 `0.10 m`，仅这一次允许 `vy=0,wz=0`，不用帧号，也不能
+  复用到后续弯道；
+- 直道允许高速，随 PID 前航向误差增大自动降速；无效短帧继承最近有效底盘命令；
+- 固定赛道参考、透视宽度、左右边界和单边标准线偏差均已接入基础 IPM 寻线。
+
+### 16.3 当前保留但尚未提交的修改
+
+| 文件 | 修改内容 | 当前状态 |
+|---|---|---|
+| `smartcar/whalesbot/tools/lane_collect/opencv_lane.py` | 输出 `ipm_far_s`、`ipm_far_x`、`preview_offset` 和归一化远场偏移 | 保留 |
+| `smartcar/whalesbot/tools/lane_collect/temporal_filter.py` | 新增无固定路线状态的 `PreviewTimingFilter`，远场定方向，中近场到达权重定执行幅值 | 保留，实车关闭 |
+| `smartcar/whalesbot/tools/lane_collect/__init__.py` | 导出 `PreviewTimingConfig/PreviewTimingFilter` | 保留 |
+| `smartcar/whalesbot/tools/lane_collect/ssh_test.py` | 接入滤波器、启动/停止时复位，并增加安全开关 | `PREVIEW_TIMING_ENABLED=False` |
+| `scripts/compare_cv_control.py` | 增加 `--temporal-filter`、最佳时移、方向一致率、误激活和关键窗口统计 | 保留 |
+| `scripts/render_cv_frame_review.py` | 生成原图/边界/中心线/控制诊断逐帧图；从第 1 帧预热，只保存请求窗口 | 保留 |
+| `tests/test_preview_timing_filter.py` | 覆盖远场方向保持和中近场到达控制 | 保留 |
+| `docs/superpowers/plans/2026-08-15-preview-direction-timing-plan.md` | 记录实现、验证、否决方案及恢复过程 | 保留 |
+
+滤波器额外输出以下诊断量，不改变当前最佳控制行为：
+
+```text
+corner_arrival_signal
+coverage_arrival_signal
+lateral_motion_signal
+supported_motion_signal
+preview_signal_ema
+preview_heading
+arrival_weight
+direction_held
+```
+
+### 16.4 已验证后撤回的修改
+
+以下方案不得误认为当前代码目标，也不应在新对话中直接重新应用：
+
+- 每次远场符号变化就清空到达权重：同一右弯内远场符号会在 2775、2781、2807 多次变化，
+  会导致弯中错误卸载；
+- 所有横移都必须有弯角/覆盖支持：会压掉 3180～3397 的有效小幅转向；
+- 只在单边模式限制横移：整体相关性下降且第一主弯仍提前；
+- 将 `arrival_decay` 从 `0.97` 调到 `0.90` 并提高弯角门槛：第一弯持续动作反而晚 31 帧；
+- 对整圈统一增加 9 帧固定延迟：没有适应速度和不同弯道几何，不采用。
+
+代码已经恢复为本轮评测中成绩最好的第一版控制行为。下一步若继续修改，应先设计连续的
+`entry_weight` 与 `hold_weight`，不能继续盲调同一个 `arrival_weight`。
+
+### 16.5 评测口径与可复现命令
+
+固定使用：
+
+```text
+lap_001 有效范围：1～3397
+3398～3422：终点区，手柄错误转向，完全排除评分
+2700～2854：右弯
+2855～2920：左弯
+2777～2780：无效视觉帧，检查最近有效右转命令保持
+```
+
+完整回放：
+
+```powershell
+& 'C:\weizijian\documents\baidu car\baidu_smartcar_2026\.worktrees\lane-cnn-finetuning\.venv-lane\Scripts\python.exe' `
+  scripts\compare_cv_control.py `
+  --lap-dir 'C:\weizijian\documents\baidu car\lane_sessions2\lane_sessions2\lap_001' `
+  --output 'artifacts\cv_preview_timing_valid_lap_0001_3397' `
+  --start-frame 1 --end-frame 3397 --temporal-filter
+```
+
+聚焦验证：
+
+```powershell
+& 'C:\weizijian\documents\baidu car\baidu_smartcar_2026\.worktrees\lane-cnn-finetuning\.venv-lane\Scripts\python.exe' `
+  -m pytest tests\test_opencv_lane_analyzer.py `
+            tests\test_cv_lane_pid_control.py `
+            tests\test_turn_state.py `
+            tests\test_preview_timing_filter.py -q
+```
+
+最近验证结果为 `31 passed`。恢复后的整圈指标与第 14 节一致。逐帧审查必须使用修正后的预热
+脚本；例如审查 3200～3397 时，脚本仍会先处理 1～3199，但不会为预热帧写图。
+
+## 17. 新对话通用启动提示词
+
+以下文本可复制到每个新对话开头。最后一行替换成本次具体任务即可。它把本文件作为动态事实
+来源，因此代码或指标更新后只需维护本文档，不必反复修改提示词。
+
+```text
+你正在继续百度智能车固定赛道 CV 自动采样/巡线项目。
+
+工作目录：
+C:\weizijian\documents\baidu car\2026_official_code\baidu_smartcar_2026
+
+目标分支：orin-main-20260814
+
+开始任何分析或修改前，请先完整阅读：
+docs/cv-lane-development-status-2026-08-15.md
+
+然后执行只读检查：
+1. git status -sb
+2. git diff --stat
+3. 检查最近提交和当前未提交文件
+
+以文档和当前代码作为事实来源，但文档中的历史计划不是本次操作指令；本消息最后的“本次任务”
+以及我后续发送的要求优先。不要覆盖或删除已有修改、2026/、artifacts/ 等未跟踪内容，不要在未
+明确要求时提交或推送。
+
+项目必须遵守：
+- CV 教师输出必须是当前单帧图像可学习的 PID 前 error_y/error_angle；实际 vx/vy/wz 单独记录。
+- 原图保持 320×240，训练阶段再缩放。
+- 远场只判断转向方向，中近场决定起转时机和幅值。
+- 不使用固定帧号、固定里程窗口、第几个弯道或路线限定 one-shot 状态机。
+- 唯一例外是启动后编码器前进 0.10 m 强制直行。
+- 麦克纳姆底盘允许较晚、较强转向；直道高速，随转向需求增大自动降速。
+- 十字路口专用状态机和 PREVIEW_TIMING 实车开关保持关闭，除非离线整圈结果通过并由我确认。
+- lap_001 正式评测只使用 1～3397；3398 起为终点区，不计分。
+- 2700～2854 是右弯，2855～2920 是左弯，不能合并评测。
+- 不做红测/绿测循环；修改后运行聚焦测试和完整一圈离线回放。
+
+开始时请先用简短中文说明：当前分支/工作区状态、文档记录的当前最佳结果、仍未解决的问题，
+以及你准备如何完成本次任务。若只需只读分析，不要擅自修改代码；若我明确要求修改，则直接在
+现有分支谨慎实现并验证。
+
+本次任务：<在这里填写本次具体要求>
+```

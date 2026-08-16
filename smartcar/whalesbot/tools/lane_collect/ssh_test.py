@@ -15,6 +15,7 @@ import cv2
 from .calibration import ErrorMapping
 from .opencv_lane import LaneAnalyzerConfig, OpenCVLaneAnalyzer, StandardLaneReference
 from .pid_control import CvLanePidConfig, CvLanePidController
+from .temporal_filter import PreviewTimingFilter
 from .turn_state import CrossStraightStateMachine
 
 
@@ -121,6 +122,9 @@ class OpenCVLaneSshTest:
     # Temporarily bypass the route-specific crossing controller while
     # validating ordinary and right-angle bends at the higher test speed.
     CROSS_STATE_ENABLED = False
+    # Implemented and available for offline replay, but kept off on the real
+    # car until the first-turn timing error and +9-frame best lag pass.
+    PREVIEW_TIMING_ENABLED = False
 
     def __init__(self, camera, car, output_root="dataset/cv_lane_tests",
                  frame_callback=None, standard_root="standard") -> None:
@@ -146,6 +150,8 @@ class OpenCVLaneSshTest:
             ),
         ), reference=reference)
         self.controller = CvLanePidController(CvLanePidConfig())
+        self.temporal_filter = PreviewTimingFilter(
+            error_mapping=self.analyzer.config.error_mapping)
         self.cross_state = CrossStraightStateMachine()
         self.commands = queue.Queue()
         self.running = False
@@ -188,6 +194,8 @@ class OpenCVLaneSshTest:
                     return
             image = self.camera.read().copy()
             analysis = self.analyzer.process(image)
+            if self.PREVIEW_TIMING_ENABLED:
+                analysis = self.temporal_filter.update(analysis)
             distance_m, distance_source = self._read_distance()
             if distance_m is not None:
                 if self.distance_origin_m is None:
@@ -273,6 +281,7 @@ class OpenCVLaneSshTest:
                     print("CV control is already running.", flush=True)
                     continue
                 self.controller.reset()
+                self.temporal_filter.reset()
                 if self.CROSS_STATE_ENABLED:
                     self.cross_state.reset()
                 self.last_valid_command = None
@@ -300,6 +309,7 @@ class OpenCVLaneSshTest:
         self.running = False
         self._stop_vehicle()
         self.controller.reset()
+        self.temporal_filter.reset()
         self.last_valid_command = None
         self.invalid_hold_frames = 0
         self.distance_origin_m = None

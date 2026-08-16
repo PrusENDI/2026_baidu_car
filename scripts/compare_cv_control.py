@@ -20,6 +20,7 @@ from smartcar.whalesbot.tools.lane_collect import (
     ErrorMapping,
     LaneAnalyzerConfig,
     OpenCVLaneAnalyzer,
+    PreviewTimingFilter,
     StandardLaneReference,
 )
 
@@ -32,6 +33,9 @@ def parse_args():
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--start-frame", type=int, default=1)
     parser.add_argument("--end-frame", type=int, default=3432)
+    parser.add_argument(
+        "--temporal-filter", action="store_true",
+        help="apply far-direction/near-arrival temporal filtering")
     return parser.parse_args()
 
 
@@ -45,6 +49,27 @@ def correlation(first, second):
     return float(np.corrcoef(first, second)[0, 1])
 
 
+def best_lag_metrics(values, manual, max_lag=50):
+    """Return best correlation and the shift needed to align manual data.
+
+    A positive lag means the manual curve is shifted later, i.e. CV is early.
+    """
+    candidates = []
+    for lag in range(-max_lag, max_lag + 1):
+        if lag > 0:
+            score = correlation(values[:-lag], manual[lag:])
+        elif lag < 0:
+            score = correlation(values[-lag:], manual[:lag])
+        else:
+            score = correlation(values, manual)
+        if score is not None:
+            candidates.append((score, lag))
+    if not candidates:
+        return None, None
+    score, lag = max(candidates, key=lambda item: item[0])
+    return score, lag
+
+
 def steering_metrics(values, manual, limit=None):
     values = np.asarray(values, dtype=np.float64)
     manual = np.asarray(manual, dtype=np.float64)
@@ -55,9 +80,12 @@ def steering_metrics(values, manual, limit=None):
     finite_values = values[np.isfinite(values)]
     differences = np.abs(np.diff(finite_values))
     active_signs = np.sign(finite_values[np.abs(finite_values) >= 0.03])
+    best_correlation, best_lag = best_lag_metrics(values, manual)
     return {
         "correlation_all": correlation(values[valid], manual[valid]),
         "correlation_manual_turning": correlation(values[turning], manual[turning]),
+        "best_lag_correlation": best_correlation,
+        "best_lag_frames": best_lag,
         "same_direction_rate": (float(np.mean(
             np.sign(values[directional]) == np.sign(manual[directional])))
             if np.count_nonzero(directional) else None),
@@ -80,10 +108,36 @@ def window_metrics(rows, start, end):
     selected = [row for row in rows if start <= row["index"] <= end]
     values = np.asarray([row["angular_speed"] for row in selected], dtype=np.float64)
     manual = np.asarray([row["hand_angular"] for row in selected], dtype=np.float64)
+    def active_runs(field):
+        runs = []
+        for row in selected:
+            if abs(float(row[field])) < 0.03:
+                continue
+            frame = int(row["index"])
+            if not runs or frame > runs[-1][1] + 1:
+                runs.append([frame, frame])
+            else:
+                runs[-1][1] = frame
+        return runs
+
+    cv_runs = active_runs("angular_speed")
+    manual_runs = active_runs("hand_angular")
+    cv_dominant = max(cv_runs, key=lambda run: run[1] - run[0], default=None)
+    manual_dominant = max(
+        manual_runs, key=lambda run: run[1] - run[0], default=None)
+    cv_onset = cv_dominant[0] if cv_dominant else None
+    manual_onset = manual_dominant[0] if manual_dominant else None
     return {
         "start": start,
         "end": end,
         "count": len(selected),
+        "cv_first_active": cv_runs[0][0] if cv_runs else None,
+        "manual_first_active": manual_runs[0][0] if manual_runs else None,
+        "cv_onset": cv_onset,
+        "manual_onset": manual_onset,
+        "onset_error_frames": (cv_onset - manual_onset
+                                if cv_onset is not None and
+                                manual_onset is not None else None),
         "cv_mean": float(np.mean(values)) if values.size else None,
         "cv_min": float(np.min(values)) if values.size else None,
         "cv_max": float(np.max(values)) if values.size else None,
@@ -147,6 +201,9 @@ def main():
             lateral_scale=-0.10,
             heading_scale=-0.40,
         )), reference)
+    temporal_filter = (PreviewTimingFilter(
+        error_mapping=analyzer.config.error_mapping)
+                       if args.temporal_filter else None)
     controller = CvLanePidController()
     last_valid_command = None
     invalid_hold_frames = 0
@@ -158,11 +215,12 @@ def main():
             image_path = args.lap_dir / image_path
         frame = int(image_path.stem)
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        analysis = analyzer.process(image) if image is not None else None
-        if analysis is None:
+        base_analysis = analyzer.process(image) if image is not None else None
+        if base_analysis is None:
             raise RuntimeError(f"could not decode {image_path}")
-        base_valid = analysis.valid
-        controlled = analysis
+        base_valid = base_analysis.valid
+        controlled = (temporal_filter.update(base_analysis)
+                      if temporal_filter is not None else base_analysis)
         command = controller.compute(controlled)
         held_invalid = False
         if not command.valid:
@@ -174,23 +232,27 @@ def main():
             invalid_hold_frames = 0
             last_valid_command = command
         state = item.get("state", [None, None, None])
-        metrics = analysis.metrics
+        metrics = controlled.metrics
         rows.append({
             "index": frame,
             "base_valid": base_valid,
             "controlled_valid": command.valid,
             "held_invalid": held_invalid,
-            "raw_lateral": analysis.raw_lateral,
-            "raw_heading": analysis.raw_heading,
+            "raw_lateral": controlled.raw_lateral,
+            "raw_heading": controlled.raw_heading,
             "error_y": command.error_y,
             "error_angle": command.error_angle,
             "angular_speed": command.angular_speed,
             "forward_speed": command.forward_speed,
-            "control_state": "DISABLED",
+            "control_state": ("PREVIEW_TIMING_FILTER"
+                               if temporal_filter is not None else "DISABLED"),
             "control_source": "ipm_lane_pid",
             "reference_mode": metrics.get("reference_tracking_mode"),
             "false_double_rejected": metrics.get("false_double_rejected", False),
             "false_double_rejected_side": metrics.get("false_double_rejected_side", "none"),
+            "preview_direction": metrics.get("preview_direction"),
+            "arrival_weight": metrics.get("arrival_weight"),
+            "direction_held": metrics.get("direction_held", False),
             "hand_speed": state[0] if len(state) > 0 else None,
             "hand_lateral": state[1] if len(state) > 1 else None,
             "hand_angular": state[2] if len(state) > 2 else None,
@@ -220,9 +282,13 @@ def main():
         "baseline": steering_metrics(baseline, manual, 0.35),
         "filtered_vs_baseline_correlation": correlation(filtered, baseline),
         "windows": {
+            "first_turn": window_metrics(rows, 150, 278),
             "first_cross": window_metrics(rows, 217, 278),
             "second_cross": window_metrics(rows, 1161, 1181),
+            "right_turn_2700": window_metrics(rows, 2700, 2854),
+            "left_turn_2855": window_metrics(rows, 2855, 2920),
             "known_invalid": window_metrics(rows, 2777, 2780),
+            "late_section": window_metrics(rows, 3180, 3397),
         },
     }
     args.output.mkdir(parents=True, exist_ok=True)

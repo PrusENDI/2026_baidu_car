@@ -261,6 +261,12 @@ class OpenCVLaneAnalyzer:
         reference_x = float(
             quadratic * reference_s * reference_s +
             linear * reference_s + intercept)
+        far_s = float(np.max(fit_s))
+        far_x = float(
+            quadratic * far_s * far_s + linear * far_s + intercept)
+        preview_offset = float(far_x - reference_x)
+        preview_offset_normalized = float(
+            preview_offset / max(float(ref.lane_width) / 2.0, 1e-9))
         local_slope = float(2.0 * quadratic * reference_s + linear)
         raw_lateral = float(
             reference_x / max(float(ref.lane_width) / 2.0, 1e-9))
@@ -292,6 +298,10 @@ class OpenCVLaneAnalyzer:
             "ipm_intercept": float(intercept),
             "ipm_reference_s": reference_s,
             "ipm_reference_x": reference_x,
+            "ipm_far_s": far_s,
+            "ipm_far_x": far_x,
+            "preview_offset": preview_offset,
+            "preview_offset_normalized": preview_offset_normalized,
             "curvature": curvature,
             "perspective_median": float(np.median(fit_s)),
             "roi_top_y": roi_top,
