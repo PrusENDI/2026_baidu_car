@@ -43,8 +43,8 @@ def build_epoch_batches(
     groups: dict[str, list[int]], *, batch_size: int = 64,
     seed: int = 20260817, epoch: int,
 ) -> tuple[list[list[int]], dict]:
-    if batch_size != 64:
-        raise ValueError("fixed-track grouped sampling requires batch_size=64")
+    if batch_size < 3:
+        raise ValueError("batch_size must leave room for all three groups")
     if epoch < 1:
         raise ValueError("epoch must be positive")
     if set(groups) != set(GROUPS) or any(not groups[name] for name in GROUPS):
@@ -75,15 +75,25 @@ def build_epoch_batches(
                 cursors[name] = 0
         return result
 
-    batch_count = math.ceil(len(groups["cv"]) / 45)
+    if batch_size == 64:
+        cv_count, first_manual, second_manual = 45, 10, 9
+    else:
+        first_manual = max(1, round(batch_size * 0.15))
+        second_manual = max(1, round(batch_size * 0.15))
+        cv_count = batch_size - first_manual - second_manual
+        if cv_count < 1:
+            raise ValueError("batch_size produces an empty cv draw")
+    batch_count = math.ceil(len(groups["cv"]) / cv_count)
     draw_counts = {name: 0 for name in GROUPS}
     batches: list[list[int]] = []
     for batch_index in range(batch_count):
         active_count, context_count = (
-            (10, 9) if batch_index % 2 == 0 else (9, 10)
+            (first_manual, second_manual)
+            if batch_index % 2 == 0
+            else (second_manual, first_manual)
         )
         counts = {
-            "cv": 45,
+            "cv": cv_count,
             "manual_active": active_count,
             "manual_context": context_count,
         }
