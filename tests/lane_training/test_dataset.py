@@ -1,7 +1,12 @@
 import numpy as np
 from PIL import Image
 
-from lane_training.dataset import LaneDataset, horizontal_flip, preprocess_rgb
+from lane_training.dataset import (
+    LaneDataset,
+    augment_rgb,
+    horizontal_flip,
+    preprocess_rgb,
+)
 
 
 def test_preprocess_contract_and_normalization():
@@ -36,6 +41,21 @@ def test_horizontal_flip_keeps_speed_demand_and_reverses_curvature():
 
     assert np.array_equal(flipped, image[:, ::-1])
     assert np.allclose(label, [0.75, 1.2])
+
+
+def test_action_augmentation_can_disable_horizontal_flip():
+    image = np.full((16, 16, 3), 128, dtype=np.uint8)
+    label = np.array([0.75, -1.2], dtype=np.float32)
+
+    for seed in range(20):
+        _, augmented_label = augment_rgb(
+            image,
+            label,
+            np.random.default_rng(seed),
+            label_semantics="speed_demand_action_curvature",
+            horizontal_flip_probability=0.0,
+        )
+        assert np.allclose(augmented_label, label)
 
 
 def test_dataset_preload_caches_resized_rgb(tmp_path):

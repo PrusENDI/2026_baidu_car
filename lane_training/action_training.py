@@ -49,7 +49,9 @@ def train_action(*, manifest: Path, output: Path, initial_checkpoint: Path | Non
         if set(state)!=set(model.state_dict()): raise ValueError("checkpoint keys do not match CnnModel")
         model.set_state_dict(state)
     optimizer=paddle.optimizer.Adam(learning_rate=learning_rate, parameters=model.parameters()); output.mkdir(parents=True,exist_ok=True)
-    history=[]; best=math.inf; limit=2 if smoke else epochs; train_ds=LaneDataset(train_rows,training=True,return_target_mask=True)
+    history=[]; best=math.inf; limit=2 if smoke else epochs; train_ds=LaneDataset(
+        train_rows, training=True, return_target_mask=True,
+        horizontal_flip_probability=0.0)
     for epoch in range(1,limit+1):
         train_ds.set_epoch(epoch); model.train(); losses=[]; order=np.random.default_rng(20260817+epoch).permutation(len(train_ds))
         for images,target,mask in _batch(train_ds,order,batch_size):

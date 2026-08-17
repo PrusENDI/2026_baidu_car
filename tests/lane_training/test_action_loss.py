@@ -25,3 +25,14 @@ def test_cv_mask_trains_both_outputs():
     assert float(loss) > 0.0
     assert float(parts["valid_speed"]) == 1.0
     assert float(parts["valid_kappa"]) == 1.0
+
+
+def test_kappa_loss_uses_full_turn_scale():
+    prediction = paddle.to_tensor([[0.0, 5.0]], dtype="float32")
+    target = paddle.zeros([1, 2], dtype="float32")
+    mask = paddle.to_tensor([[0.0, 1.0]], dtype="float32")
+
+    loss, parts = masked_smooth_l1_loss(prediction, target, mask)
+
+    assert float(loss) == 0.5
+    assert float(parts["kappa"]) == 0.5

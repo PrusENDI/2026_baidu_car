@@ -54,6 +54,7 @@ def augment_rgb(
     label: np.ndarray,
     rng: np.random.Generator,
     label_semantics: str = "legacy_vy_yaw",
+    horizontal_flip_probability: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
     brightness = rng.uniform(0.8, 1.2)
     contrast = rng.uniform(0.8, 1.2)
@@ -75,7 +76,7 @@ def augment_rgb(
         augmented = np.clip(augmented.astype(np.float32) + noise, 0, 255).astype(
             np.uint8
         )
-    if rng.random() < 0.5:
+    if rng.random() < horizontal_flip_probability:
         augmented, label = horizontal_flip(
             augmented, label, label_semantics=label_semantics)
     return augmented, np.asarray(label, dtype=np.float32)
@@ -92,6 +93,7 @@ class LaneDataset(Dataset):
         illumination_severity: int = 3,
         corruption_config: CorruptionConfig | None = None,
         return_target_mask: bool = False,
+        horizontal_flip_probability: float = 0.5,
     ) -> None:
         super().__init__()
         self.rows = list(rows)
@@ -104,6 +106,7 @@ class LaneDataset(Dataset):
         self.illumination_severity = illumination_severity
         self.corruption_config = corruption_config or CorruptionConfig()
         self.return_target_mask = bool(return_target_mask)
+        self.horizontal_flip_probability = float(horizontal_flip_probability)
         self._cached_images: list[np.ndarray | None] = [None] * len(self.rows)
 
     def __len__(self) -> int:
@@ -140,7 +143,12 @@ class LaneDataset(Dataset):
         if self.training:
             rng = np.random.default_rng(self.seed + self.epoch * 1_000_003 + int(index))
             rgb, label = augment_rgb(
-                rgb, label, rng, label_semantics=label_semantics)
+                rgb,
+                label,
+                rng,
+                label_semantics=label_semantics,
+                horizontal_flip_probability=self.horizontal_flip_probability,
+            )
         if self.return_target_mask:
             return preprocess_rgb(rgb), label, target_mask
         if not np.allclose(target_mask, 1.0):
