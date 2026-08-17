@@ -5,11 +5,16 @@ import hashlib
 import json
 import math
 import random
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import paddle
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from lane_training.action_loss import masked_smooth_l1_loss
 from lane_training.action_training import load_manifest

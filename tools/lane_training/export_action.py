@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import paddle
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from lane_training.action_training import load_manifest
 from lane_training.dataset import LaneDataset
