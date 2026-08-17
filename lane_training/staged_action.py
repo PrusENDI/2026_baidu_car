@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import paddle
 
@@ -80,3 +83,104 @@ def build_optimizer(model, epoch: int):
         parameters=optimizer_parameter_groups(model, stage),
     )
     return optimizer, stage
+
+
+@dataclass
+class LoadedTrainingCheckpoint:
+    checkpoint: Path
+    last_completed_epoch: int
+    stage: TrainingStage
+    optimizer: paddle.optimizer.Optimizer
+    sampler_state: dict
+    history: list[dict]
+
+    @property
+    def next_epoch(self) -> int:
+        return self.last_completed_epoch + 1
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def save_training_checkpoint(
+    checkpoint_root: Path | str,
+    *,
+    epoch: int,
+    model,
+    optimizer,
+    stage: TrainingStage,
+    sampler_state: dict,
+    history: list[dict],
+) -> Path:
+    if stage != stage_for_epoch(epoch):
+        raise ValueError("checkpoint stage does not match epoch")
+    root = Path(checkpoint_root)
+    root.mkdir(parents=True, exist_ok=True)
+    final = root / f"epoch_{epoch:04d}"
+    incomplete = root / f"epoch_{epoch:04d}.incomplete"
+    if final.exists() or incomplete.exists():
+        raise FileExistsError(f"checkpoint already exists: {final}")
+    incomplete.mkdir()
+    model_path = incomplete / "model.pdparams"
+    optimizer_path = incomplete / "optimizer.pdopt"
+    paddle.save(model.state_dict(), str(model_path))
+    paddle.save(optimizer.state_dict(), str(optimizer_path))
+    hashes = {
+        "model.pdparams": _sha256(model_path),
+        "optimizer.pdopt": _sha256(optimizer_path),
+    }
+    state = {
+        "schema_version": 1,
+        "last_completed_epoch": int(epoch),
+        "stage": stage.name,
+        "augmentation_profile": stage.augmentation_profile,
+        "sampler_state": sampler_state,
+        "history": history,
+        "sha256": hashes,
+    }
+    (incomplete / "state.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if any(_sha256(incomplete / name) != value for name, value in hashes.items()):
+        raise ValueError("checkpoint SHA256 mismatch after save")
+    incomplete.rename(final)
+    return final
+
+
+def load_training_checkpoint(checkpoint: Path | str, model) -> LoadedTrainingCheckpoint:
+    checkpoint = Path(checkpoint)
+    if checkpoint.name.endswith(".incomplete"):
+        raise ValueError("cannot load an incomplete checkpoint")
+    state = json.loads((checkpoint / "state.json").read_text(encoding="utf-8"))
+    if state.get("schema_version") != 1:
+        raise ValueError("unsupported checkpoint schema")
+    for filename, expected in state.get("sha256", {}).items():
+        if _sha256(checkpoint / filename) != expected:
+            raise ValueError("checkpoint SHA256 mismatch")
+    epoch = int(state["last_completed_epoch"])
+    stage = stage_for_epoch(epoch)
+    if (
+        state.get("stage") != stage.name
+        or state.get("augmentation_profile") != stage.augmentation_profile
+    ):
+        raise ValueError("checkpoint stage metadata mismatch")
+    model_state = paddle.load(str(checkpoint / "model.pdparams"))
+    if set(model_state) != set(model.state_dict()):
+        raise ValueError("checkpoint model keys do not match CnnModel")
+    model.set_state_dict(model_state)
+    optimizer, configured_stage = build_optimizer(model, epoch)
+    optimizer.set_state_dict(paddle.load(str(checkpoint / "optimizer.pdopt")))
+    return LoadedTrainingCheckpoint(
+        checkpoint=checkpoint,
+        last_completed_epoch=epoch,
+        stage=configured_stage,
+        optimizer=optimizer,
+        sampler_state=dict(state.get("sampler_state", {})),
+        history=list(state.get("history", [])),
+    )

@@ -1,9 +1,13 @@
 import pytest
+import paddle
 
 from lane_training.model import CnnModel
 from lane_training.staged_action import (
+    build_optimizer,
     configure_stage,
+    load_training_checkpoint,
     optimizer_parameter_groups,
+    save_training_checkpoint,
     stage_for_epoch,
 )
 
@@ -59,3 +63,48 @@ def test_stage_configuration_uses_approved_layers_and_rate_multipliers():
     assert [group["learning_rate"] for group in optimizer_parameter_groups(
         model, full,
     )] == pytest.approx([0.1, 1.0])
+
+
+def test_training_checkpoint_round_trip_restores_complete_state(tmp_path):
+    model = CnnModel()
+    optimizer, stage = build_optimizer(model, epoch=21)
+    checkpoint = save_training_checkpoint(
+        tmp_path,
+        epoch=21,
+        model=model,
+        optimizer=optimizer,
+        stage=stage,
+        sampler_state={"base_seed": 20260817, "next_epoch": 22},
+        history=[{"epoch": 21, "train_loss": 0.2}],
+    )
+
+    restored = CnnModel()
+    result = load_training_checkpoint(checkpoint, restored)
+
+    assert result.last_completed_epoch == 21
+    assert result.next_epoch == 22
+    assert result.stage.name == "rear"
+    assert result.sampler_state == {"base_seed": 20260817, "next_epoch": 22}
+    assert result.history == [{"epoch": 21, "train_loss": 0.2}]
+    for name, value in model.state_dict().items():
+        assert paddle.allclose(value, restored.state_dict()[name])
+
+
+def test_training_checkpoint_rejects_corrupted_model(tmp_path):
+    model = CnnModel()
+    optimizer, stage = build_optimizer(model, epoch=20)
+    checkpoint = save_training_checkpoint(
+        tmp_path,
+        epoch=20,
+        model=model,
+        optimizer=optimizer,
+        stage=stage,
+        sampler_state={"next_epoch": 21},
+        history=[],
+    )
+    model_path = checkpoint / "model.pdparams"
+    with model_path.open("ab") as handle:
+        handle.write(b"corrupt")
+
+    with pytest.raises(ValueError, match="checkpoint SHA256 mismatch"):
+        load_training_checkpoint(checkpoint, CnnModel())
