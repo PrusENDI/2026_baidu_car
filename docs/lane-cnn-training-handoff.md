@@ -1264,3 +1264,32 @@ epoch 20 CV 最佳版
 两者动态/静态最大差异分别为 `3.58e-7` 和 `2.38e-7`，均使用 `kappa_action` profile。
 本轮未部署 Orin；下一步必须低速闭环对比十字路口误转、普通弯道、锐角、入弯减速和出弯恢复。
 本轮是基础入口的 20-epoch 候选训练，不替代上文仍待实现的 200-epoch 分层学习率/分组采样长训。
+
+### 20.11 固定赛道 200-epoch 长训实测结果（2026-08-18）
+
+本轮从原始 D4 重新开始，仅使用 CV 2822 帧与十字路口手柄 646 帧。manifest SHA256 为
+`fab8953b90515befa811574c37251efe1e3bf7a19422a70f2203b86780876758`，D4 SHA256 为
+`3398fc6b2d2be73d1ec7eed6f54f51f0be6e2b6c5814f255485d23442167cb49`。训练采用 CV 70%、
+手柄有效转向 15%、手柄零转向上下文 15%，batch 64、63 batches/epoch、曲率除以 5 的
+masked loss、曲率权重 2。
+
+阶段边界实测无误：epoch 1～20 为 head/clean，epoch 21～160 为 rear/mild photometric，
+epoch 161～200 为 full/clean；epoch 161 增强命中数为 0。epoch 200 CV 验证
+`speed_mae=0.0445`、`kappa_mae=0.3045`，完整 40 个评测报告和训练报告保存在
+`artifacts/cross_manual_long_20260817_remote/`。
+
+三角色候选为：`crossroad_best=epoch 55`（十字路口方向/召回 `1.000/1.000`，曲率 MAE
+`0.4494`）、`balanced=epoch 135`（方向/召回 `0.9865/0.9459`，误转率 `0.5385`）、
+`cv_preservation_best=epoch 200`（CV speed/kappa MAE `0.0445/0.3045`，十字路口曲率
+MAE `0.1806`）。候选均为 `selected=false`、`vehicle_test_performed=false`，未部署 Orin。
+
+导出归档 SHA256：
+
+```text
+epoch_0055_crossroad_best.tgz       1e9d5d4bc3636cc4bb237c730ba3a6e6545844e100d746a670fe15746a441d6c
+epoch_0135_balanced.tgz             626c0f090c028d666f3fe4e72d7ac8ea434cc0582168c5fadb3e95b913ab1b33
+epoch_0200_cv_preservation_best.tgz a882834db36193937a738900c51794a608c994014df4dcf2e3ce6b57089d8a52
+```
+
+三个候选动态/静态最大差异不超过 `4.77e-7`。最终放行仍需低速实车比较十字路口误转、
+普通弯道/锐角、入弯减速和出弯恢复；在此之前不宣布唯一最终模型，也不修改 `config_car.yml`。

@@ -2070,3 +2070,38 @@ epoch 20 的 CV 拟合和部分方向一致率更好，因此导出 epoch 10 平
 ```text
 artifacts/cross_manual_joint_20260817_remote/
 ```
+
+### 19.9 固定赛道 200-epoch 分阶段长训完成（2026-08-18）
+
+从 D4 重新开始，仅使用 2822 条 CV 与 646 条十字路口手柄训练帧。manifest SHA256 为
+`fab8953b90515befa811574c37251efe1e3bf7a19422a70f2203b86780876758`，D4 SHA256 为
+`3398fc6b2d2be73d1ec7eed6f54f51f0be6e2b6c5814f255485d23442167cb49`。训练采用 CV 70%、
+手柄有效转向 15%、手柄零转向上下文 15%，batch 64、63 batches/epoch、曲率除以 5 的
+masked loss、曲率权重 2。
+
+阶段边界实测无误：epoch 20 为 head/clean，epoch 21 切到 rear/mild photometric；epoch
+160 仍为 rear，epoch 161 切到 full/clean，学习率由 `5e-6/1e-6` 变为 `2e-6/2e-7`。
+epoch 161 增强命中数为 0，epoch 200 训练完成并生成完整 checkpoint。训练过程中未出现非
+有限 loss，epoch 2 的独立进程恢复 smoke 也已验证。
+
+40 个 checkpoint 评测均已下载至：
+
+```text
+artifacts/cross_manual_long_20260817_remote/
+```
+
+最终三角色为：十字路口最佳 epoch 55（direction/active recall `1.0000/1.0000`，曲率
+MAE `0.4494`）；折中版 epoch 135（direction/active recall `0.9865/0.9459`，误转率
+`0.5385`）；CV 保持最佳 epoch 200（speed/kappa MAE `0.0445/0.3045`，十字路口曲率
+MAE `0.1806`）。`lap_002` 与官方手柄参考集仍只作独立风险参考，不能与 CV 误差混平均。
+
+导出归档 SHA256：
+
+```text
+epoch_0055_crossroad_best.tgz       1e9d5d4bc3636cc4bb237c730ba3a6e6545844e100d746a670fe15746a441d6c
+epoch_0135_balanced.tgz             626c0f090c028d666f3fe4e72d7ac8ea434cc0582168c5fadb3e95b913ab1b33
+epoch_0200_cv_preservation_best.tgz a882834db36193937a738900c51794a608c994014df4dcf2e3ce6b57089d8a52
+```
+
+三个候选均标记 `selected=false`，未部署 Orin；下一步只允许在低速实车闭环对比后由用户
+确认放行角色，训练容器正式输出仍保留，未删除 checkpoint。
