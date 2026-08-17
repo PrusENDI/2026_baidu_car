@@ -2020,3 +2020,53 @@ ssh_test.py     359d8fef27d47f268e0e8fc43160d65d9da5f176e766c60161a1aecbb436993d
 
 本次未在 Orin 上启动 `collect_data.py` 或执行实车控制，下一步需要以完整赛道 session 验证右锐角
 入口、683～684 等效阶段的方向保持、达到约 1.70 rad 后的释放以及是否出现新的过转。
+
+### 19.6 十字路口手柄纠正数据的最简联合训练标准（2026-08-17）
+
+手柄数据用于纠正 CV 自动采集在十字路口等局部路段的转向时，第一版采用分输出监督：CV
+样本使用 `target_mask=[1,1]` 同时监督 `speed_demand` 和 `kappa_action`；手柄样本使用
+`target_mask=[0,1]`，只监督曲率。手柄 `state[2]` 是手柄映射后发送给底盘的角速度命令，
+不是底盘实测反馈，曲率按 `state[2] / max(abs(state[0]), 0.12)` 换算，不得再次乘手柄比例。
+
+手柄样本的速度占位值不参与损失，但车端仍按模型输出的 `speed_demand` 经过速度曲线和真实
+`dt` 速度梯度计算 `actual_vx`，再按 `wz=actual_vx*kappa_action` 输出底盘命令。第一轮将
+CV 训练/验证数据与两组十字路口手柄数据联合训练，保持现有 `kappa_action` profile；若要让
+手柄图片直接监督速度，必须先为同一批图片生成可信速度标签，不能从其他 CV 图片复制。
+
+### 19.7 手柄参考验证集与 CV 问题集（2026-08-17）
+
+本轮验证不再把当前 CV 十字路口问题版本当作唯一金标准。验证按数据来源拆分：
+
+```text
+cv_val                 CV 验证集，检查原有速度和普通路线能力是否退化
+manual_lap002          C:\weizijian\documents\baidu car\lane_sessions2\lane_sessions2\lap_002
+manual_official        C:\weizijian\documents\baidu car\offical-line-test
+cross_cv_problem       当前 CV 十字路口问题集，仅作误转改善诊断
+```
+
+`lap_002` 是手柄原始 `state=[vx,vy,wz]` 数据，验证只统计曲率方向、幅值、起转时序、
+持续时间和整段冲量，不统计速度 MAE。官方目录实际名称为 `offical-line-test`；其中的
+`image_set_lane (1).zip` 与 `image_set_lane_eval (1).zip` 必须先在独立目录解压，并转换为
+统一的图像/手柄 `data.json` 后才能进入同一评估入口。原始 zip 保持不变。
+
+训练划分保持不变：CV 训练数据和两组十字路口手柄数据为 `train`，CV 验证数据为 `val`；
+`lap_002`、官方手柄数据分别作为独立验证 manifest，不能混入训练或与 CV 问题集混合平均。
+最终放行同时检查 `cv_val` 无明显退化、两组手柄参考集转向方向正确、CV 十字路口误转减少，
+以及车端后处理后的 `actual_vx/wz`、入路口减速和出弯恢复。
+
+### 19.8 首轮联合训练执行记录（2026-08-17）
+
+已在新 RTX 4080 SUPER 容器完成首轮 20-epoch 联合训练。用户指出原 863 条 CV 数据相对
+646 条手柄样本过少后，训练在 smoke 前暂停并重新划分：最终使用 2822 条 CV 训练样本
+（完整训练圈、截断到 867 的有效圈、两组弯道和一组锐角连续弯）及 646 条十字路口手柄
+样本，另保留 868 条 CV 验证样本。三个手柄参考集均保持独立，不进入训练。
+
+训练前补齐 `kappa_action/5.0` masked loss，并为固定赛道 action 训练关闭水平翻转；本地和
+远端聚焦测试均为 16 项通过。epoch 20 的 CV 验证为
+`speed_mae=0.0666`、`kappa_mae=0.2652`。手柄参考集显示 epoch 10 的曲率 MAE 更优，
+epoch 20 的 CV 拟合和部分方向一致率更好，因此导出 epoch 10 平衡版和 epoch 20 CV 最佳版
+两个候选，尚未部署 Orin。完整报告位于：
+
+```text
+artifacts/cross_manual_joint_20260817_remote/
+```

@@ -1019,7 +1019,45 @@ horizontal flip    = [speed_demand, -kappa_action]
 
 ### 20.7 第一版固定赛道长训方案（2026-08-17）
 
-第一版只执行一条训练路线，不做随机初始化、手柄混训或其他对照实验。赛道完全固定，
+### 20.8 最简 CV+手柄联合训练方案（2026-08-17）
+
+当手柄数据用于纠正 CV 自动采集在十字路口等局部路段的转向时，第一版采用分输出监督，
+不把手柄采集时的低速命令误当成速度策略：
+
+```text
+CV 样本：      speed_demand + kappa_action，target_mask=[1,1]
+手柄样本：     仅 kappa_action，target_mask=[0,1]
+```
+
+手柄 `data.json` 的 `state=[vx_command, vy_command, wz_command]` 是手柄映射后发送给底盘的
+命令，不是底盘实测反馈。其曲率标签统一计算为：
+
+```text
+kappa_action = wz_command / max(abs(vx_command), 0.12)
+```
+
+不得再次乘手柄映射比例，也不得把手柄 `vx_command` 直接作为 `speed_demand` 标签。手柄
+样本的 `speed_demand=0` 仅为占位值，必须由 mask 排除速度损失。
+
+联合训练仍输出 `[speed_demand, kappa_action]`。手柄样本只通过曲率损失纠正十字路口转向，
+而车端仍完整执行速度后处理：
+
+```text
+CNN speed_demand -> speed_curve -> target_vx
+                 -> real-dt slew -> actual_vx
+CNN kappa_action -> wz = actual_vx * kappa_action
+```
+
+因此，手柄数据不直接提供新的速度策略，但不会绕过速度计算；十字路口最终速度仍由模型
+预测的 `speed_demand` 和车端真实时间速度梯度决定。
+
+第一轮最简数据组合为：CV 训练/验证数据加上两组十字路口手柄数据作为训练样本。训练前应
+从 D4 或现有 action checkpoint 初始化，保持网络输出和 `kappa_action` 车端 profile 不变。
+验收至少检查普通 CV 验证集是否退化、十字路口误转是否减少、`wz` 符号/幅值是否正确，
+以及十字路口前后的减速和出弯恢复是否仍正常。若需要让手柄图片直接监督速度，必须先对
+同一批手柄图片生成可信的 `speed_demand` 标签，不能从其他 CV 图片按帧复制速度标签。
+
+第一版只执行一条训练路线，不做随机初始化或其他对照实验；手柄数据仅按本节的曲率纠正规则加入。赛道完全固定，
 允许模型针对当前场地过拟合；训练目标是复现当前 CV 教师在固定赛道上的完整速度和曲率
 动作，而不是追求跨赛道泛化。
 
@@ -1032,7 +1070,7 @@ horizontal flip    = [speed_demand, -kappa_action]
 训练数据            新采集 CV 数据
 旧 D4/官方训练图片   不加入
 D4 teacher loss     关闭
-手柄数据            第一版不加入
+手柄数据            两组十字路口手柄数据，仅监督 kappa_action
 训练 mask           CV 全部为 [1.0, 1.0]
 模型输出            [speed_demand, kappa_action]
 ```
@@ -1043,6 +1081,34 @@ D4 teacher loss     关闭
 训练集：完整圈 1 + 完整圈 2 + 全部弯道专项 session
 验证集：完整圈 3
 ```
+
+### 20.9 手柄参考验证集与 CV 问题集划分（2026-08-17）
+
+当前十字路口 CV 验证数据来自转向仍有问题的 CV 自动采集版本，不能单独作为“正确答案”。
+训练完成后必须把验证拆成以下角色：
+
+```text
+cv_val                 当前 CV 验证集；检查原有 CV 速度/普通路线是否退化
+manual_lap002          lane_sessions2/lane_sessions2/lap_002；手柄正确转向参考
+manual_official        offical-line-test；官方手柄正确转向参考
+cross_cv_problem       当前 CV 十字路口问题集；只用于诊断误转改善，不作为唯一金标准
+```
+
+`manual_lap002` 使用原始 `data.json`，其手柄 `vx=0.1` 仍只用于派生
+`kappa_action=wz/max(abs(vx),0.12)`，验证时只统计曲率指标，不统计速度误差。
+`manual_official` 当前实际目录名为 `offical-line-test`（单个连字符），目录中是
+`image_set_lane (1).zip` 和 `image_set_lane_eval (1).zip`，不是可直接加载的 action
+session。必须先解压到独立目录并确认/转换为包含 `img_path`、`state=[vx,vy,wz]` 的
+统一 `data.json`；不得覆盖原始 zip 或把只有图片的旧标签直接当作手柄速度标签。
+
+第一轮训练 manifest 仍只把 CV 训练集和两组十字路口手柄数据标为 `train`，CV 验证集标为
+`val`。`lap_002` 和官方手柄数据不参与训练，分别生成独立验证 manifest（或使用独立 split）
+后调用同一个 action evaluator，避免把不同验证来源混成一个平均数。
+
+放行必须同时满足：普通 `cv_val` 速度策略无明显退化；`manual_lap002` 和
+`manual_official` 的转向方向正确、起转时序和持续时间合理；`cross_cv_problem` 的错误
+转向减少；并在车端后处理后检查 `actual_vx`、`wz`、十字路口前减速和出弯恢复。手柄验证
+只约束 `kappa_action`，不能因为手柄低速命令而改变 CNN 的速度策略。
 
 禁止把第三圈相邻帧随机拆回训练集。这里保留完整验证圈不是为了测跨赛道泛化，而是为了
 选择 checkpoint，并检查模型是否学到可重复的固定赛道动作，而不是某一圈的控制抖动。
@@ -1136,13 +1202,65 @@ Hue/颜色旋转    关闭
 
 #### 训练器实施门槛
 
-当前已验证的 action smoke 入口支持双输出、mask、评测和导出，但仍是全网络统一学习率、
-均匀采样、未做曲率尺度归一化的基础版本。正式长训开始前必须补齐并测试：
+当前 action 入口已支持双输出、mask、`kappa_action/5.0` 归一化、固定赛道关闭水平翻转、
+评测和导出，但仍是全网络统一学习率和均匀采样的基础版本。正式长训开始前必须补齐并测试：
 
 1. 三阶段冻结/解冻；
 2. 输出头与卷积层分层学习率；
 3. 完整圈与弯道专项的 60/40 分组采样；
-4. `kappa_action / 5.0` 的归一化 masked loss；
+4. `kappa_action / 5.0` 的归一化 masked loss（已完成）；
 5. 每 5 epochs checkpoint 及完整验证圈逐段报告。
 
 在这些能力完成前，只能运行 smoke 验证，不能直接把当前基础入口用于 200-epoch 正式训练。
+
+### 20.10 首轮 20-epoch CV+手柄联合训练结果（2026-08-17）
+
+新容器为 `connect.bjb1.seetacloud.com:43447`，GPU 为 RTX 4080 SUPER 32 GB，使用
+`/root/autodl-tmp/envs/lane-d5/bin/python`、Paddle 3.3.1。远端独立目录为：
+
+```text
+/root/autodl-tmp/lane-cnn/run-20260817-cross-manual
+```
+
+正式训练没有使用最初过小的 863 CV + 646 手柄组合。最终训练集为：
+
+```text
+CV 训练集1                                      863
+CV 可用圈 0～867                                868
+CV 弯道                                          490
+CV 锐角连续弯                                    220
+CV 弯道                                          381
+CV 合计                                         2822
+十字路口手柄 1+2                                 646
+训练合计                                        3468
+CV 独立验证                                      868
+```
+
+其中 CV 训练数据有 2045 帧满足 `abs(kappa_action)>=0.05`；手柄样本占训练样本约
+18.6%。`或许可以用`、`先不要用` 和两个 `不可用` session 均未加入。手柄 mask 为
+`[0,1]`，CV mask 为 `[1,1]`。训练前按 TDD 修正了两项基础入口：曲率先除以 5.0 再计算
+Smooth L1；action 固定赛道训练显式设置水平翻转概率为 0。聚焦测试远端 16 项全部通过。
+
+本轮从真实 D4（SHA256 `3398fc6b2d2be73d1ec7eed6f54f51f0be6e2b6c5814f255485d23442167cb49`）
+初始化，训练 20 epochs、batch 64、学习率 `1e-5`、曲率权重 2。CV 验证从 epoch 1 的
+`speed_mae=0.2161/kappa_mae=1.0040` 改善到 epoch 20 的
+`speed_mae=0.0666/kappa_mae=0.2652`。
+
+独立手柄验证显示 checkpoint 存在权衡：epoch 10 在 `lap_002`、官方训练参考集、官方 eval
+上的曲率 MAE 分别约为 `0.562/0.479/0.478`，优于 epoch 20 的
+`0.628/0.624/0.638`；epoch 20 的 CV 指标与部分方向一致率更好，但零转向帧误转率更高。
+因此没有仅按 CV 平均 MAE宣布唯一最终模型，而是导出两个候选：
+
+```text
+epoch 10 平衡版
+  artifacts/cross_manual_joint_20260817_remote/export_epoch10_balanced.tgz
+  SHA256 51b2232c72409dc66fbd01ab678ddfb577a0c95766f121a3572da8ac54295fe8
+
+epoch 20 CV 最佳版
+  artifacts/cross_manual_joint_20260817_remote/export_epoch20_cv_best.tgz
+  SHA256 19b030ae83716614d2bec831d30fee887e5257227a02da1aaca3da924fecb10f
+```
+
+两者动态/静态最大差异分别为 `3.58e-7` 和 `2.38e-7`，均使用 `kappa_action` profile。
+本轮未部署 Orin；下一步必须低速闭环对比十字路口误转、普通弯道、锐角、入弯减速和出弯恢复。
+本轮是基础入口的 20-epoch 候选训练，不替代上文仍待实现的 200-epoch 分层学习率/分组采样长训。
