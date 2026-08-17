@@ -52,6 +52,8 @@ def parse_args(argv=None):
     parser.add_argument("--expected-cv", type=int, default=2822)
     parser.add_argument("--expected-manual-active", type=int, default=74)
     parser.add_argument("--expected-manual-context", type=int, default=572)
+    parser.add_argument("--eval-set", action="append", default=[])
+    parser.add_argument("--evaluation-output", type=Path)
     return parser.parse_args(argv)
 
 
@@ -115,6 +117,8 @@ def _train(
     expected_cv: int = 2822,
     expected_manual_active: int = 74,
     expected_manual_context: int = 572,
+    eval_set: list[str] | None = None,
+    evaluation_output: Path | None = None,
 ) -> Path:
     if (initial_checkpoint is None) == (resume is None):
         raise ValueError("provide exactly one of initial_checkpoint or resume")
@@ -122,6 +126,8 @@ def _train(
         raise ValueError("invalid epoch limit")
     if checkpoint_interval < 1 or kappa_weight <= 0:
         raise ValueError("invalid training configuration")
+    if bool(eval_set) != (evaluation_output is not None):
+        raise ValueError("eval_set and evaluation_output must be provided together")
     if resume is None and output.exists():
         raise FileExistsError(f"output already exists: {output}")
     if resume is not None and not output.is_dir():
@@ -261,7 +267,7 @@ def _train(
         }
         history.append(entry)
         if save_now:
-            save_training_checkpoint(
+            saved_checkpoint = save_training_checkpoint(
                 checkpoint_root,
                 epoch=epoch,
                 model=model,
@@ -270,6 +276,43 @@ def _train(
                 sampler_state={"base_seed": seed, "next_epoch": epoch + 1},
                 history=history,
             )
+            if eval_set and epoch % checkpoint_interval == 0:
+                from tools.lane_training.evaluate_fixed_track_long import (
+                    append_evaluation_index,
+                    evaluate_checkpoint,
+                    parse_set_spec,
+                    write_evaluation_report,
+                )
+
+                parsed_sets = [parse_set_spec(value) for value in eval_set]
+                evaluation_sets = {
+                    name: (path, selector)
+                    for name, path, selector in parsed_sets
+                }
+                if len(evaluation_sets) != len(parsed_sets):
+                    raise ValueError("duplicate evaluation set name")
+                evaluation = evaluate_checkpoint(
+                    saved_checkpoint,
+                    evaluation_sets,
+                    device=device,
+                    batch_size=batch_size,
+                )
+                evaluation_path = write_evaluation_report(
+                    evaluation, evaluation_output,
+                )
+                append_evaluation_index(
+                    evaluation, evaluation_path, evaluation_output,
+                )
+                entry["evaluation_report"] = str(evaluation_path)
+                state_path = saved_checkpoint / "state.json"
+                checkpoint_state = json.loads(
+                    state_path.read_text(encoding="utf-8")
+                )
+                checkpoint_state["history"] = history
+                state_path.write_text(
+                    json.dumps(checkpoint_state, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
         _write_json_atomic(output / "training_report.json", report)
     return output
 

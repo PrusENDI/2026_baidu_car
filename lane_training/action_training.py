@@ -27,12 +27,18 @@ def _batch(dataset, indices, batch_size):
     if images: yield paddle.to_tensor(np.stack(images)), paddle.to_tensor(np.stack(targets)), paddle.to_tensor(np.stack(masks))
 
 
-def evaluate_model(model, rows: list[dict], *, batch_size=64):
+def predict_action(model, rows: list[dict], *, batch_size=64):
     dataset = LaneDataset(rows, training=False, return_target_mask=True); predictions=[]; targets=[]; masks=[]; model.eval()
     with paddle.no_grad():
         for images, target, mask in _batch(dataset, range(len(dataset)), batch_size):
             predictions.append(model(images).numpy()); targets.append(target.numpy()); masks.append(mask.numpy())
-    prediction, target, mask = np.concatenate(predictions), np.concatenate(targets), np.concatenate(masks); valid=mask.sum(axis=0)
+    if not predictions:
+        raise ValueError("cannot predict an empty action row set")
+    return np.concatenate(predictions), np.concatenate(targets), np.concatenate(masks)
+
+
+def evaluate_model(model, rows: list[dict], *, batch_size=64):
+    prediction, target, mask = predict_action(model, rows, batch_size=batch_size); valid=mask.sum(axis=0)
     mae=np.divide((np.abs(prediction-target)*mask).sum(axis=0), np.maximum(valid, 1e-6))
     mae=np.where(valid > 0, mae, np.nan)
     return {"count":len(rows),"valid_speed":int(valid[0]),"valid_kappa":int(valid[1]),"speed_mae":None if valid[0] == 0 else float(mae[0]),"kappa_mae":None if valid[1] == 0 else float(mae[1]),"masked_mae":float(np.sum(np.abs(prediction-target)*mask)/max(mask.sum(),1e-6))}

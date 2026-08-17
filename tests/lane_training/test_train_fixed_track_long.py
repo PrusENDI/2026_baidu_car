@@ -65,6 +65,9 @@ def test_one_epoch_cpu_training_writes_complete_report_and_checkpoint(tmp_path):
         expected_cv=2,
         expected_manual_active=1,
         expected_manual_context=1,
+        checkpoint_interval=1,
+        eval_set=[f"cross_train={manifest}:train_manual"],
+        evaluation_output=output / "evaluations",
     )
 
     assert (output / "checkpoints/epoch_0001/model.pdparams").is_file()
@@ -76,6 +79,7 @@ def test_one_epoch_cpu_training_writes_complete_report_and_checkpoint(tmp_path):
     assert report["history"][0]["stage"] == "head"
     assert report["history"][0]["valid_speed"] > 0
     assert report["history"][0]["valid_kappa"] > 0
+    assert (output / "evaluations/epoch_0001.json").is_file()
 
     train(
         manifest=manifest,
@@ -87,6 +91,10 @@ def test_one_epoch_cpu_training_writes_complete_report_and_checkpoint(tmp_path):
         expected_cv=2,
         expected_manual_active=1,
         expected_manual_context=1,
+        checkpoint_interval=1,
+        eval_set=[f"cross_train={manifest}:train_manual"],
+        evaluation_output=output / "evaluations",
     )
     resumed = json.loads((output / "training_report.json").read_text())
     assert [item["epoch"] for item in resumed["history"]] == [1, 2]
+    assert (output / "evaluations/epoch_0002.json").is_file()
