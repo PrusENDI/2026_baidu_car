@@ -36,6 +36,7 @@ from smartcar.paddlebaidu.ernie_bot import (
     OrderPrompt,
 )
 from smartcar.whalesbot.tools import CountRecord, get_yaml, IndexWrap
+from smartcar.whalesbot.tools.curvature_control import CurvatureSpeedController
 import sys
 from typing import List
 import re
@@ -461,6 +462,24 @@ class MyCar(MecanumDriver):
         # self.det_pid = DetPidCal(**cfg['det_pid'])
         self.lane_pid = PidCal2(**cfg["lane_pid"])
         self.det_pid = PidCal2(**cfg["det_pid"])
+        lane_control = cfg.get("lane_control", {})
+        self.lane_control_profile = lane_control.get("profile", "legacy_error")
+        if self.lane_control_profile not in {"legacy_error", "kappa_action"}:
+            raise ValueError(
+                "lane_control.profile must be legacy_error or kappa_action")
+        self.lane_curvature_control = CurvatureSpeedController(
+            max_speed=lane_control.get("max_forward_speed", 0.30),
+            min_speed=lane_control.get("min_forward_speed", 0.12),
+            full_turn_curvature=lane_control.get(
+                "full_turn_curvature_m_inv", 5.0),
+            speed_exponent=lane_control.get("speed_curve_exponent", 1.5),
+            deceleration_rate=lane_control.get(
+                "max_deceleration_mps2", 0.194),
+            acceleration_rate=lane_control.get(
+                "max_acceleration_mps2", 0.129),
+            max_angular_speed=lane_control.get("max_angular_speed", 1.50),
+            fallback_dt=lane_control.get("fallback_dt_s", 0.05),
+        )
 
     def camera_init(self, cfg):
         """
@@ -1037,21 +1056,36 @@ class MyCar(MecanumDriver):
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
         # 处理巡线相关逻辑。
+        self.lane_curvature_control.reset()
+        previous_control_time = time.monotonic()
         while True:
             if self._stop_flag:
                 return
 
-            error_y, error_angle = self.get_lane_results()
-            y_speed, angle_speed = self.lane_pid.get_out(-error_y, -error_angle)
-            if CROP:
-                # 按模型原始角度误差连续降速。
-                speed_max = 0.3
-                speed_min = 0.18
-                full_turn_error = 0.39
-                turn_ratio = min(abs(error_angle) / full_turn_error, 1.0)
-                speed = speed_max - (speed_max - speed_min) * turn_ratio
+            first_output, second_output = self.get_lane_results()
+            now = time.monotonic()
+            dt_s = now - previous_control_time
+            previous_control_time = now
+            if self.lane_control_profile == "kappa_action":
+                speed_demand = first_output
+                kappa_action = second_output
+                speed, _, angle_speed, _ = self.lane_curvature_control.command(
+                    kappa_action, dt_s=dt_s, speed_demand=speed_demand)
+                y_speed = 0.0
             else:
-                speed = 0.1
+                error_y = first_output
+                error_angle = second_output
+                y_speed, angle_speed = self.lane_pid.get_out(
+                    -error_y, -error_angle)
+                if CROP:
+                    # 按模型原始角度误差连续降速。
+                    speed_max = 0.3
+                    speed_min = 0.18
+                    full_turn_error = 0.39
+                    turn_ratio = min(abs(error_angle) / full_turn_error, 1.0)
+                    speed = speed_max - (speed_max - speed_min) * turn_ratio
+                else:
+                    speed = 0.1
             self.set_velocity(speed, y_speed, angle_speed)
             if end_fuction():
                 break
@@ -1657,7 +1691,10 @@ class MyCar(MecanumDriver):
         res = self.crusie(image)
         error, angle = res[0], res[1]
         # 绘制标签
-        label_text = f"d_e: {error:7.5f} d_a:{angle:7.5f}"
+        if self.lane_control_profile == "kappa_action":
+            label_text = f"speed_demand:{error:7.5f} kappa:{angle:7.5f}"
+        else:
+            label_text = f"d_e: {error:7.5f} d_a:{angle:7.5f}"
 
         cv2.putText(
             image,

@@ -12,6 +12,7 @@ from smartcar.whalesbot.tools.lane_collect import (
     LaneAnalysisResult,
 )
 from smartcar.whalesbot.tools.lane_collect.ssh_test import OpenCVLaneSshTest
+from smartcar.whalesbot.tools.curvature_control import CurvatureSpeedController
 
 
 def analysis(valid=True, lateral=0.25, heading=1.0, reason=None, metrics=None):
@@ -59,15 +60,26 @@ class FakeCar:
 
 
 class CvLanePidControllerTests(unittest.TestCase):
+    def test_cnn_speed_demand_is_independent_from_action_curvature(self):
+        controller = CurvatureSpeedController(
+            max_speed=0.30, min_speed=0.12,
+            deceleration_rate=0.0, acceleration_rate=0.0)
+        vx, vy, wz, target = controller.command(
+            0.5, speed_demand=1.0, dt_s=0.05)
+        self.assertAlmostEqual(target, 0.12)
+        self.assertAlmostEqual(vx, 0.12)
+        self.assertEqual(vy, 0.0)
+        self.assertAlmostEqual(wz, vx * 0.5)
+
     def test_launch_guard_default_is_fifteen_centimetres(self):
         self.assertAlmostEqual(
             CvLanePidConfig().initial_straight_distance_m, 0.15)
 
     def test_pure_pursuit_converts_curvature_to_yaw_rate(self):
         controller = CvLanePidController(CvLanePidConfig(
-            steering_mode="pure_pursuit", max_heading_step=0.0,
-            pure_pursuit_entry_step=0.0, max_heading_release_step=0.0,
-            max_deceleration_step=0.0))
+            steering_mode="pure_pursuit", max_heading_rate=0.0,
+            pure_pursuit_entry_rate=0.0, max_heading_release_rate=0.0,
+            max_deceleration_mps2=0.0))
         result = analysis(heading=0.0, metrics={
             "pure_pursuit_curvature_m_inv": 2.0,
         })
@@ -83,8 +95,8 @@ class CvLanePidControllerTests(unittest.TestCase):
     def test_pure_pursuit_builds_turn_faster_than_it_releases(self):
         controller = CvLanePidController(CvLanePidConfig(
             steering_mode="pure_pursuit", max_forward_speed=0.20,
-            min_forward_speed=0.20, pure_pursuit_entry_step=0.10,
-            max_heading_release_step=0.04))
+            min_forward_speed=0.20, pure_pursuit_entry_rate=2.0,
+            max_heading_release_rate=0.8))
         bend = analysis(heading=0.0, metrics={
             "pure_pursuit_curvature_m_inv": 5.0,
         })
@@ -101,9 +113,9 @@ class CvLanePidControllerTests(unittest.TestCase):
     def test_pure_pursuit_reverses_faster_than_same_direction_release(self):
         controller = CvLanePidController(CvLanePidConfig(
             steering_mode="pure_pursuit", max_forward_speed=0.20,
-            min_forward_speed=0.20, pure_pursuit_entry_step=0.10,
-            max_heading_release_step=0.04,
-            max_heading_reverse_step=0.10))
+            min_forward_speed=0.20, pure_pursuit_entry_rate=2.0,
+            max_heading_release_rate=0.8,
+            max_heading_reverse_rate=2.0))
         right = analysis(heading=0.0, metrics={
             "pure_pursuit_curvature_m_inv": 5.0,
         })
@@ -118,7 +130,7 @@ class CvLanePidControllerTests(unittest.TestCase):
     def test_right_turn_geometric_command_bypasses_frame_slew(self):
         controller = CvLanePidController(CvLanePidConfig(
             steering_mode="pure_pursuit", max_forward_speed=0.20,
-            min_forward_speed=0.20, pure_pursuit_entry_step=0.10))
+            min_forward_speed=0.20, pure_pursuit_entry_rate=2.0))
         result = analysis(heading=0.0, metrics={
             "pure_pursuit_curvature_m_inv": -6.0,
             "route_right_turn_override": True,
@@ -154,16 +166,22 @@ class CvLanePidControllerTests(unittest.TestCase):
 
     def test_bend_deceleration_is_faster_than_exit_acceleration(self):
         controller = CvLanePidController()
-        straight = controller.compute(analysis(heading=0.0))
-        bend = controller.compute(analysis(heading=1.0))
-        exit_command = controller.compute(analysis(heading=0.0))
+        real_car_dt = 0.07741451263427734
+        straight = controller.compute(analysis(heading=0.0), dt_s=real_car_dt)
+        bend = controller.compute(analysis(heading=1.0), dt_s=real_car_dt)
+        exit_command = controller.compute(
+            analysis(heading=0.0), dt_s=real_car_dt)
         self.assertAlmostEqual(
-            straight.forward_speed - bend.forward_speed, 0.015, places=6)
+            straight.forward_speed - bend.forward_speed,
+            controller.config.max_deceleration_mps2 * real_car_dt,
+            places=6)
         self.assertAlmostEqual(
-            exit_command.forward_speed - bend.forward_speed, 0.010, places=6)
+            exit_command.forward_speed - bend.forward_speed,
+            controller.config.max_acceleration_mps2 * real_car_dt,
+            places=6)
 
     def test_pid_keeps_single_frame_labels_while_vy_is_disabled(self):
-        controller = CvLanePidController(CvLanePidConfig(max_heading_step=0.0))
+        controller = CvLanePidController(CvLanePidConfig(max_heading_rate=0.0))
         command = controller.compute(analysis(lateral=0.05, heading=-0.10))
         self.assertTrue(command.valid)
         self.assertAlmostEqual(command.error_y, 0.05, places=6)
@@ -173,7 +191,7 @@ class CvLanePidControllerTests(unittest.TestCase):
         self.assertEqual(command.reason, "ipm_lane_pid")
 
     def test_heading_output_is_limited(self):
-        controller = CvLanePidController(CvLanePidConfig(max_heading_step=0.0))
+        controller = CvLanePidController(CvLanePidConfig(max_heading_rate=0.0))
         command = controller.compute(analysis(heading=10.0))
         self.assertLessEqual(abs(command.angular_speed), 1.50)
 
@@ -235,18 +253,26 @@ class OpenCVLaneSshTestTests(unittest.TestCase):
             self.assertIn("control_reason", records[0])
             self.assertIn("steering_demand", records[0])
             self.assertIn("target_forward_speed", records[0])
-            self.assertNotEqual(records[0]["state"], records[0]["control"])
-            self.assertEqual(records[0]["state"][1], records[0]["cv"]["error_y"])
-            curvature = records[0]["cv"]["metrics"][
-                "pure_pursuit_curvature_m_inv"]
+            self.assertEqual(records[0]["state"], records[0]["control"])
+            self.assertEqual(
+                records[0]["model_target"]["speed_demand"],
+                records[0]["steering_demand"])
             self.assertAlmostEqual(
-                -records[0]["state"][2] * 1.95,
-                records[0]["target_forward_speed"] * curvature,
+                records[0]["model_target"]["kappa_action"],
+                records[0]["control"][2] /
+                max(abs(records[0]["control"][0]), 0.12),
                 places=6)
+            self.assertEqual(records[0]["target_mask"], [1.0, 1.0])
+            self.assertEqual(
+                records[0]["legacy_pid_state"][1],
+                records[0]["cv"]["error_y"])
             self.assertEqual(
                 metadata["state_fields"],
-                ["forward_speed", "error_y", "error_angle"],
+                ["forward_speed", "lateral_speed", "angular_speed"],
             )
+            self.assertEqual(
+                metadata["model_output_fields"],
+                ["speed_demand", "kappa_action"])
             self.assertTrue(metadata["usable_for_training"])
             self.assertEqual(
                 metadata["controller"]["max_forward_speed"], 0.30)

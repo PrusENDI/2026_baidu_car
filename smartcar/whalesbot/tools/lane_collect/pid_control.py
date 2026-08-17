@@ -7,6 +7,7 @@ import numpy as np
 
 from ..tools_class import PID
 from .opencv_lane import LaneAnalysisResult
+from ..curvature_control import finite_dt
 
 
 @dataclass(frozen=True)
@@ -21,8 +22,11 @@ class CvLanePidConfig:
     full_turn_reference: float = 0.60
     full_turn_curvature_m_inv: float = 5.0
     speed_curve_exponent: float = 1.5
-    max_deceleration_step: float = 0.015
-    max_acceleration_step: float = 0.010
+    # Calibrated from the successful 2026-08-16 real-car session whose
+    # median control interval was 77.4 ms.  These preserve the physical
+    # rates of the former 0.015/0.010 m/s-per-frame limits.
+    max_deceleration_mps2: float = 0.194
+    max_acceleration_mps2: float = 0.129
     control_period_s: float = 0.05
     lateral_kp: float = 6.0
     lateral_ki: float = 0.0
@@ -35,12 +39,12 @@ class CvLanePidConfig:
     lateral_limit: float = 0.0
     heading_limit: float = 1.50
     pure_pursuit_gain: float = 1.0
-    max_heading_step: float = 0.04
-    pure_pursuit_entry_step: float = 0.10
-    max_heading_release_step: float = 0.04
+    max_heading_rate: float = 0.52
+    pure_pursuit_entry_rate: float = 1.29
+    max_heading_release_rate: float = 0.52
     # Release an obsolete turn direction promptly without changing the
     # smoother same-direction decay used by ordinary bends.
-    max_heading_reverse_step: float = 0.10
+    max_heading_reverse_rate: float = 1.29
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,7 @@ class CvLaneControlCommand:
     reason: str = ""
     steering_demand: float = 0.0
     target_forward_speed: float = 0.0
+    action_curvature: float = 0.0
 
     def to_record(self) -> Dict[str, float]:
         return {
@@ -66,6 +71,7 @@ class CvLaneControlCommand:
             "reason": self.reason,
             "steering_demand": float(self.steering_demand),
             "target_forward_speed": float(self.target_forward_speed),
+            "action_curvature": float(self.action_curvature),
         }
 
 
@@ -98,7 +104,7 @@ class CvLanePidController:
         self._last_forward_speed = None
 
     def compute(self, result: LaneAnalysisResult,
-                distance_m=None) -> CvLaneControlCommand:
+                distance_m=None, dt_s=None) -> CvLaneControlCommand:
         del distance_m
         if (not result.valid or result.error_y is None or
                 result.error_angle is None or
@@ -112,27 +118,28 @@ class CvLanePidController:
         # by the CNN.  All temporal smoothing is kept after this boundary.
         error_y = float(result.error_y)
         if self.config.steering_mode == "pure_pursuit":
-            return self._compute_pure_pursuit(result, error_y)
+            return self._compute_pure_pursuit(result, error_y, dt_s)
         if self.config.steering_mode != "heading_pid":
             return CvLaneControlCommand(
                 False, 0.0, 0.0, 0.0, 0.0, 0.0,
                 f"unknown steering mode: {self.config.steering_mode}")
         error_angle = float(result.error_angle)
         steering_demand, target_forward_speed = self._speed_target(error_angle)
-        forward_speed = self._apply_speed_slew(target_forward_speed)
+        forward_speed = self._apply_speed_slew(target_forward_speed, dt_s)
 
         # Keep the same sign convention and control sequence as lane_base():
         # controller.get_out(-error_y, -error_angle).
-        dt = max(float(self.config.control_period_s), 1e-6)
+        dt = finite_dt(dt_s, self.config.control_period_s)
         lateral_speed = float(self.pid_y(-error_y, dt=dt))
         requested_heading = float(self.pid_angle(-error_angle, dt=dt))
-        requested_heading = self._apply_heading_slew(requested_heading)
+        requested_heading = self._apply_heading_slew(requested_heading, dt_s=dt_s)
         return CvLaneControlCommand(
             True, forward_speed, lateral_speed,
             requested_heading, error_y, error_angle,
-            "ipm_lane_pid", steering_demand, target_forward_speed)
+            "ipm_lane_pid", steering_demand, target_forward_speed,
+            requested_heading / max(abs(forward_speed), 0.12))
 
-    def _compute_pure_pursuit(self, result, error_y):
+    def _compute_pure_pursuit(self, result, error_y, dt_s=None):
         curvature = result.metrics.get("pure_pursuit_curvature_m_inv")
         if curvature is None or not np.isfinite(curvature):
             return CvLaneControlCommand(
@@ -146,7 +153,7 @@ class CvLanePidController:
         reference = max(float(self.config.full_turn_curvature_m_inv), 1e-6)
         demand = float(np.clip(abs(curvature) / reference, 0.0, 1.0))
         target_forward_speed = self._speed_target_from_demand(demand)
-        forward_speed = self._apply_speed_slew(target_forward_speed)
+        forward_speed = self._apply_speed_slew(target_forward_speed, dt_s)
         requested_heading = float(np.clip(
             forward_speed * curvature,
             -float(self.config.heading_limit),
@@ -159,7 +166,8 @@ class CvLanePidController:
         else:
             requested_heading = self._apply_heading_slew(
                 requested_heading,
-                entry_step=self.config.pure_pursuit_entry_step)
+                entry_rate=self.config.pure_pursuit_entry_rate,
+                dt_s=dt_s)
 
         # Preserve the existing CNN/PID contract.  This label is the
         # single-frame equivalent input which the P-only heading controller
@@ -170,12 +178,13 @@ class CvLanePidController:
             -float(self.config.heading_limit),
             float(self.config.heading_limit)))
         error_angle = -label_wz / heading_kp
-        dt = max(float(self.config.control_period_s), 1e-6)
+        dt = finite_dt(dt_s, self.config.control_period_s)
         lateral_speed = float(self.pid_y(-error_y, dt=dt))
         return CvLaneControlCommand(
             True, forward_speed, lateral_speed, requested_heading,
             error_y, error_angle, reason, demand,
-            target_forward_speed)
+            target_forward_speed,
+            requested_heading / max(abs(forward_speed), 0.12))
 
     def _speed_target(self, error_angle):
         """Map current steering demand to a bounded forward-speed target."""
@@ -196,8 +205,8 @@ class CvLanePidController:
         target = minimum + (maximum - minimum) * ((1.0 - demand) ** exponent)
         return float(np.clip(target, minimum, maximum))
 
-    def _apply_heading_slew(self, requested, entry_step=None,
-                            reverse_step=None):
+    def _apply_heading_slew(self, requested, entry_rate=None,
+                            reverse_rate=None, dt_s=None):
         requested = float(requested)
         previous = float(self._last_heading_output)
         same_direction = requested == 0.0 or previous == 0.0 or \
@@ -205,22 +214,23 @@ class CvLanePidController:
         reversing = not same_direction
         building_turn = same_direction and abs(requested) > abs(previous)
         if reversing:
-            if reverse_step is None:
-                reverse_step = self.config.max_heading_reverse_step
-            step = max(float(reverse_step), 0.0)
+            if reverse_rate is None:
+                reverse_rate = self.config.max_heading_reverse_rate
+            rate = max(float(reverse_rate), 0.0)
         elif building_turn:
-            if entry_step is None:
-                entry_step = self.config.max_heading_step
-            step = max(float(entry_step), 0.0)
+            if entry_rate is None:
+                entry_rate = self.config.max_heading_rate
+            rate = max(float(entry_rate), 0.0)
         else:
-            step = max(float(self.config.max_heading_release_step), 0.0)
-        if step > 0.0:
+            rate = max(float(self.config.max_heading_release_rate), 0.0)
+        if rate > 0.0:
+            step = rate * finite_dt(dt_s, self.config.control_period_s)
             requested = float(np.clip(
                 requested, previous - step, previous + step))
         self._last_heading_output = requested
         return requested
 
-    def _apply_speed_slew(self, target):
+    def _apply_speed_slew(self, target, dt_s=None):
         """Reduce bend-entry speed faster than speed is restored after a bend."""
         target = float(target)
         if self._last_forward_speed is None:
@@ -228,10 +238,11 @@ class CvLanePidController:
             return target
         current = float(self._last_forward_speed)
         if target < current:
-            step = max(float(self.config.max_deceleration_step), 0.0)
+            rate = max(float(self.config.max_deceleration_mps2), 0.0)
         else:
-            step = max(float(self.config.max_acceleration_step), 0.0)
-        if step > 0.0:
+            rate = max(float(self.config.max_acceleration_mps2), 0.0)
+        if rate > 0.0:
+            step = rate * finite_dt(dt_s, self.config.control_period_s)
             target = float(np.clip(target, current - step, current + step))
         self._last_forward_speed = target
         return target

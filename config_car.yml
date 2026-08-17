@@ -39,6 +39,20 @@ speed:
   angle:
     limit: 3
 
+# CNN lane post-processing profile. Keep legacy_error for existing models;
+# switch to kappa_action only after deploying a model whose outputs are
+# [speed_demand, kappa_action]. Velocity slew limits are real-time rates.
+lane_control:
+  profile: legacy_error
+  max_forward_speed: 0.30
+  min_forward_speed: 0.12
+  full_turn_curvature_m_inv: 5.0
+  speed_curve_exponent: 1.5
+  max_deceleration_mps2: 0.194
+  max_acceleration_mps2: 0.129
+  max_angular_speed: 1.50
+  fallback_dt_s: 0.05
+
 # ============================================================
 # PID 参数配置，供 car_main.py 导入使用
 # ============================================================

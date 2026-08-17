@@ -17,6 +17,7 @@ from .opencv_lane import LaneAnalyzerConfig, OpenCVLaneAnalyzer, StandardLaneRef
 from .pid_control import CvLanePidConfig, CvLanePidController
 from .temporal_filter import PreviewTimingFilter
 from .turn_state import CrossStraightStateMachine
+from ..curvature_control import finite_dt
 
 
 class CvTestSessionWriter:
@@ -36,7 +37,8 @@ class CvTestSessionWriter:
 
     def append(self, cnn_image, analysis, command, *, held=False,
                command_source="opencv", odometry_distance_m=None,
-               frame_distance_m=None, distance_source="unavailable") -> None:
+               frame_distance_m=None, distance_source="unavailable",
+               timestamp_monotonic=None, effective_dt_s=None) -> None:
         if self.closed:
             raise RuntimeError("CV test session is already closed")
         image_name = f"{len(self.records):06d}.jpg"
@@ -45,21 +47,28 @@ class CvTestSessionWriter:
             raise RuntimeError(f"could not save {image_path}")
         self.records.append({
             "img_path": image_name,
-            # Match the existing CNN contract: state[1:3] is consumed as
-            # error_y/error_angle and then passed through lane_pid.
-            "state": [command.forward_speed, command.error_y,
-                      command.error_angle],
+            # Keep the same raw chassis-command schema as joystick sessions.
+            "state": [command.forward_speed, command.lateral_speed,
+                      command.angular_speed],
+            "legacy_pid_state": [command.forward_speed, command.error_y,
+                                 command.error_angle],
             # Keep the actual mecanum command separately for replay and
             # closed-loop diagnostics.
             "control": [command.forward_speed, command.lateral_speed,
                         command.angular_speed],
             "teacher": self.teacher,
-            "label_semantics": "cnn_pid_input_error",
+            "label_semantics": "raw_control_with_model_target",
+            "model_target": {
+                "speed_demand": float(command.steering_demand),
+                "kappa_action": float(command.action_curvature),
+            },
+            "target_mask": [1.0, 1.0],
             "held": bool(held),
             "command_source": str(command_source),
             "control_reason": str(command.reason),
             "steering_demand": float(command.steering_demand),
             "target_forward_speed": float(command.target_forward_speed),
+            "action_curvature": float(command.action_curvature),
             # Encoder-based distance measured by the chassis odometry.  The
             # per-frame delta is relative to the previous saved frame, while
             # odometry_distance_m is relative to the beginning of this
@@ -69,6 +78,8 @@ class CvTestSessionWriter:
             "distance_source": str(distance_source),
             "cv": analysis.to_record(),
             "timestamp": time.time(),
+            "timestamp_monotonic": timestamp_monotonic,
+            "effective_dt_s": effective_dt_s,
         })
         if len(self.records) % 10 == 0:
             self._write_data()
@@ -90,10 +101,19 @@ class CvTestSessionWriter:
             "purpose": "OpenCV PID low-speed real-car test",
             "usable_for_training": True,
             "saved_image_size": [320, 240],
-            "state_fields": ["forward_speed", "error_y", "error_angle"],
+            "state_fields": ["forward_speed", "lateral_speed",
+                             "angular_speed"],
+            "legacy_pid_state_fields": [
+                "forward_speed", "error_y", "error_angle"],
             "control_fields": ["forward_speed", "lateral_speed",
                                "angular_speed"],
-            "label_semantics": "cnn_pid_input_error",
+            "label_semantics": "raw_control_with_model_target",
+            "model_target_fields": ["speed_demand", "kappa_action"],
+            "target_mask_fields": ["speed_demand", "kappa_action"],
+            "model_output_fields": ["speed_demand", "kappa_action"],
+            "action_label_fields": [
+                "steering_demand", "action_curvature",
+                "control.angular_speed"],
             "teacher": self.teacher,
             "distance_fields": {
                 "odometry_distance_m": "session-relative chassis odometry",
@@ -170,6 +190,7 @@ class OpenCVLaneSshTest:
         self.invalid_hold_frames = 0
         self.distance_origin_m = None
         self.last_distance_m = None
+        self.last_control_timestamp = None
 
     def run(self) -> None:
         self._stop_vehicle()
@@ -194,6 +215,12 @@ class OpenCVLaneSshTest:
 
     def _control_once(self) -> None:
         try:
+            now_monotonic = time.monotonic()
+            dt_s = finite_dt(
+                None if self.last_control_timestamp is None else
+                now_monotonic - self.last_control_timestamp,
+                self.LOOP_SECONDS)
+            self.last_control_timestamp = now_monotonic
             if hasattr(self.camera, "frame_timestamp"):
                 frame_timestamp = self.camera.frame_timestamp
                 if (frame_timestamp is None or
@@ -215,7 +242,8 @@ class OpenCVLaneSshTest:
                 decision = self.cross_state.update(
                     analysis, distance_m=distance_m)
                 analysis = decision.result
-            command = self.controller.compute(analysis, distance_m=distance_m)
+            command = self.controller.compute(
+                analysis, distance_m=distance_m, dt_s=dt_s)
             command_source = decision.source if decision is not None else "standard"
             held = False
             if (command.valid and decision is not None and
@@ -253,6 +281,13 @@ class OpenCVLaneSshTest:
                     command, lateral_speed=0.0, angular_speed=0.0,
                     reason="initial_straight_guard")
                 command_source = "initial_straight_guard"
+            # The label must describe the command actually sent to the
+            # chassis, including launch protection, holds, and speed scaling.
+            command = replace(
+                command,
+                action_curvature=command.angular_speed /
+                max(abs(command.forward_speed), 0.12),
+            )
             self.car.set_velocity(
                 command.forward_speed,
                 command.lateral_speed,
@@ -273,6 +308,8 @@ class OpenCVLaneSshTest:
                 odometry_distance_m=distance_m,
                 frame_distance_m=frame_distance_m,
                 distance_source=distance_source,
+                timestamp_monotonic=now_monotonic,
+                effective_dt_s=dt_s,
             )
             if self.frame_callback is not None:
                 self.frame_callback(self.analyzer.draw_debug(image, analysis))
@@ -299,6 +336,7 @@ class OpenCVLaneSshTest:
                     self.output_root, self.controller.config)
                 self.distance_origin_m = None
                 self.last_distance_m = None
+                self.last_control_timestamp = None
                 self.running = True
                 print(f"STARTED: {self.writer.session_dir}", flush=True)
             elif command == "stop":
@@ -323,6 +361,7 @@ class OpenCVLaneSshTest:
         self.invalid_hold_frames = 0
         self.distance_origin_m = None
         self.last_distance_m = None
+        self.last_control_timestamp = None
         if self.writer is not None:
             self.writer.close()
             session = self.writer.session_dir

@@ -43,6 +43,9 @@ def parse_args():
     parser.add_argument(
         "--lookahead-m", type=float, default=0.30,
         help="pure-pursuit target distance in metres (default: 0.30)")
+    parser.add_argument(
+        "--disable-heading-slew", action="store_true",
+        help="bypass heading entry/release/reverse rate limits for A/B tests")
     return parser.parse_args()
 
 
@@ -212,9 +215,18 @@ def main():
     temporal_filter = (PreviewTimingFilter(
         error_mapping=analyzer.config.error_mapping)
                        if args.temporal_filter else None)
-    controller = CvLanePidController(CvLanePidConfig(
+    controller_config = CvLanePidConfig(
         steering_mode=("pure_pursuit" if args.pure_pursuit
-                       else "heading_pid")))
+                       else "heading_pid"))
+    if args.disable_heading_slew:
+        controller_config = replace(
+            controller_config,
+            max_heading_rate=0.0,
+            pure_pursuit_entry_rate=0.0,
+            max_heading_release_rate=0.0,
+            max_heading_reverse_rate=0.0,
+        )
+    controller = CvLanePidController(controller_config)
     last_valid_command = None
     invalid_hold_frames = 0
     rows = []
