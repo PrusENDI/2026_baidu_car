@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -8,6 +9,62 @@ import numpy as np
 from PIL import Image
 from paddle.io import Dataset
 from .corruptions import CorruptionConfig, generate_light_corruption
+
+
+@dataclass(frozen=True)
+class ActionAugmentationConfig:
+    application_probability: float = 1.0
+    brightness_range: tuple[float, float] = (0.8, 1.2)
+    contrast_range: tuple[float, float] = (0.8, 1.2)
+    saturation_range: tuple[float, float] = (0.85, 1.15)
+    hue_delta: int = 8
+    blur_probability: float = 0.15
+    noise_probability: float = 0.15
+    horizontal_flip_probability: float = 0.5
+
+    def __post_init__(self) -> None:
+        for name in (
+            "application_probability",
+            "blur_probability",
+            "noise_probability",
+            "horizontal_flip_probability",
+        ):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        for name in (
+            "brightness_range",
+            "contrast_range",
+            "saturation_range",
+        ):
+            value = getattr(self, name)
+            if len(value) != 2 or value[0] <= 0.0 or value[0] > value[1]:
+                raise ValueError(f"{name} must be an ordered positive range")
+        if self.hue_delta < 0:
+            raise ValueError("hue_delta must be nonnegative")
+
+
+LEGACY_ACTION_AUGMENTATION = ActionAugmentationConfig()
+CLEAN_ACTION_AUGMENTATION = ActionAugmentationConfig(
+    application_probability=0.0,
+    brightness_range=(1.0, 1.0),
+    contrast_range=(1.0, 1.0),
+    saturation_range=(1.0, 1.0),
+    hue_delta=0,
+    blur_probability=0.0,
+    noise_probability=0.0,
+    horizontal_flip_probability=0.0,
+)
+MILD_FIXED_TRACK_ACTION_AUGMENTATION = ActionAugmentationConfig(
+    application_probability=0.30,
+    brightness_range=(0.95, 1.05),
+    contrast_range=(0.95, 1.05),
+    saturation_range=(0.97, 1.03),
+    hue_delta=2,
+    blur_probability=0.0,
+    noise_probability=0.0,
+    horizontal_flip_probability=0.0,
+)
 
 
 def preprocess_rgb(image: np.ndarray) -> np.ndarray:
@@ -54,32 +111,52 @@ def augment_rgb(
     label: np.ndarray,
     rng: np.random.Generator,
     label_semantics: str = "legacy_vy_yaw",
-    horizontal_flip_probability: float = 0.5,
-) -> tuple[np.ndarray, np.ndarray]:
-    brightness = rng.uniform(0.8, 1.2)
-    contrast = rng.uniform(0.8, 1.2)
-    saturation = rng.uniform(0.85, 1.15)
+    horizontal_flip_probability: float | None = None,
+    config: ActionAugmentationConfig = LEGACY_ACTION_AUGMENTATION,
+    return_applied: bool = False,
+):
+    if horizontal_flip_probability is not None:
+        config = replace(
+            config,
+            horizontal_flip_probability=float(horizontal_flip_probability),
+        )
+    if rng.random() >= config.application_probability:
+        result = (image, np.asarray(label, dtype=np.float32))
+        return result + (False,) if return_applied else result
+
+    brightness = rng.uniform(*config.brightness_range)
+    contrast = rng.uniform(*config.contrast_range)
+    saturation = rng.uniform(*config.saturation_range)
     work = image.astype(np.float32) * brightness
     mean = work.mean(axis=(0, 1), keepdims=True)
     work = (work - mean) * contrast + mean
     augmented = np.clip(work, 0, 255).astype(np.uint8)
     hsv = cv2.cvtColor(augmented, cv2.COLOR_RGB2HSV)
-    hsv[..., 0] = (hsv[..., 0].astype(np.int16) + int(rng.integers(-8, 9))) % 180
+    hue_shift = (
+        int(rng.integers(-config.hue_delta, config.hue_delta + 1))
+        if config.hue_delta
+        else 0
+    )
+    hsv[..., 0] = (hsv[..., 0].astype(np.int16) + hue_shift) % 180
     hsv[..., 1] = np.clip(hsv[..., 1].astype(np.float32) * saturation, 0, 255).astype(
         np.uint8
     )
     augmented = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-    if rng.random() < 0.15:
+    if config.blur_probability and rng.random() < config.blur_probability:
         augmented = cv2.GaussianBlur(augmented, (3, 3), rng.uniform(0.3, 0.8))
-    if rng.random() < 0.15:
+    if config.noise_probability and rng.random() < config.noise_probability:
         noise = rng.normal(0.0, rng.uniform(2.0, 6.0), augmented.shape)
         augmented = np.clip(augmented.astype(np.float32) + noise, 0, 255).astype(
             np.uint8
         )
-    if rng.random() < horizontal_flip_probability:
+    if (
+        config.horizontal_flip_probability
+        and rng.random() < config.horizontal_flip_probability
+    ):
         augmented, label = horizontal_flip(
             augmented, label, label_semantics=label_semantics)
-    return augmented, np.asarray(label, dtype=np.float32)
+    result = (augmented, np.asarray(label, dtype=np.float32))
+    return result + (True,) if return_applied else result
 
 
 class LaneDataset(Dataset):
@@ -94,6 +171,7 @@ class LaneDataset(Dataset):
         corruption_config: CorruptionConfig | None = None,
         return_target_mask: bool = False,
         horizontal_flip_probability: float = 0.5,
+        action_augmentation_config: ActionAugmentationConfig | None = None,
     ) -> None:
         super().__init__()
         self.rows = list(rows)
@@ -107,6 +185,15 @@ class LaneDataset(Dataset):
         self.corruption_config = corruption_config or CorruptionConfig()
         self.return_target_mask = bool(return_target_mask)
         self.horizontal_flip_probability = float(horizontal_flip_probability)
+        self.action_augmentation_config = (
+            replace(
+                LEGACY_ACTION_AUGMENTATION,
+                horizontal_flip_probability=self.horizontal_flip_probability,
+            )
+            if action_augmentation_config is None
+            else action_augmentation_config
+        )
+        self.augmentation_applied_count = 0
         self._cached_images: list[np.ndarray | None] = [None] * len(self.rows)
 
     def __len__(self) -> int:
@@ -114,6 +201,14 @@ class LaneDataset(Dataset):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
+        self.augmentation_applied_count = 0
+
+    def set_action_augmentation_config(
+        self, config: ActionAugmentationConfig,
+    ) -> None:
+        if not isinstance(config, ActionAugmentationConfig):
+            raise TypeError("config must be an ActionAugmentationConfig")
+        self.action_augmentation_config = config
 
     @property
     def cached_image_count(self) -> int:
@@ -142,13 +237,15 @@ class LaneDataset(Dataset):
         label, target_mask, label_semantics = row_target(row)
         if self.training:
             rng = np.random.default_rng(self.seed + self.epoch * 1_000_003 + int(index))
-            rgb, label = augment_rgb(
+            rgb, label, applied = augment_rgb(
                 rgb,
                 label,
                 rng,
                 label_semantics=label_semantics,
-                horizontal_flip_probability=self.horizontal_flip_probability,
+                config=self.action_augmentation_config,
+                return_applied=True,
             )
+            self.augmentation_applied_count += int(applied)
         if self.return_target_mask:
             return preprocess_rgb(rgb), label, target_mask
         if not np.allclose(target_mask, 1.0):
