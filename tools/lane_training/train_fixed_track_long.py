@@ -276,6 +276,18 @@ def _train(
                 sampler_state={"base_seed": seed, "next_epoch": epoch + 1},
                 history=history,
             )
+            entry["checkpoint_sha256"] = _sha256(
+                saved_checkpoint / "model.pdparams"
+            )
+            state_path = saved_checkpoint / "state.json"
+            checkpoint_state = json.loads(
+                state_path.read_text(encoding="utf-8")
+            )
+            checkpoint_state["history"] = history
+            state_path.write_text(
+                json.dumps(checkpoint_state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
             if eval_set and epoch % checkpoint_interval == 0:
                 from tools.lane_training.evaluate_fixed_track_long import (
                     append_evaluation_index,
@@ -304,7 +316,6 @@ def _train(
                     evaluation, evaluation_path, evaluation_output,
                 )
                 entry["evaluation_report"] = str(evaluation_path)
-                state_path = saved_checkpoint / "state.json"
                 checkpoint_state = json.loads(
                     state_path.read_text(encoding="utf-8")
                 )
