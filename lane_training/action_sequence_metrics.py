@@ -1,12 +1,30 @@
 from __future__ import annotations
 
 import math
+import importlib.util
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 
-from smartcar.whalesbot.tools.curvature_control import CurvatureSpeedController
+
+
+def _load_vehicle_controller():
+    controller_path = (
+        Path(__file__).resolve().parents[1]
+        / "smartcar" / "whalesbot" / "tools" / "curvature_control.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "lane_training_vehicle_curvature_control", controller_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load vehicle controller: {controller_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.CurvatureSpeedController
+
+
+CurvatureSpeedController = _load_vehicle_controller()
 
 
 def derive_sequence_keys(rows: Sequence[dict]) -> list[str]:
