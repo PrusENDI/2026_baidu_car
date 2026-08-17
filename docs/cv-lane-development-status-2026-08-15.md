@@ -3,6 +3,10 @@
 本文是当前 CV 自动采样模式的上下文恢复入口。后续开始工作前，应先阅读本文，再查看
 文末列出的设计、操作和验证文件，避免因对话上下文压缩而重新采用已经否定的方案。
 
+> **文档边界（2026-08-17）：**本文继续维护 CV 视觉算法、赛道帧段、参数变化和实车实验历史。当前采集字段、CNN 输出 `[speed_demand,kappa_action]`、训练 mask 和车端 `kappa_action` profile 统一维护在 [CNN 训练接续文档](lane-cnn-training-handoff.md)。本文历史章节中的 `[vy,yaw_error]`、PID 前 `state`、按帧梯度或旧启动状态描述只用于追溯，不能覆盖训练主文档和当前代码。
+
+当前有效 worktree 为 `C:\weizijian\documents\baidu car\baidu_smartcar_2026\.worktrees\lane-cnn-finetuning`，分支为 `orin-main-20260814`。下方旧路径、提交号和 Git 状态均保留为当时快照。
+
 ### 文档维护规则（用户要求，2026-08-16）
 
 从现在开始，每次修改 CV 相关代码、参数、测试、离线回放逻辑或运行开关，都必须在本文
@@ -20,7 +24,7 @@
 事实来源。历史章节中的提交号、工作区状态和参数可能已经过时，必须结合最新追加记录及
 只读 Git/代码检查确认。除非用户明确要求，不得因为更新本文而自动提交、推送或同步 Orin。
 
-## 1. 仓库状态
+## 1. 仓库状态（历史快照）
 
 ```text
 仓库：C:\weizijian\documents\baidu car\2026_official_code\baidu_smartcar_2026
@@ -1754,3 +1758,34 @@ wz = forward_speed * curvature
 opencv_lane.py  1e416af39ad2d88471e52e1c99ceaafc1affe284b07e9be7d9c7935648a26d72
 pid_control.py  429c7516748374ee42657428eca2b38e113405b676218508d2329e4cf07db592
 ```
+
+## 19. CV 教师与 CNN 训练接口整合（2026-08-17）
+
+CV 控制和训练数据接口已在 `orin-main-20260814` 分支整合，控制代码基线提交为
+`30d0f0e feat: add CV teacher and curvature CNN control`。本节只记录与 CV 开发历史相关的
+结果；完整数据字典、训练缺口、部署 profile 和验收清单见
+[CNN 训练接续文档](lane-cnn-training-handoff.md)第 18、20 节。
+
+当前 CV session 不再把 PID 前误差写入普通 `state`：
+
+```text
+state/control    = [actual_vx, actual_vy, actual_wz]
+legacy_pid_state = [forward_speed, error_y, error_angle]
+model_target     = [speed_demand, kappa_action]
+target_mask      = [1.0, 1.0]
+```
+
+`kappa_action` 在启动直行保护、短时无效帧继承、锐角处理和最终限幅之后，按实际命令
+`actual_wz/max(abs(actual_vx),0.12)` 重新计算。这样 CNN 学到当帧实际转向动作，车端只保留
+可调速度曲线、真实时间速度梯度和 `wz=actual_vx*kappa_action`，不重复执行 CV 的角速度
+建立/释放逻辑。
+
+速度和 CV 角速度梯度已经由按帧步长改为真实 `dt` 速率。速度参数为减速
+`0.194 m/s²`、加速 `0.129 m/s²`，无效或缺失 `dt` 回退到 `0.05 s`。当前
+`finite_dt()` 没有正数上限钳制，长时间卡顿后的首步变化仍是部署风险；修复前必须依靠
+watchdog、控制器重置和低速验证，不能直接宣称丢帧安全。
+
+本次同时确认训练路径尚未全部固化：GitHub 已有 CV/手柄 manifest、双输出标签、mask 和
+数据集增强，但尚无已跟踪的 mask 损失训练器、新语义正式训练入口和一键导出工具。本地
+未跟踪 `tools/` 不能作为远端可复现流程。后续 CV 视觉修改仍记录在本文；训练接口只在训练
+接续文档维护，避免两份文档再次分叉。

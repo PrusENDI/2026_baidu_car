@@ -1,9 +1,9 @@
 # 百度智能车巡航 CNN 训练接续文档
 
-更新时间：2026-08-16
-用途：会话压缩或更换对话后，先阅读本文件，再查看所链接的脚本和原始报告。本文只记录已确认、已执行的当前状态；旧设计文档中的自动弯道划分和绝对 A/B 门禁不再作为当前结论。
+更新时间：2026-08-17
+用途：会话压缩或更换对话后，先阅读本文件，再查看所链接的脚本和原始报告。本文是当前 CV 采集标签、CNN 训练接口和车端部署语义的主入口；[CV 自动采样巡线开发状态](cv-lane-development-status-2026-08-15.md)保留视觉算法、赛道帧段和参数演进历史。历史章节中的旧接口不得覆盖本文顶部、第 18 节和第 20 节的当前结论。
 
-## 当前最终模型接口（2026-08-16）
+## 当前最终模型接口（2026-08-17）
 
 巡线 CNN 保持两个输出，但语义改为：
 
@@ -25,11 +25,12 @@ CV 与手柄数据的公共原始字段固定为 `state/control=[vx,vy,wz]`。�
 ## 1. 仓库与操作边界
 
 - Worktree：`C:\weizijian\documents\baidu car\baidu_smartcar_2026\.worktrees\lane-cnn-finetuning`
-- 分支：`feat/lane-cnn-finetuning`
-- 保留当前分支和 worktree，不合并、不推送、不清理。
+- 分支：`orin-main-20260814`，跟踪 `github/orin-main-20260814`。
+- 当前 CV/CNN 控制整合基线：`30d0f0e feat: add CV teacher and curvature CNN control`；后续文档提交号以 `git log -1` 为准。
+- 保留当前 worktree，不清理本地未跟踪的虚拟环境、训练实验脚本和 `artifacts/`。
 - 不修改 `car_task_function.py`。
 - 不运行或上传官方 locked test。
-- 当前任务只优化 CNN 第二维 yaw；第一维 vy 由 D4 教师保持，不主动优化。
+- 新 CV 模型的两维输出是 `[speed_demand, kappa_action]`；旧 D4/R7 的 `[vy, yaw_error]` 只在 `legacy_error` profile 下继续兼容。
 - 现有 epoch 5/20 车端包均为用户明确接受风险后的导出，不代表行为门禁通过，也不能仅凭离线指标宣称一定可上车。
 - 后续若改变输入分辨率、模型结构、解冻范围、损失或数据角色，应先说明预期收益和退化风险；本文件不构成自动授权。
 
@@ -51,13 +52,14 @@ ssh -i "C:\Users\fjcy\.ssh\autodl_bjb2_28297" -p 42832 root@connect.bjb2.seetacl
 
 ## 3. 模型输入、输出与车端控制
 
-- 官方 CNN 固定输入为 `[N, 3, 128, 128]`，输出为 `[N, 2] = [vy, yaw]`。
+- 官方网络结构固定输入为 `[N, 3, 128, 128]`，仍保留两个输出节点；输出节点的语义由部署 profile 决定。
 - 训练端和车端都将图像直接双线性缩放为 `128×128`，归一化为 `pixel / 127.5 - 1.0`，再转成 RGB/CHW。
 - `128×128` 是官方模型和车端部署接口的一部分，不只是训练参数。只改训练端分辨率会造成模型与车端预处理不一致。
-- 正确的车端控制逻辑以 `C:\weizijian\documents\baidu car\car_wrap_2026.py` 为准，其 SHA256 为 `1b6dbe851f047650934507b15e6446a69d5ac714edd611560ff8d90338728280`。
-- `CROP=True` 时速度范围是 `0.30 → 0.18`，`full_turn_error=0.39`。
-- CNN 第二维是角度误差，不是直接角速度，不能用 `yaw / speed` 推导曲率。
-- 角度 PID 为 `Kp=3`、输出限幅 `[-1.5, 1.5]`；因此 `abs(yaw) >= 0.5` 时比例项会进入饱和区。
+- `legacy_error`：旧模型输出 `[vy, yaw_error]`，继续通过旧 PID 和 `CROP` 降速链；旧模型第二维不是角速度，不能用 `yaw/speed` 推导曲率。
+- `kappa_action`：新模型输出 `[speed_demand, kappa_action]`，其中 `speed_demand∈[0,1]` 是弯道速度需求强度，`kappa_action` 是最终动作曲率。
+- 新模型车端执行 `target_vx=speed_curve(speed_demand)`、真实 `dt` 速度梯度、`wz=actual_vx*kappa_action` 和角速度安全限幅，当前 `vy=0`。
+- profile 在 `config_car.yml` 的 `lane_control.profile` 中选择；部署新模型前必须显式改为 `kappa_action`，默认值 `legacy_error` 是为防止旧模型被误解释。
+- 正确车端入口以当前 worktree 的 `car_wrap_2026.py` 为准，不再引用工作树外的旧副本或固定 SHA256。
 
 相关实现：
 
@@ -519,6 +521,8 @@ SHA256: 2756e7a02712a837e47bab805911019b598ea97f745edcd6f6fecc2dd1f9af03
 
 ## 16. CV 教师标签与 CNN 底盘后处理选择（2026-08-16）
 
+> **历史决策记录：**第 16、17 节记录从 `[vy, yaw_error]` 过渡到动作曲率接口之前的分析，便于追溯为什么放弃旧方案。这里出现的 `state=[forward_speed,error_y,error_angle]`、按帧梯度和“尚未修改代码”等描述已经失效；当前实现以第 18、20 节和代码为准。
+
 新的 OpenCV Pure Pursuit 逻辑已经由用户在真实赛道测试，整体行驶没有明显问题。后续目标是
 让 CNN 学习该教师，同时保留实车阶段调整转向幅值、弯道速度和起转/回正时序的能力。
 
@@ -638,6 +642,8 @@ CNN 入口复制一套容易漂移的参数和公式。
 
 ## 17. 推荐方案的边界与此前忽视的问题（2026-08-16）
 
+> **历史风险分析：**本节中的单帧歧义、闭环分布偏移、推理延迟和教师版本混训风险仍然成立，但旧的 `state[1:3]` 输出建议、按帧梯度描述和启动保护标签关系已被当前动作曲率数据格式替代。
+
 本节补充采用“CNN 预测 `state[1:3]`、再复用 CV 底盘控制器”时必须单独处理的问题。两输出
 标签能够表达主要视觉转向趋势，但不自动包含 CV 控制器的全部离散状态、历史状态和运行时序。
 
@@ -749,93 +755,135 @@ CNN 只在 CV 已经跑正确的轨迹上学习。实车一旦因预测误差偏
 
 ## 18. 最终统一方案：速度条件下的 CV/CNN 曲率训练
 
-本节将主仓库中的中文设计文档合并到训练交接结论中，并作为第 16、17 节
-讨论后的当前方案。旧的 `vy/yaw_error` 方案保留为历史背景，不再作为新
-CV 数据的首选训练接口。
+本节是第 16、17 节讨论后的当前实现。旧的 `[vy,yaw_error]` 方案只供历史
+模型在 `legacy_error` profile 下兼容，不再作为新 CV 数据的训练接口。
 
 ### 18.1 统一数据格式与标签
 
-所有采集源都保留原始底盘动作：
+CV session 每帧保存以下三层数据：
 
 ```text
-control = [vx, vy, wz]
+state/control    = [actual_vx, actual_vy, actual_wz]
+legacy_pid_state = [forward_speed, error_y, error_angle]
+model_target     = {speed_demand, kappa_action}
+target_mask      = [1.0, 1.0]
 ```
 
-CV 最终教师命令派生动作曲率：
+`state` 与 `control` 使用和手柄 session 相同的原始底盘命令格式。CV 的
+`legacy_pid_state` 只用于诊断旧接口，不是新模型标签。新标签定义为：
 
 ```text
-kappa_action = control.wz / max(abs(control.forward_speed), 0.12)
+speed_demand = command.steering_demand
+kappa_action = actual_wz / max(abs(actual_vx), 0.12)
 ```
 
-`control.wz` 必须是 CV 全部逻辑执行后的最终值，包含断线保持、右锐角处理、
-启动保护、角速度限幅和当前教师动作。数据还应保存 `target_vx`、`valid`、
-`held`、教师原因、单调时间戳、`source` 和 CV 配置哈希。
+`speed_demand` 不是绝对速度，范围为 `[0,1]`：`0` 表示直道最高速度需求，
+`1` 表示最强弯道降速需求。`kappa_action` 在短时断线继承、右锐角处理、启动
+直行保护和最终限幅之后重新按实际命令计算，因此监督的是当帧最终转向动作。
+记录同时包含 `held`、`command_source`、`control_reason`、编码器距离、
+`timestamp_monotonic` 和 `effective_dt_s`。
 
-手柄数据仍可直接采集和使用；曲率只是可重新计算的派生字段，不得覆盖原始
-`vx/vy/wz`。手柄救车样本应单独统计或降低损失权重，不能未经区分地当作
-CV 标准轨迹。
+手柄 session 继续保存 `state=[vx,vy,wz]`，加载时派生：
+
+```text
+speed_demand = 0.0                   # 占位，不参与损失
+kappa_action = wz / max(abs(vx), 0.12)
+target_mask  = [0.0, 1.0]
+```
+
+因此手柄数据可以补充转向和偏移恢复，但不能用其油门直接监督 CV 速度曲线。
+水平翻转时 `speed_demand` 不变，`kappa_action` 反号。
 
 ### 18.2 模型与控制流程
 
 ```text
-图像 + 已知 vx 条件
+320×240 原图（训练/推理入口再缩放为 128×128）
     ↓
-CNN 输出 kappa_action
+CNN 输出 [speed_demand, kappa_action]
     ↓
-根据曲率计算目标速度
+speed_curve(speed_demand) 计算 target_vx
     ↓
-按真实 dt 执行速度梯度
+按真实 dt 执行速度梯度得到 actual_vx
     ↓
-wz = actual_vx × kappa_action
+wz = clip(actual_vx × kappa_action, ±1.50)
     ↓
 安全限幅与 watchdog
     ↓
 输出 vx, 0, wz
 ```
 
-训练以最终动作 `wz` 为主损失，曲率为辅助约束：
+CV 教师端仍可使用 Pure Pursuit、真实时间角速度建立/释放、断线保持和启动保护，
+但这些行为已经编码进最终 `kappa_action`。CNN 后处理只移植速度曲线与真实时间
+速度梯度，不再次执行 CV 的入弯/回正角速度梯度或路线 override，避免双重处理。
+
+训练直接对两个输出计算带 mask 的稳健回归损失，概念形式为：
 
 ```text
-kappa_label = control.wz / max(abs(target_vx), 0.12)
-wz_pred     = target_vx × kappa_pred
-loss        = SmoothL1(wz_pred, control.wz)
-              + lambda_kappa × SmoothL1(kappa_pred, kappa_label)
+loss_speed = mask[0] × SmoothL1(speed_pred, speed_label)
+loss_kappa = mask[1] × SmoothL1(kappa_pred, kappa_label)
+loss       = normalized(loss_speed + lambda_kappa × loss_kappa)
 ```
 
-车端推理不得再次执行 `pure_pursuit_entry_step`、角速度释放/反向梯度或
-`route_right_turn_override`。这些行为已经写入教师标签，推理后只保留底盘
-安全限幅、watchdog 和通信异常保护。本方案当前假定 `vy=0`。
+mask 的归一化必须避免手柄样本的 `speed_demand=0` 占位值参与速度损失。本方案
+当前固定 `vy=0`；偏移恢复先由 `kappa_action` 学习，不增加独立横移网络。
 
 ### 18.3 真实时间速度梯度
 
-CV 教师和 CNN 控制器都必须使用单调时钟计算真实 `dt`：
+CV 教师和 CNN 控制器都使用单调时钟计算真实 `dt`。当前速度参数为：
 
 ```text
-dt = clamp(monotonic_now - last_time, dt_min, dt_max)
-vx_next = move_towards(vx_previous, target_vx, rate_per_second × dt)
+减速率 = 0.194 m/s²
+加速率 = 0.129 m/s²
+首帧或无效 dt 回退 = 0.05 s
+vx_next = move_towards(vx_previous, target_vx, rate_per_second × effective_dt_s)
 ```
 
-不能再使用按帧固定的速度或角速度步长。首帧使用标称 20 Hz 默认周期，丢帧
-时限制 `dt`，并记录有效 `dt` 供离线回放。
+`finite_dt()` 会把缺失、非数值、非有限或小于等于零的输入回退为 `0.05 s`，并把
+最小值限制为 `1e-4 s`。当前实现**没有正数 `dt` 上限**：如果控制循环长时间卡顿，
+恢复后的第一步可能允许较大的速度或角速度变化。部署前应增加 `dt_max` 或在 watchdog
+恢复时重置控制器；在该问题修复前，不得把“丢帧时已限制 dt”写入验收结论。
 
 ### 18.4 旧图片离线重标注
 
 旧手柄或旧采集图片可以按完整序列重新交给 CV 教师处理：
 
 ```text
-旧图片 → 按原顺序回放 CV → 生成 control/kappa/target_vx → 训练 CNN
+旧图片 → 按原顺序回放 CV → 生成 control/model_target/target_mask → 训练 CNN
 ```
 
 每圈开始时必须重置控制器状态，不能逐张独立处理；应使用原始单调时间戳，
 没有时间戳时使用固定标称周期并写入 `session.json`。重标注结果必须保存到
 独立的 `cv_relabelled_*` session，不得覆盖原始手柄数据。
 
-重标注必须固定 ROI、透视、曲率、速度范围、速度梯度、`dt` 限制、锐角规则、
+重标注必须固定 ROI、透视、曲率、速度范围、速度梯度、有效 `dt`、锐角规则、
 断线保持、启动处理和代码版本。线段质量差、检测失败或动作明显不适合当前
 图像的样本应剔除或单独归入恢复数据集。离线重标注可以扩充图片和统一标签，
 但不能替代新控制策略下的真实速度、底盘姿态和执行延迟采集。
 
-### 18.5 标准验收要求
+当前 GitHub 分支尚未包含“一条命令完成整圈序列重标注”的正式工具；不能逐张调用
+单帧分析器冒充序列重标注。实现该工具时必须复用 session 级控制器状态和时间顺序。
+
+### 18.5 当前训练工具完成度
+
+已经提交并经过测试的部分：
+
+- `lane_training/manifest.py`：加载 CV 动作 session，并把手柄 `[vx,vy,wz]` 转为曲率标签；
+- `lane_training/dataset.py`：返回 `[speed_demand,kappa_action]`，支持 `target_mask` 和水平翻转；
+- `tests/lane_training/`：验证 CV/手柄 mask、曲率换算和数据增强；
+- `car_wrap_2026.py`：支持 `legacy_error` 与 `kappa_action` 两种车端 profile。
+
+尚未在当前 GitHub 分支固化的部分：
+
+- 使用 `return_target_mask=True` 的正式训练入口；
+- 对两个输出执行 mask 归一化损失的训练器；
+- 写入输出语义和 profile 的模型导出清单；
+- 新语义模型的离线推理评测与一键车端导出命令。
+
+本地未跟踪的 `tools/` 和训练实验脚本不能被当作 GitHub 上可复现的正式工具。开始
+新模型训练前，必须先把上述四项实现、测试并提交，否则只能说“数据接口兼容”，不能说
+“完整训练路径已经可用”。
+
+### 18.6 标准验收要求
 
 验证必须按完整 session/lap 划分，至少比较：
 
@@ -848,6 +896,8 @@ vx_next = move_towards(vx_previous, target_vx, rate_per_second × dt)
 7. 完整闭环轨迹回放和低速实车结果。
 
 ## 19. 旧方案最低验收要求（历史记录）
+
+> 本节针对旧的“预测 yaw 后再送入共享 CV 控制器”方案，仅保留其有价值的时序验收维度。当前 `[speed_demand,kappa_action]` 模型应按第 18.6 和第 20 节验收。
 
 新模型不能只报告 `yaw MAE`。必须将预测送入共享 CV 控制器后，比较：
 
@@ -862,5 +912,105 @@ vx_next = move_towards(vx_previous, target_vx, rate_per_second × dt)
 完整 session 的低速闭环实车结果
 ```
 
-本节为架构风险记录，尚未修改训练加载器、模型输出、CNN 车端入口或共享控制器，也未运行
-新的训练、离线评测或实车验证。
+上述清单仍可作为补充诊断，但其中“预测送入共享 CV 控制器”的链路不是当前部署实现。
+
+## 20. CV 教师—CNN 训练—车端部署操作闭环（2026-08-17）
+
+本节给出接续开发时的最短正确路径。CV 视觉细节、赛道窗口和参数演进见
+[CV 自动采样巡线开发状态](cv-lane-development-status-2026-08-15.md)。
+
+### 20.1 采集与 session 检查
+
+1. 通过 `collect_data.py` 进入 CV 实车采集模式，保存 320×240 原图；训练和推理阶段再缩放为 128×128。
+2. 每次启动都要创建新 session，并在开始时重置 PID、时间滤波、断线保持、速度状态和里程原点。
+3. 检查 `session.json` 中至少存在 `model_output_fields`、`controller`、`speed_control` 和 `launch_guard`。
+4. 检查 `data.json` 每帧都包含：
+
+```json
+{
+  "state": [0.20, 0.0, -0.40],
+  "control": [0.20, 0.0, -0.40],
+  "legacy_pid_state": [0.20, 0.01, 0.12],
+  "model_target": {
+    "speed_demand": 0.65,
+    "kappa_action": -2.0
+  },
+  "target_mask": [1.0, 1.0],
+  "held": false,
+  "command_source": "standard",
+  "effective_dt_s": 0.05
+}
+```
+
+示例数值只说明字段关系，不是赛道固定标签。必须验证 `state==control` 且
+`kappa_action≈control[2]/max(abs(control[0]),0.12)`；启动保护和无效帧继承也按
+最终实际命令重新计算曲率。
+
+### 20.2 生成训练 manifest
+
+- CV session 使用 `load_cv_action_session()`，要求 `label_semantics=raw_control_with_model_target`。
+- 手柄 session 使用 `load_manual_action_session()`，从原始 `[vx,vy,wz]` 派生曲率。
+- 不覆盖原始 `data.json`；合并结果保存为新的 manifest，并保留 session/lap 边界。
+- 训练、验证和测试必须按完整 session 划分，禁止把同一圈的相邻帧随机拆到不同集合。
+- 不同 CV 参数或代码版本先分组统计，确认标签策略一致后才能混训。
+
+### 20.3 训练入口必须满足的契约
+
+正式训练器接入前必须同时满足：
+
+```text
+LaneDataset(..., return_target_mask=True)
+model output shape = [N, 2]
+output semantics   = [speed_demand, kappa_action]
+masked loss        = 分输出乘 target_mask 后按有效权重归一化
+horizontal flip    = [speed_demand, -kappa_action]
+```
+
+只修改 manifest 而继续使用旧 `[vy,yaw_error]` 损失会静默训练出语义错误的模型。
+手柄样本的第一维 mask 为零，训练器若忽略 mask，会把大量 `speed_demand=0` 占位值
+错误学习成“所有手柄画面都应直道高速”。
+
+### 20.4 导出与车端部署
+
+导出包必须记录：
+
+```json
+{
+  "output_semantics": ["speed_demand", "kappa_action"],
+  "control_profile": "kappa_action",
+  "input_size": [128, 128],
+  "source_image_size": [320, 240]
+}
+```
+
+部署新模型时把 `config_car.yml` 的 `lane_control.profile` 改为 `kappa_action`，并核对
+最高/最低速度、曲率满量程、速度指数、加减速率和角速度限幅。旧 D4/R7 模型必须继续
+使用 `legacy_error`，不能仅替换模型文件而沿用错误 profile。
+
+### 20.5 验收清单
+
+离线检查：
+
+- 两个输出范围、符号和 mask 生效；
+- CV 与 CNN 的速度需求、曲率、最终 `vx/wz` 趋势；
+- 入弯、回正、连续反向弯、右锐角、断线保持和启动窗口；
+- 相机时间、推理完成时间、命令时间、编码器位置和 `effective_dt_s`；
+- 完整一圈闭环回放，不只比较随机帧 MAE。
+
+实车检查：
+
+- 先以低速 profile 跑完整一圈，再逐步恢复目标速度；
+- 确认直道加速、入弯减速和出弯恢复符合真实时间，而不是帧率；
+- 检查卡顿或 watchdog 恢复后的首个 `dt`，当前无 `dt_max` 时不得直接高速测试；
+- 记录偏离赛道后的恢复样本，用于补充闭环分布，而不是只重复标准轨迹。
+
+### 20.6 关键文件索引
+
+- CV session 写入：`smartcar/whalesbot/tools/lane_collect/ssh_test.py`
+- CV Pure Pursuit 与真实时间梯度：`smartcar/whalesbot/tools/lane_collect/pid_control.py`
+- CNN 曲率速度后处理：`smartcar/whalesbot/tools/curvature_control.py`
+- 车端 profile 入口：`car_wrap_2026.py`、`config_car.yml`
+- CV/手柄 manifest：`lane_training/manifest.py`
+- 标签、mask 和增强：`lane_training/dataset.py`
+- 数据接口测试：`tests/lane_training/test_manifest.py`、`tests/lane_training/test_dataset.py`
+- CV 控制与采集契约测试：`tests/test_cv_lane_pid_control.py`
