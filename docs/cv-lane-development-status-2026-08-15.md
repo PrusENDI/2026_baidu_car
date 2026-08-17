@@ -24,6 +24,43 @@
 事实来源。历史章节中的提交号、工作区状态和参数可能已经过时，必须结合最新追加记录及
 只读 Git/代码检查确认。除非用户明确要求，不得因为更新本文而自动提交、推送或同步 Orin。
 
+## 本次更新：finite_dt 上限与低覆盖转向连续性保护（2026-08-17）
+
+本次仅修改 CV 采集侧共享时间处理和短时无效帧处理，未启用十字路口状态机，未接入主程序 CNN 循迹。
+
+- `finite_dt()` 增加正数上限 `0.25 s`；缺失、非法或非正值仍回退到合法 fallback。该上限只限制卡顿恢复后的速度/角速度 slew 步长，摄像头 watchdog 仍负责长时间卡顿停车。
+- `OpenCVLaneSshTest` 撤销 invalid 后额外增加角速度的趋势延续，所有短时 invalid 恢复为精确保持上一条有效底盘命令，避免锐角弯失效段继续加大转向。
+- `collect_data.py` 不再在 CV runner 退出后重复发送停车命令；runner 的停车调用对串口锁被 Ctrl+C 中断和其他停止异常做保护，避免二次停车导致退出崩溃。
+- `finite_dt()` 长间隔上限仍保留。当前 Windows 工作区没有 Python/OpenCV 运行环境，测试需在 Orin 或具备依赖的环境执行。
+- 使用 `cv_low_speed_20260816_181952_915652` 和 `cv_low_speed_20260817_132926_817266` 回放后确认，趋势延续未解决目标弯道，且会使最后锐角 invalid 首帧略微增加转向，因此已撤销。
+- 低成本几何连续性保护曾在 Orin `/tmp/codex_cv_test_20260817_1348` 临时副本通过 39 项测试并同步实车，但实车结果不可接受，已按用户要求撤销。视觉和 pure-pursuit 恢复此前无时序方向修正的行为；仍保留 `finite_dt()` 上限、invalid 精确保持和 Ctrl+C 退出修复。
+- 时间型右缓弯释放保护虽在临时副本通过 40 项测试，但在 `cv_low_speed_20260817_151145_022611` 中从未触发：`right_cross_time_release=0`，所有候选/active 字段均为 false。目标缓弯可靠阶段 `corner_detected=true`，被锐角排除条件挡住；该逻辑已撤销。
+- 同一 session 阈值审计：773 帧中 Otsu 低于 150 的 49 帧、高于 165 的 112 帧、区间内 612 帧。直道 500–570 即使上限钳制到 165，仍保持约 0.80 置信度且角速度接近零，不支持“直道退化由阈值导致”。右锐角 744–756 的 Otsu 为 141–152，其中 744–756 多帧被下限抬到 150，750–754 的有效行数异常跳到 120/置信度 1.0，结合图像中的深色装饰区域，存在过分割风险。十字前 58–74 仅在 165/166 附近上限钳制，边界行仍从 99 降到 0，主要是几何断线而非阈值差异。
+- 对 730–760 做真实 A/B 回放后排除阈值下限为主因：`min150/min145/min140/raw Otsu` 的平均绝对曲率分别为 `3.0482/3.0470/3.0469/3.0469`，sharp 帧均为 13，几乎不变。整体反相掩码则 invalid 从 1 增到 9，744–756 多帧曲率反号（例如 746 从 `-5.456` 变为 `+0.372`，750 从 `-3.949` 变为 `+5.932`），不可采用。当前 `THRESH_BINARY_INV` 将黑色赛道变成白色连通前景是正确语义。
+
+## 本次更新：正式 action CNN 训练与导出入口（2026-08-17）
+
+- 目标：补齐 `[speed_demand,kappa_action]` 正式训练入口、`target_mask` loss、离线评测和车端导出，不改变 CV 视觉/Pure Pursuit 控制行为。
+- 新增 `lane_training/model.py`、`lane_training/action_loss.py`、`lane_training/action_training.py`，以及 `tools/lane_training/{prepare_action_manifest,train_action,evaluate_action,export_action}.py`；新增 `tests/lane_training/test_action_loss.py`。
+- 正式训练始终使用 `LaneDataset(return_target_mask=True)`；CV mask 为 `[1,1]`，手柄 mask 为 `[0,1]`，手柄 `speed_demand=0` 占位值不会进入速度损失。
+- 已连接远端 `connect.bjb2.seetacloud.com:42832`，环境为 Paddle 3.3.1、单 GPU；官方 `CnnModel` 与 `artifacts/d4_physical_long_r7/best.pdparams` 的 18 个参数键完全匹配。
+- 使用 `lap_001` 手柄数据训练、`lap_002` 手柄数据验证生成 6567 条 smoke manifest；完成 2 epoch GPU smoke，生成 `best.pdparams`。该 smoke 仅验证流程，不代表有效新模型，因为手柄数据不监督速度维。
+- 远端相关数据接口与 loss 测试 14 项通过。离线评测确认 validation 的 `valid_speed=0`、`valid_kappa=3134`，说明 mask 生效；静态导出动态/静态最大差为 0。
+- Paddle 3.3.1 导出为 `cnn_lane.json + cnn_lane.pdiparams`，已通过 `paddle.inference.Config` 加载；Orin 若只支持旧 `.pdmodel`，需使用兼容 Paddle 版本重新导出。
+- 新增文件已同步远端项目用于验证，但本地和远端均未提交或推送 Git；未同步 Orin、未运行实车、未启动正式数据训练。现有 CV、日志、模型和用户未提交文件均未清理或覆盖。
+
+## 本次更新：确定第一版固定赛道长训方法（2026-08-17）
+
+- 用户确认赛道完全固定且允许过拟合，并计划提供至少三圈完整 CV 数据和弯道专项数据。第一版不加入手柄数据，不做随机初始化或其他对照实验。
+- 唯一训练路线确定为：D4 checkpoint 初始化，但不加入旧 D4/官方图片、不使用 D4 teacher preservation loss；训练监督 100% 来自新 CV 数据，使最终参数偏向当前赛道。
+- 训练选择阶段使用完整圈 1、2 和弯道专项作为训练集，完整圈 3 作为验证集；选定参数和轮数后，再从 D4 初始化并使用三圈加专项数据重训最终模型。
+- 初始采样比例为完整圈普通帧 60%、弯道专项 40%；专项必须保留入弯前、弯中和出弯回正后的连续窗口。
+- 初始长训计划为 200 epochs：输出头 10、最后两层卷积加输出头 30、全网络 160；每 5 epochs 保存 checkpoint，最终按完整验证圈的速度/曲率时序和关键弯道选择。
+- 正式 loss 使用 `speed_demand` 原尺度与 `kappa_action/5.0` 归一化尺度，概念权重为 `speed + 2*kappa`，并继续保持逐输出 `target_mask` 归一化。
+- 第一版关闭水平翻转、色相旋转、模糊和噪声；亮度增强默认关闭或仅使用现场确认的轻微范围。
+- 当前 action smoke 训练器尚缺三阶段冻结/解冻、分层学习率、60/40 分组采样、曲率归一化 loss 和每 5 epochs 的逐段报告；这些能力实现前不启动正式 200-epoch 长训。
+- 本次只整理训练方法文档，没有修改训练代码、同步远端或 Orin、运行测试、启动训练、提交或推送 Git。完整方案统一维护在 [CNN 训练接续文档](lane-cnn-training-handoff.md)第 20.7 节。
+
 ## 1. 仓库状态（历史快照）
 
 ```text
@@ -1789,3 +1826,197 @@ watchdog、控制器重置和低速验证，不能直接宣称丢帧安全。
 数据集增强，但尚无已跟踪的 mask 损失训练器、新语义正式训练入口和一键导出工具。本地
 未跟踪 `tools/` 不能作为远端可复现流程。后续 CV 视觉修改仍记录在本文；训练接口只在训练
 接续文档维护，避免两份文档再次分叉。
+
+### 19.1 右锐角退出方向迟滞（2026-08-17，已同步 Orin）
+
+最新完整 session `cv_low_speed_20260817_151145_022611` 的最后右锐角入口在 730～733 帧
+命中 `route_right_turn_override`。随后 741～753 帧为 `left_only`、负曲率且
+`pure_pursuit_sharp_boosted=true` 的自然 Pure Pursuit 强转向段，现有
+`pure_pursuit_right_turn_sharp_gain=1.20` 正常生效。该参数并未失效；它只控制已识别锐角的
+曲率幅度，不能处理后续曲率符号错误。
+
+759～760 帧角点仍存在，但 Pure Pursuit 曲率短暂从负号变为 `+1.249/+0.845 1/m`；控制器按
+`max_heading_reverse_rate=1.29 rad/s²` 快速回中，使实际角速度从 758 帧约 `-0.430` 降到
+`-0.327/-0.122 rad/s`。761～762 帧曲率重新恢复负号，763～772 帧无效保持却只能继承较小的
+`-0.175 rad/s`，与实车反馈的后半段转向不足一致。
+
+本次在 `pid_control.py` 增加仅针对该视觉生命周期的方向迟滞：严格右锐角入口先确认弯道身份，
+且必须随后实际出现过 `pure_pursuit_sharp_boosted` 强转向段；只有在二者都成立、当前仍
+`corner_detected=true` 时，才把短暂正曲率按相同绝对值解释为右转负曲率。角点消失或控制器
+`reset()` 时立即清除。没有使用帧数、时间或里程窗口，不延长固定输出，不改变曲率绝对值，
+也不修改 1.20 增益、普通弯、前三个左直角弯、速度、`vy=0`、十字开关或无效保持规则。
+
+使用该 session 已记录的真实曲率、车速和 `effective_dt_s` 重算，730～758 帧输出保持不变；
+只从错误反号开始改变后续控制器输出：
+
+```text
+frame  raw kappa   old wz   replay wz
+759      +1.249    -0.327     -0.388
+760      +0.845    -0.122     -0.306
+761      -0.208    -0.086     -0.270
+762      -1.694    -0.175     -0.359
+```
+
+因此 763～772 的 10 帧无效保持预计继承约 `-0.359 rad/s`，而不是原来的约 `-0.175 rad/s`。
+已为“强转向前不拦截正号”“强转向后仅在角点存在时保持右转符号”“角点消失释放”和
+“reset 清除”增加聚焦测试。Windows 本地仍无 Python，测试命令无法执行。已使用指定的
+`sync_to_orin.ps1`，仅将运行文件 `smartcar/whalesbot/tools/lane_collect/pid_control.py`
+同步到 `/home/jetson/workspaces/baidu_smart_2026_8_14/` 对应路径；脚本执行成功，未同步测试、
+文档或其他工作区内容，也未额外执行远端测试。
+
+### 19.2 最新实车右锐角仍晚转的入口分析（2026-08-17）
+
+同步 19.1 后的最新完整 session 为 `cv_low_speed_20260817_155444_990668`，已将其
+`data.json`、`session.json` 和 700～776 帧图像下载到本地
+`artifacts/orin_cv_low_speed_20260817_155444_990668/`。退出方向迟滞已在 761～764 帧以
+`control_reason=right_acute_exit_sign_hold` 实际触发，说明 19.1 代码已运行；用户反馈的主要
+问题仍是右锐角入口晚，而不是退出反号。
+
+713～718 帧已经出现约 `-1.40 rad` 的远场右转切线，但角点分数仅约 `0.60`；若降低
+`right_turn_candidate_min_score=0.70` 会把强转向提前约 0.5 m，风险过大。731～732 帧则已经
+满足分数、方向、mixed 参考线和 lateral ratio 条件，仅分别因为
+`corner_near_progress=0.150/0.183` 低于当前最小值 `0.20` 被拒绝；直到 733 帧进度达到
+`0.217` 才触发，角速度从 732 帧错误的 `+0.022 rad/s` 跳到 733 帧 `-0.820 rad/s`。
+
+对完整 777 帧做假设门控审计：若只将 `right_turn_candidate_min_near_progress` 从 `0.20`
+降到 `0.15`，只会新增 731～732 两个候选帧，现有 733～735 保持候选，其他弯道没有新增命中；
+入口将从 15.602 m 提前到 15.553 m，约提前 4.9 cm。建议下一步只做该参数修改，不降低分数
+阈值，不改变 `pure_pursuit_right_turn_sharp_gain=1.20`、退出方向迟滞或其他弯道控制。
+用户短暂停止后确认继续采用该最小修改：
+`right_turn_candidate_min_near_progress: 0.20 -> 0.15`。同时更新聚焦测试，使
+`near_progress=0.15` 命中、`0.14` 仍被拒绝。其余右锐角分数、方向、横向比例、最大进度、
+曲率增益、1.20 锐角增益和退出方向迟滞均不变。Windows 本地无 Python，测试未执行；完成
+差异检查后已使用指定 `sync_to_orin.ps1`，仅同步运行文件 `opencv_lane.py` 到
+`/home/jetson/workspaces/baidu_smart_2026_8_14/` 对应路径，脚本执行成功；未同步测试、文档或
+其他工作区内容，也未额外运行远端测试。
+
+### 19.3 入口提前后右锐角反而转向不足的实车分析（2026-08-17）
+
+最新完整 session `cv_low_speed_20260817_161256_038249` 已完整下载到
+`artifacts/orin_cv_low_speed_20260817_161256_038249/`，并与前一轮
+`cv_low_speed_20260817_155444_990668` 及昨日完整赛道
+`cv_low_speed_20260816_173313_422375` 逐帧对比。本节仅记录分析，没有修改代码或参数，也没有同步 Orin。
+
+最新一轮并非没有触发右锐角入口。`route_right_turn_override` 在 665～667 帧、
+15.445～15.497 m 命中；关键入口图像和几何方向正确，Otsu 阈值、有效行和 mixed 参考线也均正常。
+但将 `right_turn_candidate_min_near_progress` 从 0.20 降至 0.15 后，入口在角点更远时触发，
+直接几何曲率绝对值也随距离变小：
+
+```text
+session                         entry frames  near_progress       route kappa (1/m)       actual wz (rad/s)
+20260816_173313_422375          667～669       约 0.20 之后         -3.05/-3.42/-3.92       -0.96/-1.02/-1.11
+20260817_155444_990668          733～735       0.217～0.292        -2.90/-3.11/-3.53       -0.82/-0.83/-0.90
+20260817_161256_038249          665～667       0.158～0.225        -2.49/-2.84/-2.97       -0.77/-0.83/-0.83
+```
+
+因此本轮虽较早开始右转，但入口不是“更早且同样快”，而是“更早但明显更弱”。这正好解释了相对昨日
+的退化，不能再简单继续降低 near progress；该门槛同时改变触发时机和距离反比几何曲率。
+
+第二个问题出现在入口后的方向生命周期。673～678 帧有 6 帧 `short_invalid_hold`，仍能准确保持
+约 `-0.35 rad/s`；679～680 帧重新得到负向 sharp boost。但 681～682 帧分析结果有效却出现
+`corner_detected=false`，现有 `_apply_right_acute_exit_sign_hold()` 立即清除
+`_right_acute_turn_confirmed` 和 `_right_acute_sharp_seen`。683～684 帧角点重新出现时，Pure Pursuit
+已经给出 `+8.13/+8.94 1/m` 的相反方向锐角曲率，但右锐角身份已经丢失，所以
+`right_acute_exit_sign_hold` 没有触发。车辆之后在 708 帧约 16.361 m 开始输出正角速度，
+710～720 帧持续约 `+0.34～+0.53 rad/s`，从已确认的右锐角转向中反向退出。前一轮
+`155444` 的 761～764 帧则实际触发了 `right_acute_exit_sign_hold`，没有这一段反向输出。
+
+量化上，`155444` 从入口附近到 session 结束累计有符号角位移约 `-1.78 rad`；最新一轮从入口前
+到 720 帧虽然绝对角位移约 `1.90 rad`，有符号角位移却只有约 `-0.91 rad`，说明不是角速度完全
+不够，而是后半段相反方向输出抵消了约一半有效右转。图像也显示最新一轮在 702～720 帧已经错过
+昨日同阶段的完整转向轨迹。关键阶段分割持续有效，因此这次退化的首要原因不是 Otsu 自适应阈值。
+
+后续最小修正应分开处理两个耦合问题：保留 0.15 的提前识别时机时，入口专用曲率需要补偿较远角点
+造成的幅度下降；同时右锐角身份不能被单个短暂的 `corner_detected=false` 直接清除。修改前应先决定
+采用哪一种几何释放条件，避免再次引入会影响普通弯的全局帧数、统一延迟或统一增益。
+
+### 19.4 CV 采集频率与行为克隆样本密度审计（2026-08-17）
+
+对最近三个完整 session 的真实时间戳进行了统计，本节仅记录分析，没有修改采集或控制代码：
+
+```text
+session                         frames  duration  average FPS  median dt  p99 dt   distance
+20260816_173313_422375          871     69.97 s   12.43        78 ms      137 ms    20.15 m
+20260817_155444_990668          777     61.84 s   12.55        76 ms      147 ms    16.37 m
+20260817_161256_038249          773     61.67 s   12.52        77 ms      150 ms    17.37 m
+```
+
+最新 session 平均每米约 44.4 帧，平均空间间隔约 2.25 cm；对当前最高约 0.33 m/s 的速度，
+空间采样并不稀疏。明显的周期性瓶颈是 `CvTestSessionWriter.append()` 每累计 10 帧就调用
+`_write_data()`，将不断增大的完整 records 列表重新序列化并覆盖 `data.json`。最新 session 中，
+帧号模 10 等于 0 的周期平均约 120 ms，77 个周期中有 60 个超过 100 ms；其余周期多数约
+72～78 ms。完整 JSON 周期性重写解释了大部分 p99 长帧，但不能解释约 75 ms 的基础周期；基础耗时
+还包含串行执行的相机读取、OpenCV 分析、编码器读取、阻塞式 `set_velocity()` 串口交互和 JPEG 写盘，
+需要增加分阶段计时后才能继续归因。
+
+单圈约 800 张图足够做控制回放和问题定位，但不足以单独训练具有泛化能力的行为克隆模型。
+同一圈相邻图像高度相关，提高同一圈 FPS 只能增加相似样本，不能替代不同起始偏差、光照、速度、
+路线姿态和恢复过程。训练/验证还必须按完整 session 分组，不能随机拆散相邻帧，否则会产生数据泄漏。
+在 CV 教师能稳定完整跑圈后，应优先采集多圈、多工况和恢复样本，并检查直线、普通弯、直角弯、
+左右锐角的标签分布，再决定是否按路段重采样或加权。
+
+安全的性能优化顺序是：先增加阶段耗时遥测；再将逐帧记录改成可恢复的追加日志或后台有界写队列，
+结束时生成兼容的 `data.json`；最后根据遥测决定是否需要解耦阻塞式底盘串口。异步采集不得静默丢帧，
+队列满时必须记录 dropped count 或安全停止，并继续保证每张完整 320×240 图像与实际发送命令严格对齐。
+
+### 19.5 右锐角入口幅度补偿与转向进度方向保持（2026-08-17，本地待实车）
+
+根据 19.3 的退化链路，已在本地实施只作用于严格确认的最终右锐角的最小修正，尚未同步 Orin。
+普通弯、前三个左直角、全局锐角增益、右锐角自然 Pure Pursuit 增益、速度、`vy=0`、十字关闭、
+启动直行保护和最多 10 帧 invalid 精确保持均未修改。
+
+第一项修改将 `right_turn_curvature_gain` 从 `0.65` 调整为 `0.78`。0.15 near-progress 门槛
+让入口更早、角点距离更远，原直接几何曲率因此缩小；1.20 倍仅补偿这一严格 route override 的幅度，
+不作用于普通 Pure Pursuit。最新 session 的入口三帧离线估计从约
+`-0.77/-0.83/-0.83 rad/s` 恢复到 `-0.92/-0.96/-0.99 rad/s`，接近昨日正确轨迹的入口强度，
+但仍低于旧版过转实验曾出现的 `-1.5 rad/s` 限幅。
+
+第二项修改用实际发送角速度的积分取代 `corner_detected` 单帧生命周期：严格
+`route_right_turn_override` 首次命中后确认唯一右锐角，累计
+`max(-actual_wz, 0) * dt`；在累计右转进度达到 `1.70 rad` 前，所有正曲率都保留绝对值但改为
+右转负号。短暂 `corner_detected=false` 不再清除身份，invalid 精确保持命令也通过
+`observe_applied_command()` 计入进度。达到 1.70 rad 后立即释放，由当时的 Pure Pursuit 几何自然回中；
+`reset()` 仍立即清除。该逻辑不使用帧数、固定时间或里程，改变 FPS 和车速时仍按实际发送动作累计。
+
+选择 1.70 rad 的依据是实车对比：昨日能完整转过的 `20260816_173313_422375` 在 687 帧附近
+达到约 1.70 rad，下一帧开始接受几何正曲率回中；最新失败 session 原始命令到结束仅累计约
+1.43 rad，随后被反向输出抵消。使用最新 `161256` 的记录曲率、真实 `effective_dt_s`、速度和角速度
+斜率进行离线控制链重算，入口后的关键结果为：
+
+```text
+frame   old wz   replay wz   progress/reason
+665     -0.77    -0.92       route override
+667     -0.83    -0.99       0.22 rad / route override
+668     -0.72    -0.95       0.30 rad / progress sign hold
+679     -0.45    -0.85       0.99 rad / natural right sharp
+683     -0.73    -1.20       1.39 rad / reject +8.13 1/m false sign
+684     -0.63    -1.29       1.49 rad / reject +8.94 1/m false sign
+687     -0.51    -1.17       1.78 rad / release after completion
+```
+
+该回放仍是基于原轨迹图像的反事实控制重算，不能替代实车闭环验证；但其强转向时序与昨日正确轨迹
+同阶段约 `-1.19～-1.03 rad/s` 基本一致。已更新聚焦单元测试，覆盖角点短暂消失仍保持、实际命令
+进度释放和 reset 清除。Windows 本地没有 Python，未执行测试；`git diff --check` 已通过。
+
+随后按用户确认，使用指定 `sync_to_orin.ps1`，明确指定本地根目录
+`C:\weizijian\documents\baidu\baidu_smart_2026_7_17` 和远端根目录
+`/home/jetson/workspaces/baidu_smart_2026_8_14`，仅同步以下 3 个运行文件：
+
+```text
+smartcar/whalesbot/tools/lane_collect/opencv_lane.py
+smartcar/whalesbot/tools/lane_collect/pid_control.py
+smartcar/whalesbot/tools/lane_collect/ssh_test.py
+```
+
+未同步测试、进度文档、模型、日志或数据集。同步脚本执行成功，远端只读检查确认参数
+`right_turn_curvature_gain=0.78`、`right_acute_min_turn_progress_rad=1.70` 以及
+`observe_applied_command()` 调用均存在；本地与远端 SHA256 一致：
+
+```text
+opencv_lane.py  09df26f2bdefc64bee04c3ea72c3403190372c96e2bec9c413924cb2f8d9ed64
+pid_control.py  ac6544252cca82037a5797402a498b4baebcde1367b1709703f8e5c03449f7be
+ssh_test.py     359d8fef27d47f268e0e8fc43160d65d9da5f176e766c60161a1aecbb436993d
+```
+
+本次未在 Orin 上启动 `collect_data.py` 或执行实车控制，下一步需要以完整赛道 session 验证右锐角
+入口、683～684 等效阶段的方向保持、达到约 1.70 rad 后的释放以及是否出现新的过转。

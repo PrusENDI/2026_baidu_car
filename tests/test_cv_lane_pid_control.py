@@ -13,16 +13,18 @@ from smartcar.whalesbot.tools.lane_collect import (
 )
 from smartcar.whalesbot.tools.lane_collect.ssh_test import OpenCVLaneSshTest
 from smartcar.whalesbot.tools.curvature_control import CurvatureSpeedController
+from smartcar.whalesbot.tools.curvature_control import finite_dt
 
 
-def analysis(valid=True, lateral=0.25, heading=1.0, reason=None, metrics=None):
+def analysis(valid=True, lateral=0.25, heading=1.0, reason=None, metrics=None,
+             confidence=0.8):
     return LaneAnalysisResult(
         valid=valid,
         error_y=lateral if valid else None,
         error_angle=heading if valid else None,
         raw_lateral=lateral if valid else None,
         raw_heading=heading if valid else None,
-        confidence=0.8 if valid else 0.0,
+        confidence=confidence if valid else 0.0,
         cross_status="none",
         cross_score=0.0,
         reason=reason,
@@ -60,6 +62,11 @@ class FakeCar:
 
 
 class CvLanePidControllerTests(unittest.TestCase):
+    def test_finite_dt_caps_long_callback_gap(self):
+        self.assertAlmostEqual(finite_dt(2.0), 0.25)
+        self.assertAlmostEqual(finite_dt(None, fallback_s=0.4), 0.25)
+        self.assertAlmostEqual(finite_dt(-1.0), 0.05)
+
     def test_cnn_speed_demand_is_independent_from_action_curvature(self):
         controller = CurvatureSpeedController(
             max_speed=0.30, min_speed=0.12,
@@ -138,6 +145,65 @@ class CvLanePidControllerTests(unittest.TestCase):
         command = controller.compute(result)
         self.assertEqual(command.reason, "route_right_turn")
         self.assertAlmostEqual(command.angular_speed, -1.20)
+
+    def test_right_acute_holds_sign_until_applied_turn_progress(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            steering_mode="pure_pursuit", max_forward_speed=0.20,
+            min_forward_speed=0.20, pure_pursuit_entry_rate=0.0,
+            max_heading_release_rate=0.0,
+            max_heading_reverse_rate=0.0,
+            right_acute_min_turn_progress_rad=0.10))
+        entry = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": -4.0,
+            "route_right_turn_override": True,
+            "corner_detected": True,
+        })
+        false_reverse = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": 1.25,
+            "route_right_turn_override": False,
+            "corner_detected": True,
+        })
+        corner_gone = analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": 1.25,
+            "route_right_turn_override": False,
+            "corner_detected": False,
+        })
+
+        controller.compute(entry)
+        held = controller.compute(false_reverse)
+        held_without_corner = controller.compute(corner_gone)
+        controller.observe_applied_command(-0.50, dt_s=0.10)
+        still_held = controller.compute(false_reverse)
+        controller.observe_applied_command(-0.50, dt_s=0.10)
+        released = controller.compute(false_reverse)
+
+        self.assertEqual(held.reason, "right_acute_exit_sign_hold")
+        self.assertAlmostEqual(held.angular_speed, -0.25)
+        self.assertEqual(
+            held_without_corner.reason, "right_acute_exit_sign_hold")
+        self.assertAlmostEqual(held_without_corner.angular_speed, -0.25)
+        self.assertEqual(still_held.reason, "right_acute_exit_sign_hold")
+        self.assertEqual(released.reason, "ipm_pure_pursuit")
+        self.assertAlmostEqual(released.angular_speed, 0.25)
+
+    def test_right_acute_exit_hold_is_cleared_by_reset(self):
+        controller = CvLanePidController(CvLanePidConfig(
+            steering_mode="pure_pursuit", max_forward_speed=0.20,
+            min_forward_speed=0.20, pure_pursuit_entry_rate=0.0,
+            max_heading_reverse_rate=0.0))
+        controller.compute(analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": -4.0,
+            "route_right_turn_override": True,
+            "corner_detected": True,
+        }))
+        controller.reset()
+        command = controller.compute(analysis(heading=0.0, metrics={
+            "pure_pursuit_curvature_m_inv": 1.25,
+            "route_right_turn_override": False,
+            "corner_detected": True,
+        }))
+        self.assertEqual(command.reason, "ipm_pure_pursuit")
+        self.assertGreater(command.angular_speed, 0.0)
 
     def test_pure_pursuit_requires_curvature_metric(self):
         controller = CvLanePidController(CvLanePidConfig(

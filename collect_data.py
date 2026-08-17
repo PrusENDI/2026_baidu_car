@@ -54,7 +54,6 @@ if __name__ == "__main__":
                 standard_root=Path(__file__).resolve().parent / "standard",
             ).run()
         finally:
-            car.set_velocity(0.0, 0.0, 0.0)
             cam1.close()
             car.close()
         raise SystemExit(0)

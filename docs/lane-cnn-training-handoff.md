@@ -872,16 +872,18 @@ vx_next = move_towards(vx_previous, target_vx, rate_per_second × effective_dt_s
 - `tests/lane_training/`：验证 CV/手柄 mask、曲率换算和数据增强；
 - `car_wrap_2026.py`：支持 `legacy_error` 与 `kappa_action` 两种车端 profile。
 
-尚未在当前 GitHub 分支固化的部分：
+2026-08-17 已在当前工作树补齐并同步到远端训练环境、完成 GPU smoke 验证的部分：
 
-- 使用 `return_target_mask=True` 的正式训练入口；
-- 对两个输出执行 mask 归一化损失的训练器；
-- 写入输出语义和 profile 的模型导出清单；
-- 新语义模型的离线推理评测与一键车端导出命令。
+- `tools/lane_training/train_action.py` 与 `lane_training/action_training.py`：正式双输出训练入口，强制 `return_target_mask=True`；
+- `lane_training/action_loss.py`：对两个输出执行 mask 归一化 Smooth L1，手柄速度占位值不参与损失；
+- `tools/lane_training/evaluate_action.py`：按有效 mask 统计速度需求和曲率误差；
+- `tools/lane_training/export_action.py`：导出静态模型、`deployment.json` 和 `.tgz` 车端包，记录输出语义及 `kappa_action` profile；
+- `tools/lane_training/prepare_action_manifest.py`：合并 CV 与手柄 session 并保留 split/mask。
 
-本地未跟踪的 `tools/` 和训练实验脚本不能被当作 GitHub 上可复现的正式工具。开始
-新模型训练前，必须先把上述四项实现、测试并提交，否则只能说“数据接口兼容”，不能说
-“完整训练路径已经可用”。
+远端 Paddle 3.3.1 默认生成 `cnn_lane.json` 与 `cnn_lane.pdiparams`；已用
+`paddle.inference.Config` 验证该组合可加载。Orin 部署前仍需核对车端 Paddle 版本是否支持 PIR
+JSON；如果只支持旧 `cnn_lane.pdmodel`，需要在兼容版本环境重新导出。以上新增文件当前尚未
+提交或推送 GitHub，不能把远端临时同步副本当作最终版本库交付。
 
 ### 18.6 标准验收要求
 
@@ -1014,3 +1016,133 @@ horizontal flip    = [speed_demand, -kappa_action]
 - 标签、mask 和增强：`lane_training/dataset.py`
 - 数据接口测试：`tests/lane_training/test_manifest.py`、`tests/lane_training/test_dataset.py`
 - CV 控制与采集契约测试：`tests/test_cv_lane_pid_control.py`
+
+### 20.7 第一版固定赛道长训方案（2026-08-17）
+
+第一版只执行一条训练路线，不做随机初始化、手柄混训或其他对照实验。赛道完全固定，
+允许模型针对当前场地过拟合；训练目标是复现当前 CV 教师在固定赛道上的完整速度和曲率
+动作，而不是追求跨赛道泛化。
+
+#### 数据角色与划分
+
+用户计划提供至少三圈完整 CV session，以及单独采集的弯道专项 session。第一轮训练配置为：
+
+```text
+初始化              D4 checkpoint
+训练数据            新采集 CV 数据
+旧 D4/官方训练图片   不加入
+D4 teacher loss     关闭
+手柄数据            第一版不加入
+训练 mask           CV 全部为 [1.0, 1.0]
+模型输出            [speed_demand, kappa_action]
+```
+
+训练方案选择阶段按完整 session 划分：
+
+```text
+训练集：完整圈 1 + 完整圈 2 + 全部弯道专项 session
+验证集：完整圈 3
+```
+
+禁止把第三圈相邻帧随机拆回训练集。这里保留完整验证圈不是为了测跨赛道泛化，而是为了
+选择 checkpoint，并检查模型是否学到可重复的固定赛道动作，而不是某一圈的控制抖动。
+选定训练轮数和参数后，最终模型从 D4 重新初始化，使用三圈完整数据和全部弯道专项数据
+按选定轮数重训一次。
+
+弯道专项 session 必须包含入弯前、完整弯中和出弯回正后的连续帧，不能只截取曲率峰值。
+专项数据还必须使用与完整圈相同的标签语义、CV 控制版本、ROI、速度曲线和曲率计算方式。
+
+#### 采样比例
+
+训练 batch 不按原始帧数直接均匀抽样，初始比例为：
+
+```text
+完整圈普通帧      60%
+弯道专项帧        40%
+```
+
+如果目标锐角训练后仍明显偏弱，可将弯道专项提高到 50%，但第一版不超过 60%，避免弯道
+样本同时通过重复采样和大损失权重被双重放大，从而导致直道持续转向或提前降速。
+
+#### 分阶段长训
+
+以约 3000～5000 帧、batch size 32 为预期规模。正式训练按下列阶段执行：
+
+```text
+阶段 1：只训练全连接输出头
+  epochs = 10
+  learning rate = 1e-4
+
+阶段 2：解冻最后两层卷积和输出头
+  epochs = 30
+  head learning rate = 2e-5
+  convolution learning rate = 2e-6
+
+阶段 3：全网络长训
+  epochs = 160
+  learning rate = 5e-6，余弦衰减到 1e-7
+```
+
+初始总长度为 200 epochs。若训练集约 3500 帧、batch size 32，则约为 22000 次优化器更新。
+每 5 epochs 保存一个 checkpoint，不能只保留最低全局平均 loss 的单一版本。最终轮数由完整
+验证圈的关键路段行为选择；如果 200 epochs 结束时仍稳定改善，可以继续训练并保持相同
+checkpoint 间隔。
+
+#### 双输出损失
+
+`speed_demand` 范围为 `[0,1]`，`kappa_action` 典型满量程约为 `5 m^-1`。正式训练前应先
+归一化曲率头，避免未归一化的曲率数值天然压过速度头：
+
+```text
+speed_scaled = speed_demand
+kappa_scaled = kappa_action / 5.0
+
+loss_speed = SmoothL1(speed_prediction, speed_demand)
+loss_kappa = SmoothL1(kappa_prediction / 5.0, kappa_action / 5.0)
+loss = loss_speed + 2.0 * loss_kappa
+```
+
+两个分量仍分别乘 `target_mask` 并按有效权重归一化。第一版全为 CV 样本，mask 均为
+`[1,1]`，但训练器必须继续保持 mask 契约，不能创建仅对当前数据有效的旁路实现。
+
+#### 数据增强
+
+固定赛道第一版以拟合现场图像为优先：
+
+```text
+水平翻转        关闭
+Hue/颜色旋转    关闭
+模糊和噪声      关闭
+亮度增强        关闭或只保留经现场确认的轻微范围
+```
+
+水平翻转虽然能正确反转 `kappa_action`，但会构造固定赛道中不存在的镜像路线，因此不用于
+第一版。任何增强都必须同时保持入弯和回正时序，不得只根据随机帧 MAE 决定是否启用。
+
+#### checkpoint 选择
+
+固定验证圈至少逐段比较：
+
+- 入弯和回正位置；
+- `kappa_action` 的方向、峰值、持续时间和整段冲量；
+- 最后锐角及其他专项弯道；
+- 直道曲率偏置和误转；
+- `speed_demand` 的入弯升高、弯中保持和出弯释放；
+- 相邻帧输出抖动；
+- 经车端速度曲线与真实 `dt` 后处理还原的整圈 `vx/wz`。
+
+不能仅按训练 loss 或整圈平均 MAE 选择模型。完成离线选择后，仍须使用低速
+`kappa_action` profile 进行完整一圈实车验收，再逐步恢复目标速度。
+
+#### 训练器实施门槛
+
+当前已验证的 action smoke 入口支持双输出、mask、评测和导出，但仍是全网络统一学习率、
+均匀采样、未做曲率尺度归一化的基础版本。正式长训开始前必须补齐并测试：
+
+1. 三阶段冻结/解冻；
+2. 输出头与卷积层分层学习率；
+3. 完整圈与弯道专项的 60/40 分组采样；
+4. `kappa_action / 5.0` 的归一化 masked loss；
+5. 每 5 epochs checkpoint 及完整验证圈逐段报告。
+
+在这些能力完成前，只能运行 smoke 验证，不能直接把当前基础入口用于 200-epoch 正式训练。

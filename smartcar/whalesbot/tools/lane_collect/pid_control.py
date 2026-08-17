@@ -45,6 +45,11 @@ class CvLanePidConfig:
     # Release an obsolete turn direction promptly without changing the
     # smoother same-direction decay used by ordinary bends.
     max_heading_reverse_rate: float = 1.29
+    # A strictly confirmed final right acute turn keeps its direction until
+    # the angular velocity actually sent to the chassis has accumulated this
+    # much rightward rotation.  This is speed/rate independent and avoids a
+    # frame, elapsed-time, or odometry window.
+    right_acute_min_turn_progress_rad: float = 1.70
 
 
 @dataclass(frozen=True)
@@ -96,12 +101,16 @@ class CvLanePidController:
         )
         self._last_heading_output = 0.0
         self._last_forward_speed = None
+        self._right_acute_turn_confirmed = False
+        self._right_acute_turn_progress_rad = 0.0
 
     def reset(self) -> None:
         self.pid_y.reset()
         self.pid_angle.reset()
         self._last_heading_output = 0.0
         self._last_forward_speed = None
+        self._right_acute_turn_confirmed = False
+        self._right_acute_turn_progress_rad = 0.0
 
     def compute(self, result: LaneAnalysisResult,
                 distance_m=None, dt_s=None) -> CvLaneControlCommand:
@@ -148,8 +157,11 @@ class CvLanePidController:
         curvature = float(curvature) * float(self.config.pure_pursuit_gain)
         right_turn_override = bool(result.metrics.get(
             "route_right_turn_override", False))
-        reason = ("route_right_turn" if right_turn_override
-                  else "ipm_pure_pursuit")
+        curvature, exit_sign_held = self._apply_right_acute_exit_sign_hold(
+            curvature, result.metrics)
+        reason = ("route_right_turn" if right_turn_override else
+                  "right_acute_exit_sign_hold" if exit_sign_held else
+                  "ipm_pure_pursuit")
         reference = max(float(self.config.full_turn_curvature_m_inv), 1e-6)
         demand = float(np.clip(abs(curvature) / reference, 0.0, 1.0))
         target_forward_speed = self._speed_target_from_demand(demand)
@@ -185,6 +197,43 @@ class CvLanePidController:
             error_y, error_angle, reason, demand,
             target_forward_speed,
             requested_heading / max(abs(forward_speed), 0.12))
+
+    def _apply_right_acute_exit_sign_hold(self, curvature, metrics):
+        """Reject a false left command until the confirmed turn is completed.
+
+        The strict geometric route override uniquely confirms entry into the
+        final right acute turn.  A transient missing corner or opposite-sign
+        one-sided fit must not erase that identity.  Completion is measured
+        separately from the angular velocity actually sent to the chassis,
+        not from frames, elapsed time, or distance.
+        """
+        if (bool(metrics.get("route_right_turn_override", False)) and
+                not self._right_acute_turn_confirmed):
+            self._right_acute_turn_confirmed = True
+            self._right_acute_turn_progress_rad = 0.0
+        minimum_progress = max(
+            float(self.config.right_acute_min_turn_progress_rad), 0.0)
+        sign_held = bool(
+            self._right_acute_turn_confirmed and
+            self._right_acute_turn_progress_rad < minimum_progress and
+            curvature > 0.0)
+        if sign_held:
+            curvature = -abs(float(curvature))
+        return float(curvature), sign_held
+
+    def observe_applied_command(self, angular_speed, dt_s=None):
+        """Advance the confirmed right-turn progress from the sent command."""
+        if not self._right_acute_turn_confirmed:
+            return
+        angular_speed = float(angular_speed)
+        if not np.isfinite(angular_speed):
+            return
+        dt = finite_dt(dt_s, self.config.control_period_s)
+        self._right_acute_turn_progress_rad += max(-angular_speed, 0.0) * dt
+        minimum_progress = max(
+            float(self.config.right_acute_min_turn_progress_rad), 0.0)
+        if self._right_acute_turn_progress_rad >= minimum_progress:
+            self._right_acute_turn_confirmed = False
 
     def _speed_target(self, error_angle):
         """Map current steering demand to a bounded forward-speed target."""

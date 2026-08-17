@@ -6,15 +6,34 @@ import math
 from typing import Optional
 
 
-def finite_dt(dt_s: Optional[float], fallback_s: float = 0.05) -> float:
-    """Return a safe wall-clock interval for control-rate calculations."""
+def finite_dt(dt_s: Optional[float], fallback_s: float = 0.05,
+              max_dt_s: float = 0.25) -> float:
+    """Return a bounded wall-clock interval for control-rate calculations.
+
+    A delayed callback must not turn a multi-second scheduling gap into a
+    multi-second velocity slew.  Watchdogs still own stale-frame shutdown;
+    this bound only limits the first control step after a delayed callback.
+    """
     try:
-        value = float(dt_s) if dt_s is not None else float(fallback_s)
+        fallback = float(fallback_s)
     except (TypeError, ValueError):
-        value = float(fallback_s)
+        fallback = 0.05
+    if not math.isfinite(fallback) or fallback <= 0.0:
+        fallback = 0.05
+    try:
+        upper = float(max_dt_s)
+    except (TypeError, ValueError):
+        upper = 0.25
+    if not math.isfinite(upper) or upper <= 0.0:
+        upper = 0.25
+    upper = max(upper, 1e-4)
+    try:
+        value = float(dt_s) if dt_s is not None else fallback
+    except (TypeError, ValueError):
+        value = fallback
     if not math.isfinite(value) or value <= 0.0:
-        value = float(fallback_s)
-    return max(value, 1e-4)
+        value = fallback
+    return min(max(value, 1e-4), upper)
 
 
 class CurvatureSpeedController:

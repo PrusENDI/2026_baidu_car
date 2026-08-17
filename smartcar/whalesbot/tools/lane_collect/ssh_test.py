@@ -293,6 +293,11 @@ class OpenCVLaneSshTest:
                 command.lateral_speed,
                 command.angular_speed,
             )
+            # Advance route-specific turn completion only after the exact
+            # command has been accepted by the chassis call.  This includes
+            # short-invalid holds and therefore does not depend on image FPS.
+            self.controller.observe_applied_command(
+                command.angular_speed, dt_s=dt_s)
             frame_distance_m = None
             if distance_m is not None:
                 if self.last_distance_m is not None:
@@ -372,7 +377,16 @@ class OpenCVLaneSshTest:
             print(f"STOPPED: {reason}", flush=True)
 
     def _stop_vehicle(self) -> None:
-        self.car.set_velocity(0.0, 0.0, 0.0)
+        try:
+            self.car.set_velocity(0.0, 0.0, 0.0)
+        except KeyboardInterrupt:
+            # A second Ctrl+C may interrupt a serial lock acquisition while
+            # the first stop command is still waiting for the chassis reply.
+            print("Stop command interrupted by Ctrl+C; continuing shutdown.",
+                  flush=True)
+        except Exception as exc:
+            print(f"Stop command failed during shutdown: {exc}", flush=True)
+
 
     def _read_distance(self):
         """Return chassis odometry distance, without breaking control if absent."""

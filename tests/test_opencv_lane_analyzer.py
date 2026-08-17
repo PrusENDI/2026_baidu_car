@@ -214,21 +214,25 @@ class OpenCVLaneAnalyzerTests(unittest.TestCase):
             "score": 0.75,
             "heading": -1.40,
             "direction_known": True,
-            "near_progress": 0.30,
+            "near_progress": 0.15,
             "segment": [260, 100, 205, 90],
         }
         args = (corner, "mixed", 0.10, 0.70, -1.35, 0.20,
-                0.20, 0.45)
+                0.15, 0.45)
         self.assertEqual(
             self.analyzer._right_turn_reason(*args), "near_entry")
+        result = self.analyzer._right_turn_reason(
+            dict(corner, near_progress=0.14), "mixed", 0.10,
+            0.70, -1.35, 0.20, 0.15, 0.45)
+        self.assertIsNone(result)
         continuation = dict(corner, score=0.82, direction_known=False)
         result = self.analyzer._right_turn_reason(
             continuation, "left_only", 0.25, 0.70, -1.35,
-            0.20, 0.20, 0.45)
+            0.20, 0.15, 0.45)
         self.assertIsNone(result)
         result = self.analyzer._right_turn_reason(
             dict(corner, near_progress=0.48), "mixed", 0.10,
-            0.70, -1.35, 0.20, 0.20, 0.45)
+            0.70, -1.35, 0.20, 0.15, 0.45)
         self.assertIsNone(result)
         self.assertTrue(self.analyzer._right_turn_geometry(
             corner, "mixed", -1.35))

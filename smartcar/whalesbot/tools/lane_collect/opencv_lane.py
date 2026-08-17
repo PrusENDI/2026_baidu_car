@@ -124,9 +124,12 @@ class LaneAnalyzerConfig:
     right_turn_candidate_min_score: float = 0.70
     right_turn_candidate_max_heading: float = -1.35
     right_turn_candidate_max_lateral_ratio: float = 0.20
-    right_turn_candidate_min_near_progress: float = 0.20
+    right_turn_candidate_min_near_progress: float = 0.15
     right_turn_candidate_max_near_progress: float = 0.45
-    right_turn_curvature_gain: float = 0.65
+    # The 0.15 near-progress gate observes the final right acute corner
+    # farther away than the former 0.20 gate.  Compensate only that strict
+    # route override so early entry does not also weaken its curvature.
+    right_turn_curvature_gain: float = 0.78
     right_turn_min_distance_m: float = 0.20
     right_turn_max_curvature_m_inv: float = 10.0
     morphology_kernel: int = 3
