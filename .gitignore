@@ -117,6 +117,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-lane/
 env/
 venv/
 ENV/
@@ -146,3 +147,14 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Local lane-training outputs and exported model files
+/artifacts/
+*.pdmodel
+*.pdiparams
+*.pdiparams.info
+*.pdparams
+*.onnx
+*.pth
+*.pt
+*.ckpt
