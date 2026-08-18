@@ -1394,3 +1394,38 @@ frame       target kappa     predicted kappa
    和人工接管帧号，区分模型曲率、速度梯度和控制限幅问题；
 10. epoch 200 只有在两个十字路口、普通弯道、锐角、直道回正和速度恢复均通过后才可由用户
     明确选中；在此之前继续保持 `selected=false`，不得自动部署或修改 `config_car.yml`。
+
+### 20.13 新模型替换与回滚步骤（2026-08-18）
+
+当前候选均为 `selected=false`，以下只是操作说明；必须先由用户明确选定 epoch，才能实际部署。
+模型实际目录为 `<Orin项目根>/smartcar/paddlebaidu/models/lane_model/`，目录内只能各有一个
+`.pdmodel` 和 `.pdiparams`，不能把新旧模型放在同一目录。
+
+1. 在本地确认候选包含 `cnn_lane.pdmodel`、`cnn_lane.pdiparams`、
+   `cnn_lane.pdiparams.info` 和 `deployment.json`。检查后者的输出语义为
+   `[speed_demand, kappa_action]`、profile 为 `kappa_action`、输入为 `128x128`，再用
+   `Get-FileHash <候选目录>\cnn_lane.* -Algorithm SHA256` 保存三个模型文件的哈希。
+2. 用当前连接 `ssh -p 47786 root@connect.bjb1.seetacloud.com` 登录，先确认实际项目根；历史
+   路径是 `/home/jetson/workspaces/baidu_smart_2026_8_14`。在
+   `smartcar/paddlebaidu/models/` 下建立独立 staging 目录，再用 `scp -P 47786` 上传三个模型
+   文件。上传后运行 `sha256sum`，必须与本地逐文件一致。
+3. 保持 Orin 供电，断开底盘驱动电源或架空驱动轮，确保底盘不会接收运动命令。先用
+   `pgrep -af 'infer_back_end.py|car_start_2026.py'` 查明推理后端和车辆主进程，再停止实际 PID
+   并复核两类进程均已退出；不要在推理运行时替换文件。
+4. 保存旧模型和配置的 SHA256；把原 `lane_model` 重命名为带时间戳且不覆盖旧目录的备份，
+   同时复制一份带相同时间戳的 `config_car.yml`。确认 staging 中恰好有一份 `.pdmodel` 和一份
+   `.pdiparams` 后，在同一文件系统内把 staging 重命名为 `lane_model`；不要逐个覆盖正在使用的
+   模型文件。
+5. 同步把 `config_car.yml -> lane_control.profile` 改为 `kappa_action`，并核对
+   `max_forward_speed=0.30`、`min_forward_speed=0.12`、`full_turn_curvature_m_inv=5.0`、
+   `speed_curve_exponent=1.5`、`max_deceleration_mps2=0.194`、`max_acceleration_mps2=0.129`、
+   `max_angular_speed=1.50`、`fallback_dt_s=0.05`。旧 D4/R7 只能配 `legacy_error`。
+6. 重启后先检查日志和模型加载，确认原始静态图输出为 `[1,2]`、`LaneInfer` 返回两个有限值；
+   然后做架空轮/人工保护下的低速检查，最后按 20.12 的清单跑完整圈。epoch 200 尤其检查
+   十字路口 1 的六个漏检帧对应路段、提前转向和直道残余曲率。
+7. 若加载、空载或低速测试失败，立即停止相关进程，把失败的 `lane_model` 改名保留，把原备份
+   目录改回 `lane_model`，恢复对应 `config_car.yml` 后再启动。若恢复的是 D4/R7，必须同时
+   恢复 `legacy_error`。记录候选 epoch、新旧 SHA256、备份路径、profile、测试结果、日志路径
+   和是否回滚。
+
+本轮只补充说明，不执行上传、模型切换或 `config_car.yml` 修改。
